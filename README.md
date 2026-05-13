@@ -35,6 +35,12 @@ url = launch_tree(df, target="risk_flag", open_browser=True)
 url
 ```
 
+Hazir notebook ornegi:
+
+```text
+examples/notebook_dataframe_sql_demo.ipynb
+```
+
 SQL tablosu veya query sonucu ile kullanmak icin:
 
 ```python
