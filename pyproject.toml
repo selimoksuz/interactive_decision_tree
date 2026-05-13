@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interactive-decision-tree"
+version = "0.1.0"
+description = "Streamlit-based interactive decision tree builder with notebook and SQL data-source support."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit",
+    "pandas",
+    "numpy",
+    "streamlit-agraph",
+    "SQLAlchemy>=2.0",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools]
+py-modules = ["interactive_decision_tree_app"]
+
+[tool.setuptools.packages.find]
+include = ["interactive_decision_tree*"]

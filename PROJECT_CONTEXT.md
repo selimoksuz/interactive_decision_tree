@@ -5,6 +5,8 @@ Bu proje, Codex ile gelistirilen Streamlit tabanli interaktif decision tree uygu
 ## Ana Dosyalar
 
 - `interactive_decision_tree_app.py`: Ana Streamlit uygulamasi.
+- `interactive_decision_tree/`: Notebook launcher, lokal session store ve SQL okuma yardimcilari.
+- `pyproject.toml`: Paketi editable olarak kurup `from interactive_decision_tree import launch_tree` kullanmayi saglar.
 - `requirements.txt`: Python bagimliliklari.
 - `run_app.ps1`: PowerShell uzerinden uygulamayi baslatir.
 - `README.md`: Kurulum ve calistirma notlari.
@@ -29,6 +31,9 @@ Uygulama varsayilan olarak `http://localhost:8501` adresinde calisir.
 - Tek tusla optimal tree kurma ve sonrasinda istedigin node'u revize etme.
 - Undo last split ve reset tree.
 - Zoom/fit kontrollu tree view.
+- Notebook RAM'indeki pandas DataFrame'i `launch_tree(df)` ile `.tree_sessions/` snapshot'i olarak uygulamaya tasima.
+- SQLAlchemy generic table/query destegi; UI manuel URL veya `.streamlit/secrets.toml` baglantilari ile calisir.
+- UI dosya yukleme kaynagi CSV ve Excel dosyalarini (`.csv`, `.xlsx`, `.xls`) destekler.
 - `work_id` URL parametresi ve `.tree_checkpoints/` altindaki otomatik checkpoint ile refresh sonrasi kaldigin agaci geri yukleme.
 - Runnable nested tree JSON export.
 
@@ -36,4 +41,6 @@ Uygulama varsayilan olarak `http://localhost:8501` adresinde calisir.
 
 - `Positive class` secimi default rate, event count, AUC/Gini, kategorik target-rate gruplama ve JSON export icin ortak referanstir.
 - Entropy / information gain hesabi class dagiliminin safligina bakar; positive class sadece binary metriklerin ve target-rate yorumunun yonunu belirler.
+- SQL credential bilgisi checkpoint'e yazilmaz; SQL sonucunun DataFrame snapshot'i `.tree_sessions/` altinda saklanir.
+- URL'deki `data_id` raw path degildir; sadece uygulamanin kendi urettigi guvenli session id'ler okunmalidir.
 - Eski gecici Codex dizinindeki kaynak dosyalar bu proje klasorune tasindi. Bundan sonraki calisma kok dizini `C:\Users\Acer\interactive_decision_tree` olmalidir.

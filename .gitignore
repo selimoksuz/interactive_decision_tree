@@ -5,4 +5,6 @@ __pycache__/
 *.log
 .streamlit/
 .tree_checkpoints/
+.tree_sessions/
 .pytest_cache/
+*.egg-info/

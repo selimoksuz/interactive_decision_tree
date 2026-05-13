@@ -13,6 +13,15 @@ import pandas as pd
 import streamlit as st
 from streamlit_agraph import Config, Edge, Node, agraph
 
+from interactive_decision_tree.session_store import (
+    DATA_ID_QUERY_PARAM,
+    load_dataframe_session,
+    normalize_data_id,
+    save_dataframe_session,
+    session_data_key,
+)
+from interactive_decision_tree.sql_source import DEFAULT_SQL_LIMIT, read_sql_dataframe
+
 
 TREE_SCHEMA_VERSION = 4
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -1284,6 +1293,150 @@ def uploaded_data_key(uploaded_name: str, df: pd.DataFrame) -> str:
     return f"uploaded:{uploaded_name}:{len(df)}:{len(df.columns)}:{dataframe_fingerprint(df)}"
 
 
+def read_uploaded_table(uploaded: Any) -> pd.DataFrame:
+    suffix = Path(uploaded.name).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(uploaded)
+    if suffix in (".xlsx", ".xls"):
+        return pd.read_excel(uploaded)
+    raise ValueError("Unsupported upload type. Use CSV or Excel.")
+
+
+def load_session_dataframe_from_query() -> tuple[pd.DataFrame, dict[str, Any], str, str] | None:
+    data_id = normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM))
+    if data_id is None:
+        return None
+    try:
+        df, metadata = load_dataframe_session(data_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        st.sidebar.warning(f"Session data could not be loaded: {exc}")
+        return None
+    return df, metadata, data_id, session_data_key(data_id, df, metadata)
+
+
+def source_metadata_value(metadata: dict[str, Any], key: str) -> Any:
+    value = metadata.get(key)
+    if value in ("", [], {}):
+        return None
+    return value
+
+
+def secret_sql_connections() -> dict[str, str]:
+    connections: dict[str, str] = {}
+
+    def add_mapping(prefix: str, mapping: Any) -> None:
+        if not hasattr(mapping, "items"):
+            return
+        for name, value in mapping.items():
+            label = f"{prefix}{name}"
+            if isinstance(value, str):
+                connections[label] = value
+            elif hasattr(value, "get"):
+                url = value.get("url") or value.get("connection_url") or value.get("sqlalchemy_url")
+                if url:
+                    connections[label] = str(url)
+
+    try:
+        add_mapping("", st.secrets.get("sql_connections", {}))
+        add_mapping("", st.secrets.get("connections", {}))
+    except (FileNotFoundError, KeyError, AttributeError):
+        return {}
+    return connections
+
+
+def save_source_session(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    name: str,
+    target: str | None = None,
+    features: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    data_id, _ = save_dataframe_session(
+        df,
+        source=source,
+        name=name,
+        target=target,
+        features=features,
+        metadata=metadata,
+    )
+    st.query_params[DATA_ID_QUERY_PARAM] = data_id
+    st.session_state["_last_query_data_id"] = None
+    return data_id
+
+
+def render_sql_source_loader() -> None:
+    connections = secret_sql_connections()
+    connection_mode_options = ["Manual SQLAlchemy URL"]
+    if connections:
+        connection_mode_options.insert(0, "Saved secret connection")
+
+    with st.sidebar.form("sql_source_form"):
+        connection_mode = st.selectbox("SQL connection", connection_mode_options)
+        if connection_mode == "Saved secret connection":
+            selected_connection = st.selectbox("Saved connection", sorted(connections))
+            connection_url = connections[selected_connection]
+        else:
+            connection_url = st.text_input("SQLAlchemy connection URL", type="password")
+
+        sql_mode = st.radio("SQL mode", ["Table", "Query"], horizontal=True)
+        table_name = ""
+        query_text = ""
+        if sql_mode == "Table":
+            table_name = st.text_input("Table name")
+        else:
+            query_text = st.text_area("SQL query", height=120)
+
+        full_table = st.checkbox("Load full result", value=False)
+        limit_value = st.number_input(
+            "Row limit",
+            value=DEFAULT_SQL_LIMIT,
+            min_value=1,
+            step=1000,
+            disabled=full_table,
+            format="%d",
+        )
+        sample_n_value = st.number_input("Optional sample rows", value=0, min_value=0, step=100, format="%d")
+        submitted = st.form_submit_button("Load SQL data", width="stretch")
+
+    if not submitted:
+        st.info("Choose a SQL source in the sidebar and load data.")
+        st.stop()
+
+    if not connection_url:
+        st.sidebar.error("SQL connection URL is required.")
+        st.stop()
+
+    try:
+        df = read_sql_dataframe(
+            connection_url,
+            table=table_name.strip() or None,
+            query=query_text.strip() or None,
+            limit=None if full_table else int(limit_value),
+            sample_n=int(sample_n_value) or None,
+            full_table=bool(full_table),
+        )
+        save_source_session(
+            df,
+            source="sql",
+            name=table_name.strip() or "SQL query",
+            metadata={
+                "sql": {
+                    "mode": sql_mode.lower(),
+                    "table": table_name.strip() or None,
+                    "limit": None if full_table else int(limit_value),
+                    "sample_n": int(sample_n_value) or None,
+                    "full_table": bool(full_table),
+                }
+            },
+        )
+        st.rerun()
+    except Exception as exc:
+        st.sidebar.error(f"SQL load failed: {exc}")
+        st.stop()
+
+
 def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.DataFrame, str, str] | None:
     if not checkpoint:
         return None
@@ -1414,6 +1567,8 @@ def save_work_checkpoint(
     data_key: str,
     data_source: str,
     uploaded_name: str | None,
+    data_id: str | None,
+    source_metadata: dict[str, Any] | None,
     target: str,
     selected_features: list[str],
     parameters: dict[str, Any],
@@ -1425,9 +1580,11 @@ def save_work_checkpoint(
     data_payload: dict[str, Any] = {
         "source": data_source,
         "name": uploaded_name,
+        "data_id": data_id,
         "data_key": data_key,
         "rows": int(len(df)),
         "columns": [str(column) for column in df.columns],
+        "metadata": json_safe(source_metadata or {}),
     }
     if data_source == "uploaded":
         data_payload["frame_json"] = df.to_json(orient="split", date_format="iso", default_handler=str)
@@ -2168,37 +2325,104 @@ def main() -> None:
     checkpoint = load_work_checkpoint(work_id)
     restore_checkpoint_ui_state(checkpoint)
 
-    uploaded = st.sidebar.file_uploader("CSV yukle", type=["csv"])
-    restored_upload = False
+    query_session = load_session_dataframe_from_query()
+    query_data_id = query_session[2] if query_session is not None else None
+    if query_data_id and st.session_state.get("_last_query_data_id") != query_data_id:
+        st.session_state["data_source_choice"] = "Session DataFrame"
+        st.session_state["_last_query_data_id"] = query_data_id
+
+    source_options = ["Session DataFrame", "CSV / Excel Upload", "SQL", "Demo"]
+    default_source = "Session DataFrame" if query_session is not None else "Demo"
+    if st.session_state.get("data_source_choice") == "CSV Upload":
+        st.session_state["data_source_choice"] = "CSV / Excel Upload"
+    if st.session_state.get("data_source_choice") not in source_options:
+        st.session_state["data_source_choice"] = default_source
+    source_choice = st.sidebar.radio(
+        "Data source",
+        source_options,
+        index=source_options.index(default_source),
+        key="data_source_choice",
+    )
+
     uploaded_name: str | None = None
+    source_metadata: dict[str, Any] = {}
+    source_data_id: str | None = None
     data_source = "demo"
-    if uploaded is not None:
-        df = pd.read_csv(uploaded)
-        uploaded_name = uploaded.name
-        data_source = "uploaded"
-        data_key = uploaded_data_key(uploaded.name, df)
-    else:
-        restored_dataframe = restore_checkpoint_dataframe(checkpoint)
-        if restored_dataframe is not None:
-            df, uploaded_name, data_key = restored_dataframe
-            data_source = "uploaded"
-            restored_upload = True
+    restored_upload = False
+    if source_choice == "Session DataFrame":
+        if query_session is None:
+            st.info("No valid session DataFrame was found. Choose another data source in the sidebar.")
+            st.stop()
+        df, source_metadata, source_data_id, data_key = query_session
+        uploaded_name = str(source_metadata.get("name") or "Session DataFrame")
+        data_source = str(source_metadata.get("source") or "session")
+    elif source_choice == "CSV / Excel Upload":
+        uploaded = st.sidebar.file_uploader("CSV veya Excel yukle", type=["csv", "xlsx", "xls"])
+        if uploaded is None:
+            restored_dataframe = restore_checkpoint_dataframe(checkpoint)
+            if restored_dataframe is not None:
+                df, uploaded_name, data_key = restored_dataframe
+                data_source = "uploaded"
+                restored_upload = True
+            else:
+                st.info("Upload a CSV or Excel file from the sidebar.")
+                st.stop()
         else:
-            df = make_demo_data()
-            data_key = "demo"
+            try:
+                df = read_uploaded_table(uploaded)
+            except Exception as exc:
+                st.sidebar.error(f"File load failed: {exc}")
+                st.stop()
+            uploaded_name = uploaded.name
+            data_source = "uploaded"
+            upload_key = uploaded_data_key(uploaded.name, df)
+            source_metadata = {
+                "source": "uploaded",
+                "name": uploaded.name,
+                "upload_name": uploaded.name,
+                "fingerprint": dataframe_fingerprint(df),
+            }
+            cache_key = "_uploaded_session"
+            cached_upload = st.session_state.get(cache_key, {})
+            if cached_upload.get("upload_key") == upload_key:
+                source_data_id = cached_upload.get("data_id")
+            else:
+                source_data_id = save_source_session(
+                    df,
+                    source="uploaded",
+                    name=uploaded.name,
+                    metadata={"upload_name": uploaded.name},
+                )
+                st.session_state[cache_key] = {"upload_key": upload_key, "data_id": source_data_id}
+            data_key = session_data_key(str(source_data_id), df, source_metadata)
+            if normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM)) != source_data_id:
+                st.query_params[DATA_ID_QUERY_PARAM] = source_data_id
+                st.rerun()
+    elif source_choice == "SQL":
+        render_sql_source_loader()
+    else:
+        df = make_demo_data()
+        data_key = "demo"
 
     st.sidebar.caption(f"Rows: {len(df):,} | Columns: {len(df.columns):,}")
     if restored_upload and uploaded_name is not None:
         st.sidebar.caption(f"Restored uploaded data: {uploaded_name}")
+    if source_data_id:
+        st.sidebar.caption(f"Data id: {source_data_id}")
     st.sidebar.caption(f"Autosave work id: {work_id}")
     if st.session_state.get("_checkpoint_error"):
         st.sidebar.warning(f"Autosave failed: {st.session_state['_checkpoint_error']}")
 
-    saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) else None
+    checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
+    checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
+    saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) and checkpoint_data_key == data_key else None
+    source_target = source_metadata_value(source_metadata, "target")
     target_options = df.columns.tolist()
     default_target_index = target_options.index("risk_flag") if "risk_flag" in target_options else len(target_options) - 1
     if saved_target in target_options:
         default_target_index = target_options.index(saved_target)
+    elif source_target in target_options:
+        default_target_index = target_options.index(source_target)
     target = st.sidebar.selectbox(
         "Target",
         options=target_options,
@@ -2208,7 +2432,11 @@ def main() -> None:
     if target_kind == "binary":
         positive_class_options = list(df[target].dropna().unique())
         positive_class_key = f"positive_class::{data_key}::{target}"
-        checkpoint_positive_class = checkpoint.get("positive_class") if isinstance(checkpoint, dict) else None
+        checkpoint_positive_class = (
+            checkpoint.get("positive_class")
+            if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
+            else None
+        )
         remembered_positive_class = st.session_state.get(positive_class_key, checkpoint_positive_class)
         default_positive_class = choose_positive_class(
             df[target],
@@ -2227,9 +2455,16 @@ def main() -> None:
         st.session_state[POSITIVE_CLASS_SESSION_KEY] = None
 
     default_features = [c for c in df.columns if c != target]
-    checkpoint_features = checkpoint.get("selected_features") if isinstance(checkpoint, dict) else None
+    checkpoint_features = (
+        checkpoint.get("selected_features")
+        if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
+        else None
+    )
+    source_features = source_metadata_value(source_metadata, "features")
     if isinstance(checkpoint_features, list):
         default_selected_features = [str(feature) for feature in checkpoint_features if str(feature) in default_features]
+    elif isinstance(source_features, list):
+        default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
     else:
         default_selected_features = default_features
     selected_features = st.sidebar.multiselect(
@@ -2239,7 +2474,11 @@ def main() -> None:
     )
     features = selected_features
 
-    saved_parameters = checkpoint.get("parameters") if isinstance(checkpoint, dict) else {}
+    saved_parameters = (
+        checkpoint.get("parameters")
+        if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
+        else {}
+    )
     if not isinstance(saved_parameters, dict):
         saved_parameters = {}
     min_leaf_input = st.sidebar.number_input(
@@ -2292,7 +2531,11 @@ def main() -> None:
         "max_categories": max_categories,
         "max_category_groups": max_category_groups,
     }
-    saved_auto_parameters = checkpoint.get("auto_parameters") if isinstance(checkpoint, dict) else {}
+    saved_auto_parameters = (
+        checkpoint.get("auto_parameters")
+        if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
+        else {}
+    )
     if not isinstance(saved_auto_parameters, dict):
         saved_auto_parameters = {}
     auto_parameters: dict[str, Any] = {}
@@ -2304,6 +2547,8 @@ def main() -> None:
             data_key=data_key,
             data_source=data_source,
             uploaded_name=uploaded_name,
+            data_id=source_data_id,
+            source_metadata=source_metadata,
             target=target,
             selected_features=features,
             parameters=parameters,
@@ -2735,6 +2980,8 @@ def main() -> None:
         data_key=data_key,
         data_source=data_source,
         uploaded_name=uploaded_name,
+        data_id=source_data_id,
+        source_metadata=source_metadata,
         target=target,
         selected_features=features,
         parameters=parameters,

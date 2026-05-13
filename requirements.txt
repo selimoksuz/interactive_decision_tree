@@ -2,3 +2,6 @@ streamlit
 pandas
 numpy
 streamlit-agraph
+SQLAlchemy>=2.0
+openpyxl>=3.1
+xlrd>=2.0
