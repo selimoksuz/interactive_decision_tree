@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+dist/
+wheelhouse/
+.setup_state.json
 .streamlit/
 .tree_checkpoints/
 .tree_sessions/

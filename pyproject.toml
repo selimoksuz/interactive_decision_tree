@@ -25,6 +25,7 @@ dev = [
 ]
 notebook = [
     "ipykernel",
+    "notebook",
 ]
 oracle = [
     "oracledb",

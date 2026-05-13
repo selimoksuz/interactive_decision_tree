@@ -42,6 +42,54 @@ Hazir notebook ornegi:
 examples/notebook_dataframe_sql_demo.ipynb
 ```
 
+## Is birimi icin Windows/Linux release
+
+Business kullaniminda kullanici Python 3.10+ kurulu bir makinede zip/tar paketini acar ve launcher'i calistirir. Kullanici `pip`, `venv` veya Streamlit komutu yazmaz.
+
+Windows:
+
+```text
+Start Interactive Tree.bat
+Open Notebook.bat
+```
+
+Linux local desktop:
+
+```bash
+chmod +x start_interactive_tree.sh open_notebook.sh
+./start_interactive_tree.sh --mode local --port 8501
+```
+
+Linux remote server:
+
+```bash
+./start_interactive_tree.sh --mode server --port 8501
+```
+
+Server modunda app `0.0.0.0:<port>` uzerinden dinler ve terminalde network URL'lerini yazar. Bu mod sadece guvenli kurum ici network icin dusunulmustur.
+
+Business release offline wheelhouse bekler:
+
+```text
+wheelhouse/windows/
+wheelhouse/linux/
+```
+
+Wheelhouse hangi OS ve Python minor version ile olusturulduysa ayni OS ve Python minor version ile kullanilmalidir. Ornegin Python 3.11 ile uretilen wheelhouse, Python 3.10 makinede kullanilmaz.
+
+Release uretimi:
+
+```powershell
+.\scripts\build_release.ps1
+```
+
+```bash
+chmod +x scripts/build_release.sh
+./scripts/build_release.sh
+```
+
+Windows wheelhouse Windows makinede, Linux wheelhouse Linux makinede uretilir. Release paketine `.venv`, `.tree_sessions`, `.tree_checkpoints`, `.streamlit`, `oracle_config`, log/cache ve git klasorleri dahil edilmez.
+
 SQL tablosu veya query sonucu ile kullanmak icin:
 
 ```python
