@@ -154,3 +154,24 @@ tree_payload = load_tree_json("interactive_entropy_tree_runnable.json")
 ```
 
 `tree_payload["tree"]` nested karar agacini, `tree_payload["nodes"]` node listesini, `tree_payload["metrics"]` model metriklerini tutar. Pickle dosyalarini sadece kendi urettiğin guvenilir dosyalardan yukle.
+
+Tek musteri skorlamak icin:
+
+```python
+from interactive_decision_tree import load_tree_pickle, score_tree_payload
+
+tree_payload = load_tree_pickle(r"C:\Users\Acer\Downloads\interactive_entropy_tree_runnable.pkl")
+
+one_customer = {
+    "age": 34,
+    "income": 35_000,
+    "tenure_months": 12,
+    "segment": "C",
+    "channel": "mobile",
+    "region": "marmara",
+}
+
+score_result = score_tree_payload(tree_payload, one_customer)
+score_result["prediction"]
+score_result["trace"]
+```
