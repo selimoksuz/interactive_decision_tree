@@ -34,6 +34,29 @@ def _server_url(port: int) -> str:
     return f"http://localhost:{int(port)}"
 
 
+def _append_query(base_url: str, query: str) -> str:
+    parts = urllib.parse.urlsplit(base_url)
+    path = parts.path or "/"
+    existing_query = parts.query
+    merged_query = f"{existing_query}&{query}" if existing_query else query
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, merged_query, parts.fragment))
+
+
+def _launch_url(
+    port: int,
+    query: str,
+    *,
+    host: str = "localhost",
+    scheme: str = "http",
+    base_url: str | None = None,
+) -> str:
+    if base_url is None and "://" in host:
+        base_url = host
+    if base_url is None:
+        base_url = f"{scheme}://{host}:{int(port)}/"
+    return _append_query(base_url, query)
+
+
 def _server_is_ready(port: int) -> bool:
     try:
         with urllib.request.urlopen(_server_url(port), timeout=1) as response:
@@ -94,6 +117,9 @@ def launch_tree(
     start_server: bool = True,
     session_name: str | None = None,
     session_dir: str | Path | None = None,
+    host: str = "localhost",
+    scheme: str = "http",
+    base_url: str | None = None,
     _source: str = "notebook",
     _metadata: dict[str, Any] | None = None,
 ) -> str:
@@ -116,7 +142,7 @@ def launch_tree(
             "work_id": work_id or uuid4().hex,
         }
     )
-    url = f"{_server_url(port)}/?{query}"
+    url = _launch_url(port, query, host=host, scheme=scheme, base_url=base_url)
     if open_browser:
         webbrowser.open(url)
     return url

@@ -142,7 +142,33 @@ url = launch_tree(
 )
 ```
 
-Jupyter proxy URL'sine cevirirken `?data_id=...&work_id=...` query kismini korumalisin.
+Jupyter/OpenShift proxy URL'sini elle cevirmek yerine dogrudan `base_url` verebilirsin:
+
+```python
+url = launch_tree(
+    df,
+    target="risk_flag",
+    start_server=False,
+    open_browser=False,
+    base_url="https://<notebook-host>/notebook/<workspace>/proxy/8501/",
+)
+```
+
+Route veya farkli host kullaniyorsan:
+
+```python
+url = launch_tree(
+    df,
+    target="risk_flag",
+    start_server=False,
+    open_browser=False,
+    host="interactive-tree.apps.internal",
+    scheme="https",
+    port=8501,
+)
+```
+
+`base_url` kullanmazsan query kismini elle tasirken `?data_id=...&work_id=...` degerlerini korumalisin.
 
 ### SQL
 
