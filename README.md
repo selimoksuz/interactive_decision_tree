@@ -78,6 +78,7 @@ wheelhouse/linux/
 ```
 
 Wheelhouse hangi OS ve Python minor version ile olusturulduysa ayni OS ve Python minor version ile kullanilmalidir. Ornegin Python 3.11 ile uretilen wheelhouse, Python 3.10 makinede kullanilmaz.
+Kaynak kod checkout'inda wheelhouse yoksa launcher geliştirici kolayligi icin online kurulum yapabilir; business release paketinde wheelhouse zorunludur.
 
 Release uretimi:
 

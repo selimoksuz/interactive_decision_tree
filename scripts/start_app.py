@@ -30,6 +30,7 @@ NOTEBOOK_IMPORTS = ["ipykernel", "notebook"]
 KERNEL_NAME = "interactive_decision_tree_env"
 KERNEL_DISPLAY_NAME = "interactive_decision_tree_env (.venv)"
 SETUP_STATE_FILE = ".setup_state.json"
+RELEASE_MANIFEST_FILE = "BUSINESS_RELEASE_MANIFEST.json"
 
 
 def project_root() -> Path:
@@ -92,6 +93,10 @@ def load_setup_state(root: Path) -> dict[str, object]:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def is_business_release(root: Path) -> bool:
+    return (root / RELEASE_MANIFEST_FILE).exists()
 
 
 def save_setup_state(root: Path, state: dict[str, object]) -> None:
@@ -168,9 +173,19 @@ def install_dependencies(root: Path, profile: str, allow_online: bool = False) -
     if allow_online:
         print("Installing dependencies from online package index.")
     else:
-        wheelhouse = validate_wheelhouse(root)
-        print(f"Installing dependencies from offline wheelhouse: {wheelhouse}")
-        command.extend(["--no-index", "--find-links", str(wheelhouse)])
+        try:
+            wheelhouse = validate_wheelhouse(root)
+        except RuntimeError:
+            if is_business_release(root):
+                raise
+            print(
+                "Offline wheelhouse was not found in this source checkout; "
+                "installing dependencies from the online package index."
+            )
+            print("Business release packages still require a platform wheelhouse.")
+        else:
+            print(f"Installing dependencies from offline wheelhouse: {wheelhouse}")
+            command.extend(["--no-index", "--find-links", str(wheelhouse)])
     for req_file in req_files:
         command.extend(["-r", str(req_file)])
 
