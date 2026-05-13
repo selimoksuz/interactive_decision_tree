@@ -23,7 +23,8 @@ Notebook icinden kullanmak icin editable kurulum:
 
 ```powershell
 cd C:\Users\Acer\interactive_decision_tree
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install -e ".[notebook]"
+.\.venv\Scripts\python.exe -m ipykernel install --user --name interactive-decision-tree --display-name "Python (.venv interactive_decision_tree)"
 ```
 
 Python / notebook:

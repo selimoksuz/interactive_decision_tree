@@ -22,6 +22,9 @@ dependencies = [
 dev = [
     "pytest",
 ]
+notebook = [
+    "ipykernel",
+]
 
 [tool.setuptools]
 py-modules = ["interactive_decision_tree_app"]
