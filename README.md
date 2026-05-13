@@ -42,6 +42,8 @@ Hazir notebook ornegi:
 examples/notebook_dataframe_sql_demo.ipynb
 ```
 
+Bu notebook lokal sample DataFrame akisini ve Oracle'a demo data yazip tekrar Oracle'dan okuyarak UI'a aktarma akisini gosterir.
+
 ## Is birimi icin Windows/Linux release
 
 Business kullaniminda kullanici Python 3.10+ kurulu bir makinede zip/tar paketini acar ve launcher'i calistirir. Kullanici `pip`, `venv` veya Streamlit komutu yazmaz.
