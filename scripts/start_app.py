@@ -153,6 +153,23 @@ def imports_available(python_path: Path, imports: list[str]) -> bool:
     return result.returncode == 0
 
 
+def project_package_installed(python_path: Path) -> bool:
+    result = subprocess.run(
+        [str(python_path), "-m", "pip", "show", "interactive-decision-tree"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(project_root()),
+    )
+    return result.returncode == 0
+
+
+def install_project_editable(root: Path, python_path: Path) -> None:
+    subprocess.check_call(
+        [str(python_path), "-m", "pip", "install", "--no-deps", "-e", str(root)],
+        cwd=str(root),
+    )
+
+
 def install_dependencies(root: Path, profile: str, allow_online: bool = False) -> None:
     python_path = venv_python(root)
     req_files = requirement_files(root, profile)
@@ -166,6 +183,8 @@ def install_dependencies(root: Path, profile: str, allow_online: bool = False) -
         and profile_state.get("requirements_hash") == req_hash
         and imports_available(python_path, expected_imports)
     ):
+        if not project_package_installed(python_path):
+            install_project_editable(root, python_path)
         print(f"Dependencies already installed for profile: {profile}")
         return
 
@@ -190,6 +209,7 @@ def install_dependencies(root: Path, profile: str, allow_online: bool = False) -
         command.extend(["-r", str(req_file)])
 
     subprocess.check_call(command, cwd=str(root))
+    install_project_editable(root, python_path)
     state[profile] = {
         "requirements_hash": req_hash,
         "platform": platform_key(),
