@@ -1837,6 +1837,9 @@ def tree_export(
         "positive_class": json_safe(choose_positive_class(df[target])) if target_kind == "binary" else None,
         "features": features,
         "parameters": json_safe(parameters),
+        "data_rows": int(len(df)),
+        "data_columns": [str(column) for column in df.columns],
+        "data_fingerprint": dataframe_fingerprint(df),
         "metrics": json_safe(metrics),
         "root_node_id": 0,
         "node_count": node_count,
@@ -1846,6 +1849,251 @@ def tree_export(
         "nodes_by_id": {str(node["node_id"]): node for node in nodes},
         "tree": export_nested_node(df, target, 0, export_paths),
     }
+
+
+class TreeImportError(ValueError):
+    pass
+
+
+def read_tree_payload_upload(uploaded: Any) -> dict[str, Any]:
+    suffix = Path(uploaded.name).suffix.lower()
+    raw = uploaded.getvalue()
+    if suffix == ".json":
+        payload = json.loads(raw.decode("utf-8"))
+    elif suffix in (".pkl", ".pickle"):
+        payload = pickle.loads(raw)
+    else:
+        raise TreeImportError("Unsupported tree artifact type. Use JSON or pickle.")
+    if not isinstance(payload, dict):
+        raise TreeImportError("Tree artifact must contain a dictionary payload.")
+    return payload
+
+
+def category_values_for_condition(series: pd.Series) -> pd.Series:
+    return series.astype("object").where(series.notna(), "__MISSING__")
+
+
+def export_condition_mask(df: pd.DataFrame, row_idx: list[int], condition: dict[str, Any]) -> pd.Series:
+    feature = condition.get("feature")
+    if feature not in df.columns:
+        raise TreeImportError(f"Split feature is missing from current data: {feature}")
+
+    series = df.loc[row_idx, feature]
+    operator = condition.get("operator")
+
+    if operator in ("<=", ">"):
+        numeric = pd.to_numeric(series, errors="coerce")
+        threshold = float(condition["threshold"])
+        mask = numeric <= threshold if operator == "<=" else numeric > threshold
+        if condition.get("includes_missing"):
+            mask = mask | numeric.isna()
+        return mask
+
+    if operator == "range":
+        numeric = pd.to_numeric(series, errors="coerce")
+        lower = float(condition["lower"])
+        upper = float(condition["upper"])
+        lower_ok = numeric >= lower if condition.get("lower_inclusive") else numeric > lower
+        upper_ok = numeric <= upper if condition.get("upper_inclusive") else numeric < upper
+        mask = lower_ok & upper_ok
+        if condition.get("includes_missing"):
+            mask = mask | numeric.isna()
+        return mask
+
+    values = category_values_for_condition(series)
+    if operator == "==":
+        return values == condition.get("value")
+    if operator == "!=":
+        return values != condition.get("value")
+    if operator == "in":
+        return values.isin(condition.get("values", []))
+    if operator == "not_in":
+        return ~values.isin(condition.get("values", []))
+
+    raise TreeImportError(f"Unsupported imported branch operator: {operator}")
+
+
+def split_value_from_export(split: dict[str, Any], branches: list[dict[str, Any]]) -> Any:
+    if "value" in split:
+        return split["value"]
+
+    split_type = split.get("type") or split.get("split_type")
+    conditions = [branch.get("condition", {}) for branch in branches]
+    if split_type == "numeric_le":
+        for condition in conditions:
+            if condition.get("operator") == "<=":
+                return condition.get("threshold")
+    if split_type == "category_eq":
+        for condition in conditions:
+            if condition.get("operator") == "==":
+                return condition.get("value")
+    if split_type == "category_group":
+        for condition in conditions:
+            if condition.get("operator") == "in":
+                return tuple(condition.get("values", []))
+    if split_type in ("category_profile_groups", "category_manual_groups"):
+        return tuple(tuple(condition.get("values", [])) for condition in conditions)
+    if split_type in ("numeric_bins", "numeric_manual_bins"):
+        thresholds: list[Any] = []
+        for condition in conditions:
+            if condition.get("operator") == "<=":
+                thresholds.append(condition.get("threshold"))
+            elif condition.get("operator") == "range":
+                thresholds.append(condition.get("upper"))
+        deduped: list[Any] = []
+        for threshold in thresholds:
+            if threshold not in deduped:
+                deduped.append(threshold)
+        return tuple(deduped)
+
+    return None
+
+
+def branch_indices_from_export(
+    df: pd.DataFrame,
+    row_idx: list[int],
+    branches: list[dict[str, Any]],
+    node_id: int,
+) -> list[tuple[dict[str, Any], list[int]]]:
+    matched_indices: list[int] = []
+    out: list[tuple[dict[str, Any], list[int]]] = []
+
+    for branch in branches:
+        condition = branch.get("condition")
+        if not isinstance(condition, dict):
+            raise TreeImportError(f"Node {node_id} has a branch without a valid condition.")
+        mask = export_condition_mask(df, row_idx, condition)
+        child_idx = df.loc[row_idx].loc[mask].index.tolist()
+        expected_child = branch.get("child") or {}
+        expected_n = expected_child.get("n")
+        if expected_n is not None and int(expected_n) != len(child_idx):
+            raise TreeImportError(
+                f"Node {node_id} branch '{branch.get('label')}' row mismatch: "
+                f"artifact has {expected_n}, current data gives {len(child_idx)}."
+            )
+        matched_indices.extend(child_idx)
+        out.append((branch, child_idx))
+
+    if len(set(matched_indices)) != len(matched_indices) or set(matched_indices) != set(row_idx):
+        raise TreeImportError(
+            f"Node {node_id} branch conditions do not exactly cover the current node rows."
+        )
+    return out
+
+
+def rebuild_editable_tree_from_export(
+    df: pd.DataFrame,
+    target: str,
+    payload: dict[str, Any],
+) -> tuple[dict[int, dict[str, Any]], int, list[int], list[str]]:
+    if payload.get("target") != target:
+        raise TreeImportError(
+            f"Target mismatch: artifact target is {payload.get('target')!r}, current target is {target!r}."
+        )
+
+    root = payload.get("tree")
+    if not isinstance(root, dict):
+        raise TreeImportError("Tree artifact must contain a nested `tree` object.")
+
+    payload_features = [str(feature) for feature in payload.get("features", [])]
+    missing_features = [
+        feature for feature in payload_features if feature != target and feature not in df.columns
+    ]
+    if missing_features:
+        raise TreeImportError(f"Current data is missing imported feature(s): {', '.join(missing_features)}")
+
+    expected_rows = payload.get("data_rows") or root.get("n")
+    if expected_rows is not None and int(expected_rows) != len(df):
+        raise TreeImportError(
+            f"Row count mismatch: artifact has {expected_rows}, current data has {len(df)}."
+        )
+    expected_columns = payload.get("data_columns")
+    if isinstance(expected_columns, list):
+        missing_columns = [str(column) for column in expected_columns if str(column) not in df.columns]
+        if missing_columns:
+            raise TreeImportError(
+                f"Current data is missing imported column(s): {', '.join(missing_columns)}"
+            )
+    expected_fingerprint = payload.get("data_fingerprint")
+    if expected_fingerprint and str(expected_fingerprint) != dataframe_fingerprint(df):
+        raise TreeImportError(
+            "Data fingerprint mismatch. Load the same dataframe snapshot before importing this tree."
+        )
+
+    tree: dict[int, dict[str, Any]] = {}
+    split_history: list[int] = []
+
+    def rebuild_node(node_payload: dict[str, Any], row_idx: list[int], depth: int, path: str) -> int:
+        node_id = int(node_payload["node_id"])
+        if node_id in tree:
+            raise TreeImportError(f"Duplicate node id in artifact: {node_id}")
+
+        expected_n = node_payload.get("n")
+        if expected_n is not None and int(expected_n) != len(row_idx):
+            raise TreeImportError(
+                f"Node {node_id} row mismatch: artifact has {expected_n}, current data gives {len(row_idx)}."
+            )
+
+        branches = node_payload.get("branches") or []
+        is_leaf = bool(node_payload.get("is_leaf")) or not branches
+        node = {
+            "id": node_id,
+            "depth": depth,
+            "path": path,
+            "row_idx": row_idx,
+            "split": None,
+            "children": [],
+            "left": None,
+            "right": None,
+        }
+        tree[node_id] = node
+        if is_leaf:
+            return node_id
+
+        split = node_payload.get("split")
+        if not isinstance(split, dict):
+            raise TreeImportError(f"Node {node_id} is not a leaf but has no split metadata.")
+        split_type = split.get("type") or split.get("split_type")
+        if not split_type:
+            raise TreeImportError(f"Node {node_id} split type is missing.")
+        split_feature = split.get("feature")
+        if split_feature not in df.columns:
+            raise TreeImportError(f"Node {node_id} split feature is missing from current data: {split_feature}")
+
+        branch_rows = branch_indices_from_export(df, row_idx, branches, node_id)
+        branch_labels = [str(branch.get("label", "")) for branch, _ in branch_rows]
+        node["split"] = {
+            "feature": split_feature,
+            "split_type": split_type,
+            "value": split_value_from_export(split, branches),
+            "label": split.get("label", f"{split_feature} {split_type}"),
+            "branch_count": len(branches),
+            "branch_labels": branch_labels,
+            "information_gain": float(split.get("information_gain", 0.0) or 0.0),
+            "weighted_entropy": float(split.get("weighted_impurity", split.get("weighted_entropy", 0.0)) or 0.0),
+        }
+        split_history.append(node_id)
+
+        children: list[dict[str, Any]] = []
+        for branch, child_idx in branch_rows:
+            child_payload = branch.get("child")
+            if not isinstance(child_payload, dict):
+                raise TreeImportError(f"Node {node_id} branch '{branch.get('label')}' has no child payload.")
+            condition = branch.get("condition") or {}
+            child_path = export_branch_path(path, branch.get("label", ""), condition)
+            child_id = rebuild_node(child_payload, child_idx, depth + 1, child_path)
+            children.append({"id": child_id, "label": str(branch.get("label", ""))})
+
+        node["children"] = children
+        if len(children) == 2:
+            node["left"] = children[0]["id"]
+            node["right"] = children[1]["id"]
+        return node_id
+
+    rebuild_node(root, df.index.tolist(), 0, "root")
+    if 0 not in tree:
+        raise TreeImportError("Imported tree must contain root node_id 0.")
+    return tree, max(tree) + 1, split_history, payload_features
 
 
 def truncate_text(value: Any, max_len: int = 70) -> str:
@@ -2589,7 +2837,7 @@ def main() -> None:
         saved_auto_parameters = {}
     auto_parameters: dict[str, Any] = {}
 
-    def save_and_rerun() -> None:
+    def save_and_rerun(selected_features_override: list[str] | None = None) -> None:
         save_work_checkpoint(
             work_id=work_id,
             df=df,
@@ -2599,7 +2847,7 @@ def main() -> None:
             data_id=source_data_id,
             source_metadata=source_metadata,
             target=target,
-            selected_features=features,
+            selected_features=selected_features_override or features,
             parameters=parameters,
             auto_parameters=auto_parameters,
         )
@@ -2651,6 +2899,40 @@ def main() -> None:
             save_and_rerun()
         if st.session_state.get("auto_tree_message"):
             st.caption(st.session_state.auto_tree_message)
+
+    with st.sidebar.expander("Import editable tree", expanded=False):
+        st.caption("Upload a tree JSON/pickle exported from this app after loading the same data.")
+        imported_tree_file = st.file_uploader(
+            "Tree artifact",
+            type=["json", "pkl", "pickle"],
+            key="tree_import_upload",
+            help="Pickle import is intended only for local files exported by this app.",
+        )
+        if st.button("Import tree into current data", width="stretch", disabled=imported_tree_file is None):
+            try:
+                import_payload = read_tree_payload_upload(imported_tree_file)
+                imported_tree, next_node_id, split_history, imported_features = rebuild_editable_tree_from_export(
+                    df,
+                    target,
+                    import_payload,
+                )
+            except (TreeImportError, json.JSONDecodeError, pickle.PickleError, OSError, ValueError) as exc:
+                st.error(f"Import failed: {exc}")
+            else:
+                imported_selected_features = [
+                    feature for feature in imported_features if feature in df.columns and feature != target
+                ]
+                st.session_state.tree = imported_tree
+                st.session_state.next_node_id = next_node_id
+                st.session_state.split_history = split_history
+                st.session_state.current_node_id = 0
+                st.session_state.tree_zoom = recommended_tree_zoom()
+                st.session_state["_tree_import_message"] = (
+                    f"Imported editable tree with {len(imported_tree)} node(s)."
+                )
+                save_and_rerun(imported_selected_features or features)
+        if st.session_state.get("_tree_import_message"):
+            st.caption(st.session_state["_tree_import_message"])
 
     if st.sidebar.button("Reset tree", width="stretch"):
         init_tree(df)

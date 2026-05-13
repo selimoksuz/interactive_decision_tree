@@ -123,6 +123,7 @@ password = ...
 - Sidebar uzerinden Session DataFrame, CSV / Excel Upload, SQL ve Demo kaynaklari arasinda gecis
 - UI uzerinden `.csv`, `.xlsx` ve `.xls` dosyalarini yukleyebilme
 - Sayfa yenilense bile ayni `work_id` URL parametresiyle agaci otomatik geri yukleme
+- Ayni data yukluyken exported tree JSON/pickle dosyasini UI'a import edip agaci editable halde devam ettirme
 - Runnable nested tree JSON export
 
 ## Lokal session ve secrets
