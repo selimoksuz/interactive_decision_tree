@@ -2464,12 +2464,47 @@ def candidate_impact_rows(
 
 def parse_threshold_text(text: str) -> list[float]:
     thresholds: list[float] = []
-    for raw in text.replace(";", ",").split(","):
+    normalized = text.replace(";", ",").replace("\n", ",")
+    for raw in normalized.split(","):
         raw = raw.strip()
         if not raw:
             continue
         thresholds.append(float(raw))
     return sorted({float(x) for x in thresholds})
+
+
+def manual_numeric_branch_rows(
+    df: pd.DataFrame,
+    row_idx: list[int],
+    feature: str,
+    thresholds: list[float],
+) -> list[dict[str, Any]]:
+    thresholds = sorted({float(x) for x in thresholds})
+    if not thresholds:
+        return []
+
+    frame = df.loc[row_idx, [feature]]
+    numeric = pd.to_numeric(frame[feature], errors="coerce")
+    rows: list[dict[str, Any]] = []
+    previous_threshold: float | None = None
+    covered = pd.Series(False, index=frame.index)
+
+    for threshold in thresholds:
+        if previous_threshold is None:
+            mask = numeric <= threshold
+            label = f"<= {threshold:.6g}"
+        else:
+            mask = (numeric > previous_threshold) & (numeric <= threshold)
+            label = f"> {previous_threshold:.6g} and <= {threshold:.6g}"
+        covered = covered | mask
+        rows.append({"branch": label, "rows": int(mask.sum())})
+        previous_threshold = threshold
+
+    last_mask = numeric > thresholds[-1]
+    if numeric.isna().any():
+        last_mask = last_mask | ~covered
+    rows.append({"branch": f"> {thresholds[-1]:.6g}", "rows": int(last_mask.sum())})
+    return rows
 
 
 def safe_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -3150,6 +3185,18 @@ def main() -> None:
                         if manual_text.strip():
                             try:
                                 thresholds = parse_threshold_text(manual_text)
+                                branch_rows = manual_numeric_branch_rows(
+                                    df,
+                                    current["row_idx"],
+                                    selected_feature,
+                                    thresholds,
+                                )
+                                if branch_rows:
+                                    st.dataframe(
+                                        arrow_safe_dataframe(pd.DataFrame(branch_rows)),
+                                        hide_index=True,
+                                        width="stretch",
+                                    )
                                 manual_candidate = score_numeric_manual_bins(
                                     df=df,
                                     target=target,
@@ -3158,6 +3205,22 @@ def main() -> None:
                                     thresholds=thresholds,
                                     min_leaf=int(min_leaf),
                                 )
+                                if manual_candidate is None:
+                                    low_branches = [
+                                        row
+                                        for row in branch_rows
+                                        if int(row["rows"]) < int(min_leaf)
+                                    ]
+                                    if low_branches:
+                                        branch_text = ", ".join(
+                                            f"{row['branch']} n={row['rows']}" for row in low_branches
+                                        )
+                                        st.warning(
+                                            "Manual split is not valid because every branch must have "
+                                            f"at least {int(min_leaf)} rows. Low-count branch(es): {branch_text}."
+                                        )
+                                    else:
+                                        st.warning("Manual split is not valid for the current node.")
                             except ValueError:
                                 st.warning("Manual thresholds must be numeric values separated by comma.")
                     else:
