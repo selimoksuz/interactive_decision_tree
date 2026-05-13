@@ -16,6 +16,7 @@ from streamlit_agraph import Config, Edge, Node, agraph
 
 from interactive_decision_tree.session_store import (
     DATA_ID_QUERY_PARAM,
+    default_session_dir,
     load_dataframe_session,
     normalize_data_id,
     save_dataframe_session,
@@ -1311,7 +1312,10 @@ def load_session_dataframe_from_query() -> tuple[pd.DataFrame, dict[str, Any], s
     try:
         df, metadata = load_dataframe_session(data_id)
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
-        st.sidebar.warning(f"Session data could not be loaded: {exc}")
+        st.sidebar.warning(
+            f"Session data could not be loaded: {exc}. "
+            f"Session directory: {default_session_dir()}"
+        )
         return None
     return df, metadata, data_id, session_data_key(data_id, df, metadata)
 

@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from interactive_decision_tree.session_store import (
+    default_session_dir,
     load_dataframe_session,
     normalize_data_id,
     save_dataframe_session,
@@ -44,3 +45,13 @@ def test_data_id_rejects_path_traversal(tmp_path, monkeypatch):
         assert normalize_data_id(bad_id) is None
         with pytest.raises(ValueError):
             session_path(bad_id)
+
+
+def test_default_session_dir_discovers_project_folder_from_notebook_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("INTERACTIVE_TREE_SESSION_DIR", raising=False)
+    project_dir = tmp_path / "interactive_decision_tree"
+    project_dir.mkdir()
+    (project_dir / "interactive_decision_tree_app.py").write_text("# marker\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert default_session_dir() == project_dir / ".tree_sessions"

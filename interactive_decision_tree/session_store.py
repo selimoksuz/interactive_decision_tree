@@ -18,17 +18,61 @@ SESSION_DIR_NAME = ".tree_sessions"
 DATA_FILE_NAME = "data.pkl"
 METADATA_FILE_NAME = "metadata.json"
 _DATA_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_PROJECT_CHILD_NAME = "interactive_decision_tree"
 
 
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _looks_like_project_root(path: Path) -> bool:
+    return (
+        (path / "interactive_decision_tree_app.py").exists()
+        or (path / "BUSINESS_RELEASE_MANIFEST.json").exists()
+        or ((path / "scripts" / "start_app.py").exists() and (path / "start_interactive_tree.sh").exists())
+    )
+
+
+def _candidate_project_roots() -> list[Path]:
+    candidates: list[Path] = []
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            return
+        if resolved not in candidates:
+            candidates.append(resolved)
+
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+
+    if cwd is not None:
+        for path in (cwd, *cwd.parents):
+            add(path)
+            add(path / _PROJECT_CHILD_NAME)
+
+    root = project_root()
+    add(root)
+    for parent in root.parents:
+        add(parent)
+    return candidates
+
+
+def discover_runtime_root() -> Path:
+    for candidate in _candidate_project_roots():
+        if _looks_like_project_root(candidate):
+            return candidate
+    return project_root()
+
+
 def default_session_dir() -> Path:
     configured = os.environ.get(SESSION_DIR_ENV)
     if configured:
         return Path(configured).expanduser().resolve()
-    return project_root() / SESSION_DIR_NAME
+    return discover_runtime_root() / SESSION_DIR_NAME
 
 
 def normalize_data_id(value: Any) -> str | None:

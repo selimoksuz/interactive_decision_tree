@@ -42,12 +42,19 @@ def _server_is_ready(port: int) -> bool:
         return False
 
 
-def _ensure_streamlit_server(port: int) -> None:
+def _resolve_session_dir(session_dir: str | Path | None = None) -> Path:
+    if session_dir is not None:
+        return Path(session_dir).expanduser().resolve()
+    return default_session_dir()
+
+
+def _ensure_streamlit_server(port: int, session_dir: str | Path | None = None) -> None:
     if _server_is_ready(port):
         return
 
+    resolved_session_dir = _resolve_session_dir(session_dir)
     env = os.environ.copy()
-    env[SESSION_DIR_ENV] = str(default_session_dir())
+    env[SESSION_DIR_ENV] = str(resolved_session_dir)
     command = [
         sys.executable,
         "-m",
@@ -86,9 +93,11 @@ def launch_tree(
     open_browser: bool = True,
     start_server: bool = True,
     session_name: str | None = None,
+    session_dir: str | Path | None = None,
     _source: str = "notebook",
     _metadata: dict[str, Any] | None = None,
 ) -> str:
+    resolved_session_dir = _resolve_session_dir(session_dir)
     data_id, _ = save_dataframe_session(
         df,
         source=_source,
@@ -96,9 +105,10 @@ def launch_tree(
         target=target,
         features=features,
         metadata=_metadata,
+        session_dir=resolved_session_dir,
     )
     if start_server:
-        _ensure_streamlit_server(port)
+        _ensure_streamlit_server(port, resolved_session_dir)
 
     query = urllib.parse.urlencode(
         {

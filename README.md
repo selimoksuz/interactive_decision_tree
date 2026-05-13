@@ -124,6 +124,26 @@ url
 
 Bu fonksiyon `.tree_sessions/<data_id>/data.pkl` dosyasini olusturur ve `http://localhost:8501/?data_id=...&work_id=...` linkini verir. Bu link acildiginda UI otomatik `Session DataFrame` modunda baslar.
 
+Notebook ve UI ayni proje klasorunden calisiyorsa session klasoru otomatik eslesir. OpenShift/Jupyter gibi ortamlarda app'i elle server modunda aciyorsan launcher ayni session klasorunu set eder:
+
+```bash
+./start_interactive_tree.sh --mode server --port 8501 --no-open-browser
+```
+
+Gerekirse notebook tarafinda ayni klasoru acikca verebilirsin:
+
+```python
+url = launch_tree(
+    df,
+    target="risk_flag",
+    start_server=False,
+    open_browser=False,
+    session_dir="/opt/app-root/src/interactive_decision_tree/.tree_sessions",
+)
+```
+
+Jupyter proxy URL'sine cevirirken `?data_id=...&work_id=...` query kismini korumalisin.
+
 ### SQL
 
 SQL modu Streamlit UI icinden SQLAlchemy URL ile tablo veya query sonucunu DataFrame'e cevirir. Sonuc `.tree_sessions/` altina snapshot olarak yazilir; sayfa yenilenince SQL tekrar calistirilmaz.

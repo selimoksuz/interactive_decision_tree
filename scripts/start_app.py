@@ -31,10 +31,26 @@ KERNEL_NAME = "interactive_decision_tree_env"
 KERNEL_DISPLAY_NAME = "interactive_decision_tree_env (.venv)"
 SETUP_STATE_FILE = ".setup_state.json"
 RELEASE_MANIFEST_FILE = "BUSINESS_RELEASE_MANIFEST.json"
+SESSION_DIR_ENV = "INTERACTIVE_TREE_SESSION_DIR"
+SESSION_DIR_NAME = ".tree_sessions"
 
 
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def resolve_session_dir(root: Path, override: str | None = None) -> Path:
+    configured = override or os.environ.get(SESSION_DIR_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (root / SESSION_DIR_NAME).resolve()
+
+
+def configure_session_dir(root: Path, override: str | None = None) -> Path:
+    session_dir = resolve_session_dir(root, override)
+    os.environ[SESSION_DIR_ENV] = str(session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_dir
 
 
 def platform_key() -> str:
@@ -240,6 +256,7 @@ def local_ip_addresses() -> list[str]:
 
 
 def run_streamlit(root: Path, args: argparse.Namespace) -> int:
+    session_dir = configure_session_dir(root, args.session_dir)
     host = "127.0.0.1" if args.mode == "local" else "0.0.0.0"
     browser_host = "localhost" if args.mode == "local" else "127.0.0.1"
     url = f"http://{browser_host}:{args.port}"
@@ -265,8 +282,9 @@ def run_streamlit(root: Path, args: argparse.Namespace) -> int:
     ]
 
     env = os.environ.copy()
-    env.setdefault("INTERACTIVE_TREE_SESSION_DIR", str(root / ".tree_sessions"))
+    env[SESSION_DIR_ENV] = str(session_dir)
     print("Starting Interactive Decision Tree...")
+    print(f"Session directory: {session_dir}")
     process = subprocess.Popen(command, cwd=str(root), env=env)
 
     deadline = time.time() + 30
@@ -342,6 +360,8 @@ def try_open_vscode(root: Path, notebook_path: Path) -> bool:
 
 
 def open_notebook(root: Path, args: argparse.Namespace) -> int:
+    session_dir = configure_session_dir(root, args.session_dir)
+    print(f"Session directory: {session_dir}")
     register_notebook_kernel(root)
     notebook_path = root / "examples" / "notebook_dataframe_sql_demo.ipynb"
     if try_open_vscode(root, notebook_path):
@@ -376,9 +396,11 @@ def build_parser(argv: list[str]) -> argparse.ArgumentParser:
     app_parser.add_argument("--port", type=int, default=8501)
     app_parser.add_argument("--open-browser", dest="open_browser", action="store_true", default=True)
     app_parser.add_argument("--no-open-browser", dest="open_browser", action="store_false")
+    app_parser.add_argument("--session-dir", help="Shared folder for notebook/UI DataFrame sessions")
     app_parser.add_argument("--allow-online", action="store_true", help="Allow online pip install if no wheelhouse is present")
 
     notebook_parser = subparsers.add_parser("notebook", help="Open the notebook example")
+    notebook_parser.add_argument("--session-dir", help="Shared folder for notebook/UI DataFrame sessions")
     notebook_parser.add_argument("--allow-online", action="store_true", help="Allow online pip install if no wheelhouse is present")
 
     return parser
@@ -396,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(raw_argv)
     root = project_root()
     profile = "notebook" if args.command == "notebook" else "app"
+    configure_session_dir(root, args.session_dir)
 
     if not running_inside_project_venv(root):
         return bootstrap_and_rerun(root, profile, raw_argv, allow_online=bool(args.allow_online))
