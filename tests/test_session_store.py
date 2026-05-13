@@ -7,6 +7,7 @@ from interactive_decision_tree.session_store import (
     default_session_dir,
     load_dataframe_session,
     normalize_data_id,
+    project_root,
     save_dataframe_session,
     session_path,
 )
@@ -47,11 +48,21 @@ def test_data_id_rejects_path_traversal(tmp_path, monkeypatch):
             session_path(bad_id)
 
 
-def test_default_session_dir_discovers_project_folder_from_notebook_cwd(tmp_path, monkeypatch):
+def test_default_session_dir_prefers_imported_project_root_over_cwd(tmp_path, monkeypatch):
     monkeypatch.delenv("INTERACTIVE_TREE_SESSION_DIR", raising=False)
     project_dir = tmp_path / "interactive_decision_tree"
     project_dir.mkdir()
     (project_dir / "interactive_decision_tree_app.py").write_text("# marker\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
-    assert default_session_dir() == project_dir / ".tree_sessions"
+    assert default_session_dir() == project_root() / ".tree_sessions"
+
+
+def test_default_session_dir_does_not_prefer_trash_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("INTERACTIVE_TREE_SESSION_DIR", raising=False)
+    trash_project = tmp_path / ".Trash" / "files" / "interactive_decision_tree"
+    trash_project.mkdir(parents=True)
+    (trash_project / "interactive_decision_tree_app.py").write_text("# stale copy\n", encoding="utf-8")
+    monkeypatch.chdir(trash_project)
+
+    assert ".Trash" not in str(default_session_dir())

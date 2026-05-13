@@ -19,6 +19,14 @@ DATA_FILE_NAME = "data.pkl"
 METADATA_FILE_NAME = "metadata.json"
 _DATA_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _PROJECT_CHILD_NAME = "interactive_decision_tree"
+_IGNORED_ROOT_PARTS = {
+    ".trash",
+    "trash",
+    ".trash-1000",
+    ".trash-1001",
+    "recycle bin",
+    "$recycle.bin",
+}
 
 
 def project_root() -> Path:
@@ -33,6 +41,10 @@ def _looks_like_project_root(path: Path) -> bool:
     )
 
 
+def _is_ignored_root_candidate(path: Path) -> bool:
+    return any(part.lower() in _IGNORED_ROOT_PARTS for part in path.parts)
+
+
 def _candidate_project_roots() -> list[Path]:
     candidates: list[Path] = []
 
@@ -41,8 +53,15 @@ def _candidate_project_roots() -> list[Path]:
             resolved = path.expanduser().resolve()
         except OSError:
             return
+        if _is_ignored_root_candidate(resolved):
+            return
         if resolved not in candidates:
             candidates.append(resolved)
+
+    root = project_root()
+    add(root)
+    for parent in root.parents:
+        add(parent)
 
     try:
         cwd = Path.cwd().resolve()
@@ -53,11 +72,6 @@ def _candidate_project_roots() -> list[Path]:
         for path in (cwd, *cwd.parents):
             add(path)
             add(path / _PROJECT_CHILD_NAME)
-
-    root = project_root()
-    add(root)
-    for parent in root.parents:
-        add(parent)
     return candidates
 
 
