@@ -74,6 +74,45 @@ def condition_matches(condition: dict[str, Any], row: dict[str, Any]) -> bool:
     return False
 
 
+def _class_probabilities(target_summary: dict[str, Any]) -> dict[str, float]:
+    distribution = target_summary.get("class_distribution")
+    if not isinstance(distribution, list):
+        return {}
+
+    counts: dict[str, float] = {}
+    total = 0.0
+    for item in distribution:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("value"))
+        count = float(item.get("count", 0) or 0)
+        counts[label] = counts.get(label, 0.0) + count
+        total += count
+
+    if total <= 0:
+        return {}
+    return {label: count / total for label, count in counts.items()}
+
+
+def _prediction_probability(
+    prediction: Any,
+    target_summary: dict[str, Any],
+    probabilities: dict[str, float],
+) -> float | None:
+    prediction_key = str(prediction)
+    if prediction_key in probabilities:
+        return probabilities[prediction_key]
+
+    positive_class = target_summary.get("positive_class")
+    default_rate = target_summary.get("default_rate")
+    if positive_class is not None and default_rate is not None:
+        positive_probability = float(default_rate)
+        if _same_value(prediction, positive_class):
+            return positive_probability
+        return 1.0 - positive_probability
+    return None
+
+
 def score_tree_payload(
     payload: dict[str, Any],
     row: dict[str, Any] | pd.Series | pd.DataFrame,
@@ -90,11 +129,28 @@ def score_tree_payload(
     while True:
         if node.get("is_leaf") or not node.get("branches"):
             leaf = node.get("leaf") or {}
+            target_summary = node.get("target_summary", {})
+            prediction = leaf.get("prediction", target_summary.get("prediction"))
+            probabilities = _class_probabilities(target_summary)
+            positive_class = target_summary.get("positive_class", payload.get("positive_class"))
+            positive_probability = (
+                float(target_summary["default_rate"])
+                if target_summary.get("default_rate") is not None
+                else probabilities.get(str(positive_class))
+            )
             return {
-                "prediction": leaf.get("prediction", node.get("target_summary", {}).get("prediction")),
+                "prediction": prediction,
+                "prediction_probability": _prediction_probability(
+                    prediction,
+                    target_summary,
+                    probabilities,
+                ),
+                "class_probabilities": probabilities,
+                "positive_class": positive_class,
+                "positive_class_probability": positive_probability,
                 "leaf_node_id": node.get("node_id"),
                 "leaf_path": node.get("path"),
-                "target_summary": node.get("target_summary", {}),
+                "target_summary": target_summary,
                 "trace": trace,
             }
 

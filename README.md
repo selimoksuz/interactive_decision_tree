@@ -184,5 +184,9 @@ one_customer = {
 
 score_result = score_tree_payload(tree_payload, one_customer)
 score_result["prediction"]
+score_result["prediction_probability"]
+score_result["positive_class_probability"]
 score_result["trace"]
 ```
+
+`prediction` global bir risk threshold'una gore degil, musteri hangi leaf'e dustuyse o leaf'in cogunluk sinifina gore gelir. Binary target icin `positive_class_probability` leaf icindeki positive class oranidir; `prediction_probability` ise tahmin edilen sinifin leaf icindeki oranidir.
