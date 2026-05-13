@@ -128,3 +128,29 @@ url = "postgresql+psycopg://user:password@host:5432/db"
 ```
 
 SQL credential bilgileri tree checkpoint dosyalarina yazilmaz; SQL sonucunun snapshot'i saklanir.
+
+## Final agaci notebook'a geri alma
+
+UI'da agaci finalize ettikten sonra en alttaki `Tree export` bolumunden iki format indirebilirsin:
+
+- `Download runnable tree JSON`
+- `Download runnable tree pickle`
+
+Pickle dosyasini ayni veya baska bir notebook'ta acmak icin:
+
+```python
+from interactive_decision_tree import load_tree_pickle
+
+tree_payload = load_tree_pickle("interactive_entropy_tree_runnable.pkl")
+tree_payload.keys()
+```
+
+JSON indirdiysen:
+
+```python
+from interactive_decision_tree import load_tree_json
+
+tree_payload = load_tree_json("interactive_entropy_tree_runnable.json")
+```
+
+`tree_payload["tree"]` nested karar agacini, `tree_payload["nodes"]` node listesini, `tree_payload["metrics"]` model metriklerini tutar. Pickle dosyalarini sadece kendi urettiğin guvenilir dosyalardan yukle.

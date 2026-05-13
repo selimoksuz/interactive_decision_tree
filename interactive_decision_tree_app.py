@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2972,6 +2973,13 @@ def main() -> None:
         file_name="interactive_entropy_tree_runnable.json",
         mime="application/json",
         key=f"download_tree_json_{export_payload['node_count']}_{export_payload['split_count']}_{st.session_state.next_node_id}",
+    )
+    st.download_button(
+        "Download runnable tree pickle",
+        data=pickle.dumps(export_payload, protocol=pickle.HIGHEST_PROTOCOL),
+        file_name="interactive_entropy_tree_runnable.pkl",
+        mime="application/octet-stream",
+        key=f"download_tree_pickle_{export_payload['node_count']}_{export_payload['split_count']}_{st.session_state.next_node_id}",
     )
     st.json(export_payload, expanded=False)
     save_work_checkpoint(
