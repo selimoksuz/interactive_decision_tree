@@ -316,13 +316,35 @@ def register_notebook_kernel(root: Path) -> None:
     print(f"Notebook kernel registered: {KERNEL_NAME}")
 
 
+def vscode_command_candidates() -> list[str]:
+    command_names = ["code.cmd", "code.exe", "code"] if os.name == "nt" else ["code"]
+    candidates: list[str] = []
+    for command_name in command_names:
+        command_path = shutil.which(command_name)
+        if command_path and command_path not in candidates:
+            candidates.append(command_path)
+    return candidates
+
+
+def try_open_vscode(root: Path, notebook_path: Path) -> bool:
+    for code_exe in vscode_command_candidates():
+        try:
+            if os.name == "nt" and Path(code_exe).suffix.lower() in {".cmd", ".bat"}:
+                subprocess.Popen(["cmd", "/c", code_exe, str(root), str(notebook_path)], cwd=str(root))
+            else:
+                subprocess.Popen([code_exe, str(root), str(notebook_path)], cwd=str(root))
+        except OSError as exc:
+            print(f"VS Code command failed ({code_exe}): {exc}")
+            continue
+        print(f"Opened notebook in VS Code: {notebook_path}")
+        return True
+    return False
+
+
 def open_notebook(root: Path, args: argparse.Namespace) -> int:
     register_notebook_kernel(root)
     notebook_path = root / "examples" / "notebook_dataframe_sql_demo.ipynb"
-    code_exe = shutil.which("code")
-    if code_exe:
-        subprocess.Popen([code_exe, str(root), str(notebook_path)], cwd=str(root))
-        print(f"Opened notebook in VS Code: {notebook_path}")
+    if try_open_vscode(root, notebook_path):
         return 0
 
     print("VS Code command `code` was not found. Starting Jupyter Notebook instead.")
