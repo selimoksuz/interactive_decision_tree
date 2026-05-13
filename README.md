@@ -80,7 +80,7 @@ SQL modu Streamlit UI icinden SQLAlchemy URL ile tablo veya query sonucunu DataF
 Oracle icin ornek:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install oracledb
+.\.venv\Scripts\python.exe -m pip install -e ".[oracle]"
 ```
 
 ```text
@@ -97,6 +97,17 @@ oracle_prod = "oracle+oracledb://USER:PASSWORD@HOST:1521/?service_name=SERVICE_N
 ```
 
 Sonra UI'da `Saved secret connection` olarak secilebilir.
+
+Notebook demo dosyasi `oracle_config/ora_config.ini` dosyasini da okuyabilir. Bu klasor git'e alinmaz. Beklenen format:
+
+```ini
+[ORA_PRD_ZTUSER]
+host = ...
+port = 1521
+service_name = ...
+user = ...
+password = ...
+```
 
 ## Ozellikler
 

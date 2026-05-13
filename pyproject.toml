@@ -26,6 +26,9 @@ dev = [
 notebook = [
     "ipykernel",
 ]
+oracle = [
+    "oracledb",
+]
 
 [tool.setuptools]
 py-modules = ["interactive_decision_tree_app"]
