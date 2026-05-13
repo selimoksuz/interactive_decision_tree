@@ -113,6 +113,7 @@ password = ...
 
 - Leaf/node uzerinden manuel split secimi
 - Candidate degiskenleri information gain'e gore siralama
+- Information gain'i pozitif olmayan degiskenleri split secim listesinden gizleme
 - Numeric, kategorik, kategorik target-profile grup splitleri
 - Binary target icin kullanici tarafindan secilen positive class
 - Default rate, AUC, Gini ve agac toplam gain metrikleri

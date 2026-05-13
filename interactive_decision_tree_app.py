@@ -29,6 +29,7 @@ CHECKPOINT_SCHEMA_VERSION = 1
 WORK_ID_QUERY_PARAM = "work_id"
 CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
+MIN_INFORMATION_GAIN_EPSILON = 1e-12
 
 
 @dataclass(frozen=True)
@@ -1818,6 +1819,7 @@ def feature_summary_rows(
     candidates: list[SplitCandidate],
     features: list[str],
     selected_features: list[str] | None = None,
+    include_zero_gain: bool = False,
 ) -> list[dict[str, Any]]:
     selected = set(selected_features or [])
     rows: list[dict[str, Any]] = []
@@ -1826,6 +1828,8 @@ def feature_summary_rows(
         if feature_candidates:
             best = max(feature_candidates, key=lambda c: c.information_gain)
             total_gain = sum(c.information_gain for c in feature_candidates)
+            if not include_zero_gain and best.information_gain <= MIN_INFORMATION_GAIN_EPSILON:
+                continue
             rows.append(
                 {
                     "selected": "yes" if feature in selected else "no",
@@ -1838,6 +1842,8 @@ def feature_summary_rows(
                 }
             )
         else:
+            if not include_zero_gain:
+                continue
             rows.append(
                 {
                     "selected": "yes" if feature in selected else "no",
@@ -1854,7 +1860,11 @@ def feature_summary_rows(
 
 def ordered_features_by_gain(features: list[str], feature_stats: dict[str, dict[str, Any]]) -> list[str]:
     return sorted(
-        features,
+        [
+            feature
+            for feature in features
+            if feature_stats.get(feature, {}).get("best_information_gain", 0.0) > MIN_INFORMATION_GAIN_EPSILON
+        ],
         key=lambda feature: (
             feature_stats.get(feature, {}).get("best_information_gain", 0.0),
             feature_stats.get(feature, {}).get("total_information_gain", 0.0),
@@ -2700,6 +2710,31 @@ def main() -> None:
                     feature_rows = feature_summary_rows(all_candidates, features)
                     feature_stats = {row["variable"]: row for row in feature_rows}
                     leaf_feature_options = ordered_features_by_gain(features, feature_stats)
+                    positive_candidates = [
+                        candidate
+                        for candidate in all_candidates
+                        if candidate.information_gain > MIN_INFORMATION_GAIN_EPSILON
+                    ]
+                    if not leaf_feature_options or not positive_candidates:
+                        st.warning("No split with positive information gain found for this leaf.")
+                        st.dataframe(
+                            arrow_safe_dataframe(
+                                pd.DataFrame(
+                                    feature_summary_rows(
+                                        all_candidates,
+                                        features,
+                                        include_zero_gain=True,
+                                    )
+                                )
+                            ),
+                            hide_index=True,
+                            width="stretch",
+                            column_config={
+                                "total_information_gain": st.column_config.NumberColumn(format="%.6f"),
+                                "best_information_gain": st.column_config.NumberColumn(format="%.6f"),
+                            },
+                        )
+                        st.stop()
                     leaf_feature_key = node_feature_key(data_key, target, current["id"])
                     ensure_node_feature(leaf_feature_key, leaf_feature_options, feature_stats)
 
@@ -2732,7 +2767,11 @@ def main() -> None:
                         },
                     )
 
-                    feature_candidates = [c for c in all_candidates if c.feature == selected_feature]
+                    feature_candidates = [
+                        c
+                        for c in all_candidates
+                        if c.feature == selected_feature and c.information_gain > MIN_INFORMATION_GAIN_EPSILON
+                    ]
                     st.subheader(f"Strongest auto split for {selected_feature}")
 
                     if not feature_candidates:
