@@ -113,6 +113,29 @@ def _prediction_probability(
     return None
 
 
+def _trace_step_path(trace_step: dict[str, Any]) -> str:
+    condition = trace_step.get("condition") or {}
+    feature = condition.get("feature")
+    branch_label = trace_step.get("branch_label")
+    if feature is not None and branch_label is not None:
+        return f"{feature} {branch_label}"
+    if branch_label is not None:
+        return str(branch_label)
+    split_label = trace_step.get("split")
+    return str(split_label) if split_label is not None else ""
+
+
+def _leaf_path_from_trace(trace: list[dict[str, Any]], fallback_path: Any) -> str | None:
+    if not trace:
+        return str(fallback_path) if fallback_path is not None else None
+    parts = ["root"]
+    for trace_step in trace:
+        step_path = _trace_step_path(trace_step)
+        if step_path:
+            parts.append(step_path)
+    return " -> ".join(parts)
+
+
 def score_tree_payload(
     payload: dict[str, Any],
     row: dict[str, Any] | pd.Series | pd.DataFrame,
@@ -149,7 +172,8 @@ def score_tree_payload(
                 "positive_class": positive_class,
                 "positive_class_probability": positive_probability,
                 "leaf_node_id": node.get("node_id"),
-                "leaf_path": node.get("path"),
+                "leaf_path": _leaf_path_from_trace(trace, node.get("path")),
+                "exported_leaf_path": node.get("path"),
                 "target_summary": target_summary,
                 "trace": trace,
             }

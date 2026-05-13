@@ -1715,13 +1715,45 @@ def export_target_summary(df: pd.DataFrame, target: str, node: dict[str, Any]) -
     return out
 
 
-def export_node(df: pd.DataFrame, target: str, node: dict[str, Any]) -> dict[str, Any]:
+def export_branch_path(parent_path: str, branch_label: Any, condition: dict[str, Any]) -> str:
+    feature = condition.get("feature")
+    if feature is not None:
+        return f"{parent_path} -> {feature} {branch_label}"
+    return f"{parent_path} -> {branch_label}"
+
+
+def compute_tree_export_paths(root_node_id: int = 0) -> dict[int, str]:
+    tree = st.session_state.tree
+    paths = {root_node_id: "root"}
+    stack = [root_node_id]
+    while stack:
+        node_id = stack.pop()
+        node = tree[node_id]
+        children = get_node_children(node)
+        if not children or node["split"] is None:
+            continue
+
+        branch_conditions = split_branch_conditions(node["split"])
+        parent_path = paths.get(node_id, str(node.get("path", "root")))
+        for index, child in enumerate(children):
+            condition = branch_conditions[index] if index < len(branch_conditions) else {}
+            paths[child["id"]] = export_branch_path(parent_path, child["label"], condition)
+            stack.append(child["id"])
+    return paths
+
+
+def export_node(
+    df: pd.DataFrame,
+    target: str,
+    node: dict[str, Any],
+    path_override: str | None = None,
+) -> dict[str, Any]:
     children = get_node_children(node)
     target_summary = export_target_summary(df, target, node)
     out: dict[str, Any] = {
         "node_id": node["id"],
         "depth": node["depth"],
-        "path": node["path"],
+        "path": path_override if path_override is not None else node["path"],
         "n": len(node["row_idx"]),
         "is_leaf": node["split"] is None,
         "target_summary": target_summary,
@@ -1755,9 +1787,14 @@ def export_node(df: pd.DataFrame, target: str, node: dict[str, Any]) -> dict[str
     return out
 
 
-def export_nested_node(df: pd.DataFrame, target: str, node_id: int) -> dict[str, Any]:
+def export_nested_node(
+    df: pd.DataFrame,
+    target: str,
+    node_id: int,
+    path_map: dict[int, str],
+) -> dict[str, Any]:
     node = st.session_state.tree[node_id]
-    exported = export_node(df, target, node)
+    exported = export_node(df, target, node, path_override=path_map.get(node_id))
     if node["split"] is None:
         return exported
 
@@ -1765,7 +1802,7 @@ def export_nested_node(df: pd.DataFrame, target: str, node_id: int) -> dict[str,
     for branch in exported["branches"]:
         child_id = branch["child_node_id"]
         nested_branch = branch.copy()
-        nested_branch["child"] = export_nested_node(df, target, child_id)
+        nested_branch["child"] = export_nested_node(df, target, child_id, path_map)
         nested_branches.append(nested_branch)
     exported["branches"] = nested_branches
     return exported
@@ -1779,8 +1816,9 @@ def tree_export(
 ) -> dict[str, Any]:
     target_kind = infer_target_kind(df[target])
     metrics = arrow_safe_dataframe(model_metrics(df, target)).to_dict("records")
+    export_paths = compute_tree_export_paths(root_node_id=0)
     nodes = [
-        export_node(df, target, node)
+        export_node(df, target, node, path_override=export_paths.get(node["id"]))
         for _, node in sorted(st.session_state.tree.items())
     ]
     node_count = len(nodes)
@@ -1806,7 +1844,7 @@ def tree_export(
         "split_count": split_count,
         "nodes": nodes,
         "nodes_by_id": {str(node["node_id"]): node for node in nodes},
-        "tree": export_nested_node(df, target, 0),
+        "tree": export_nested_node(df, target, 0, export_paths),
     }
 
 

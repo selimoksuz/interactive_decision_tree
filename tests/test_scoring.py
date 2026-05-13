@@ -95,3 +95,85 @@ def test_score_tree_payload_dataframe_row():
     assert result["prediction_probability"] == 0.8
     assert result["positive_class_probability"] == 0.2
     assert result["leaf_node_id"] == 2
+
+
+def test_score_tree_payload_rebuilds_leaf_path_from_trace_when_exported_path_is_stale():
+    payload = {
+        "format": "interactive_entropy_decision_tree",
+        "target": "risk_flag",
+        "tree": {
+            "node_id": 0,
+            "is_leaf": False,
+            "path": "root",
+            "target_summary": {"prediction": 0, "class_distribution": []},
+            "split": {"label": "segment target-profile groups (2)"},
+            "branches": [
+                {
+                    "label": "{C}",
+                    "condition": {"feature": "segment", "operator": "in", "values": ["C"]},
+                    "child": {
+                        "node_id": 4,
+                        "is_leaf": False,
+                        "path": "root -> segment {C}",
+                        "target_summary": {"prediction": 0, "class_distribution": []},
+                        "split": {"label": "channel == mobile"},
+                        "branches": [
+                            {
+                                "label": "== mobile",
+                                "condition": {
+                                    "feature": "channel",
+                                    "operator": "==",
+                                    "value": "mobile",
+                                },
+                                "child": {
+                                    "node_id": 9,
+                                    "is_leaf": False,
+                                    "path": "root -> segment {C} -> channel == mobile",
+                                    "target_summary": {"prediction": 0, "class_distribution": []},
+                                    "split": {"label": "income <= 46677.3"},
+                                    "branches": [
+                                        {
+                                            "label": "<= 46677.3",
+                                            "condition": {
+                                                "feature": "income",
+                                                "operator": "<=",
+                                                "threshold": 46677.3,
+                                            },
+                                            "child": {
+                                                "node_id": 13,
+                                                "is_leaf": True,
+                                                "path": "root -> segment {C} -> income <= 46677.3",
+                                                "leaf": {"prediction": 1},
+                                                "target_summary": {
+                                                    "prediction": 1,
+                                                    "positive_class": 1,
+                                                    "default_rate": 0.7,
+                                                    "class_distribution": [
+                                                        {"value": 1, "count": 7},
+                                                        {"value": 0, "count": 3},
+                                                    ],
+                                                },
+                                                "branches": [],
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    }
+
+    result = score_tree_payload(
+        payload,
+        {"segment": "C", "channel": "mobile", "income": 42_000},
+    )
+
+    assert result["leaf_node_id"] == 13
+    assert (
+        result["leaf_path"]
+        == "root -> segment {C} -> channel == mobile -> income <= 46677.3"
+    )
+    assert result["exported_leaf_path"] == "root -> segment {C} -> income <= 46677.3"
