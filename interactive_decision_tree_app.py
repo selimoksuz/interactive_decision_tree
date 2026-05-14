@@ -3135,20 +3135,24 @@ def main() -> None:
 
     query_session = load_session_dataframe_from_query()
     query_data_id = query_session[2] if query_session is not None else None
-    if query_data_id and st.session_state.get("_last_query_data_id") != query_data_id:
-        st.session_state["data_source_choice"] = "Session DataFrame"
-        st.session_state["_last_query_data_id"] = query_data_id
 
     source_options = ["Session DataFrame", "CSV / Excel Upload", "SQL", "Demo"]
     default_source = "Session DataFrame" if query_session is not None else "Demo"
-    if st.session_state.get("data_source_choice") == "CSV Upload":
-        st.session_state["data_source_choice"] = "CSV / Excel Upload"
-    if st.session_state.get("data_source_choice") not in source_options:
-        st.session_state["data_source_choice"] = default_source
+    remembered_source = st.session_state.get("data_source_choice")
+    if query_data_id and st.session_state.get("_last_query_data_id") != query_data_id:
+        st.session_state.pop("data_source_choice", None)
+        remembered_source = "Session DataFrame"
+        st.session_state["_last_query_data_id"] = query_data_id
+    elif remembered_source == "CSV Upload":
+        st.session_state.pop("data_source_choice", None)
+        remembered_source = "CSV / Excel Upload"
+    elif remembered_source not in source_options:
+        st.session_state.pop("data_source_choice", None)
+        remembered_source = default_source
     source_choice = st.sidebar.radio(
         "Data source",
         source_options,
-        index=source_options.index(default_source),
+        index=source_options.index(str(remembered_source)),
         key="data_source_choice",
     )
 
@@ -3600,33 +3604,78 @@ def main() -> None:
                 if not st.session_state[candidate_features_key]:
                     st.session_state[candidate_features_key] = features.copy()
                 with st.form(key=f"candidate_form::{data_key}::{target}::{current['id']}"):
-                    candidate_sample_rows = st.number_input(
-                        "Rows to scan for split ranking",
-                        min_value=1,
-                        max_value=max(1, current_row_count),
-                        step=10_000,
-                        format="%d",
-                        key=candidate_sample_key,
-                        help=(
-                            "Default is the full leaf. If you lower it, ranking uses a target-stratified sample. "
-                            "Applied splits still split the full leaf."
-                        ),
-                    )
-                    candidate_features = st.multiselect(
-                        "Variables to rank for this leaf",
-                        options=features,
-                        key=candidate_features_key,
-                        help=(
-                            "Change this list freely; split ranking runs only when you submit the form."
-                        ),
+                    use_all_rows_key = f"candidate_use_all_rows::{data_key}::{target}::{current['id']}"
+                    use_all_features_key = f"candidate_use_all_features::{data_key}::{target}::{current['id']}"
+                    if use_all_rows_key not in st.session_state:
+                        st.session_state[use_all_rows_key] = True
+                    if use_all_features_key not in st.session_state:
+                        st.session_state[use_all_features_key] = True
+
+                    use_all_rows = True
+                    use_all_features = True
+                    candidate_sample_rows = current_row_count
+                    candidate_features = features
+                    with st.expander("Advanced split search scope", expanded=False):
+                        use_all_rows = st.checkbox(
+                            "Use all rows in this leaf",
+                            key=use_all_rows_key,
+                            help=(
+                                "Keep this on for full-data ranking. Turn it off only when a leaf is too large "
+                                "and you need a target-stratified row limit."
+                            ),
+                        )
+                        if use_all_rows:
+                            candidate_sample_rows = current_row_count
+                            st.caption(f"Row scope: all {current_row_count:,} rows in this leaf.")
+                        else:
+                            candidate_sample_rows = st.number_input(
+                                "Row limit for ranking",
+                                min_value=1,
+                                max_value=max(1, current_row_count),
+                                step=10_000,
+                                format="%d",
+                                key=candidate_sample_key,
+                                help=(
+                                    "Ranking uses a target-stratified sample at this limit. "
+                                    "The chosen split is still applied to the full leaf."
+                                ),
+                            )
+
+                        use_all_features = st.checkbox(
+                            "Use all available split variables",
+                            key=use_all_features_key,
+                            help=(
+                                "Keep this on to rank every variable selected in the sidebar. "
+                                "Turn it off only to test a smaller variable subset."
+                            ),
+                        )
+                        if use_all_features:
+                            candidate_features = features
+                            st.caption(f"Variable scope: all {len(features):,} available split variable(s).")
+                        else:
+                            candidate_features = st.multiselect(
+                                "Variable subset for ranking",
+                                options=features,
+                                key=candidate_features_key,
+                                help="Only these variables will be scored for this leaf.",
+                            )
+
+                    st.caption(
+                        f"Split search will rank {len(candidate_features):,} variable(s) on "
+                        f"{min(current_row_count, safe_int(candidate_sample_rows, current_row_count)):,} "
+                        f"of {current_row_count:,} row(s)."
                     )
                     compute_candidates = st.form_submit_button(
-                        "Compute split candidates",
+                        "Compute split ranking",
                         type="primary",
                         width="stretch",
+                        help=(
+                            "Scores candidate splits for this leaf. Results are cached until scope, parameters, "
+                            "target, data, or tree state changes."
+                        ),
                     )
                 if not candidate_features:
-                    st.warning("Select at least one variable to compute split candidates for this leaf.")
+                    st.warning("Select at least one variable for split ranking.")
                     st.stop()
                 candidate_max_rows = min(current_row_count, safe_int(candidate_sample_rows, DEFAULT_CANDIDATE_SAMPLE_ROWS))
 
@@ -3644,13 +3693,13 @@ def main() -> None:
                 has_candidate_cache = cached_candidates is not None
                 all_candidates = cached_candidates if cached_candidates is not None else []
                 compute_caption = (
-                    f"Compute candidates on {candidate_max_rows:,} of {current_row_count:,} rows "
+                    f"Compute split ranking on {candidate_max_rows:,} of {current_row_count:,} rows "
                     f"across {len(candidate_features):,} variable(s)."
                 )
                 if large_leaf and not cached_meta:
                     st.warning(
-                        "Large leaf mode: split candidates are not recomputed automatically. "
-                        "Adjust variables/workers, then compute when ready."
+                        "Large leaf mode: split ranking is not recomputed automatically. "
+                        "Press Compute split ranking when ready."
                     )
                 if compute_candidates:
                     sampled_row_idx = analysis_row_idx(current["row_idx"], candidate_max_rows, df=df, target=target)
@@ -3708,14 +3757,14 @@ def main() -> None:
                     if has_candidate_cache:
                         st.warning("No valid split found for the current variables and split settings.")
                     else:
-                        st.info("Press Compute split candidates after choosing variables for this leaf.")
+                        st.info("Press Compute split ranking for this leaf.")
                     st.stop()
 
                 meta = cached_candidate_meta(data_key, target, current["id"])
                 analyzed_rows = int(meta.get("analyzed_rows", current_row_count) or current_row_count)
                 if analyzed_rows < current_row_count:
                     st.caption(
-                        f"Split ranking uses a stable sample of {analyzed_rows:,} / {current_row_count:,} rows. "
+                        f"Split ranking used a target-stratified sample of {analyzed_rows:,} / {current_row_count:,} rows. "
                         "Applied splits still use the full leaf."
                     )
 
