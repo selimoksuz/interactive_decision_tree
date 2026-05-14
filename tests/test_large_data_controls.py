@@ -5,13 +5,17 @@ import streamlit as st
 
 from interactive_decision_tree.session_store import save_dataframe_session
 from interactive_decision_tree_app import (
+    DEFAULT_DEMO_ROWS,
     analysis_row_idx,
+    build_optimal_tree,
     candidate_cache_key,
     candidate_splits,
+    candidate_validation_stats,
     checkpoint_ui_state,
     evaluation_model_metrics,
     init_tree,
     leaf_performance_rows,
+    make_demo_data,
     model_metrics,
     model_performance_wide_table,
     restore_checkpoint_dataframe,
@@ -21,6 +25,11 @@ from interactive_decision_tree_app import (
     train_test_split_indices,
     validate_test_dataframe,
 )
+
+
+def test_demo_data_default_is_large_enough_for_train_test_validation():
+    assert len(make_demo_data()) == DEFAULT_DEMO_ROWS
+    assert DEFAULT_DEMO_ROWS >= 5_000
 
 
 def test_analysis_row_idx_samples_stably():
@@ -301,6 +310,84 @@ def test_leaf_performance_rows_measure_test_when_eval_dataframe_is_present():
     assert by_leaf[1]["default_rate"] == 1.0
     assert by_leaf[2]["n"] == 1
     assert by_leaf[2]["predict"] == "high"
+
+
+def test_candidate_validation_stats_blocks_test_gini_drop():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x": [1.5, 3.5],
+            "risk_flag": ["high", "low"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+    assert candidate is not None
+
+    stats = candidate_validation_stats(
+        train_df=train,
+        test_df=test,
+        target="risk_flag",
+        node_id=0,
+        candidate=candidate,
+        max_gini_gap=0.1,
+    )
+
+    assert stats is not None
+    assert stats["test_gini_delta"] < 0
+    assert stats["validation_safe"] is False
+
+
+def test_build_optimal_tree_skips_validation_unsafe_split():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x": [1.5, 3.5],
+            "risk_flag": ["high", "low"],
+        }
+    )
+
+    split_count = build_optimal_tree(
+        df=train,
+        target="risk_flag",
+        features=["x"],
+        test_df=test,
+        min_leaf=1,
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=2,
+        max_category_groups=2,
+        max_depth=1,
+        max_leaves=2,
+        min_information_gain=0.0,
+        candidate_rows=len(train),
+        parallel_workers=1,
+        max_validation_gini_gap=0.1,
+        max_validation_gini_gap_increase=0.0,
+    )
+
+    assert split_count == 0
+    assert st.session_state.tree[0]["split"] is None
 
 
 def test_restore_checkpoint_dataframe_uses_session_snapshot_without_embedded_frame(tmp_path, monkeypatch):
