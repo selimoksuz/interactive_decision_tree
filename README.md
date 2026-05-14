@@ -40,9 +40,11 @@ Hazir notebook ornegi:
 
 ```text
 examples/notebook_dataframe_sql_demo.ipynb
+examples/notebook_separate_train_test_demo.ipynb
 ```
 
 Bu notebook lokal sample DataFrame akisini ve Oracle'a demo data yazip tekrar Oracle'dan okuyarak UI'a aktarma akisini gosterir.
+Ikinci notebook ayri train/test DataFrame, CSV/Excel ve lokal SQLite SQL kaynaklarini UI'da birlikte test etmek icindir.
 
 ## Is birimi icin Windows/Linux release
 
