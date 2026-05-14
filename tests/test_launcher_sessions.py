@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from interactive_decision_tree import launch_tree
+from interactive_decision_tree.session_store import load_dataframe_session
 
 
 def test_launch_tree_writes_to_explicit_session_dir(tmp_path):
@@ -62,3 +63,21 @@ def test_launch_tree_accepts_proxy_base_url(tmp_path):
     assert parsed.netloc == "openshift.example"
     assert parsed.path == "/notebook/ws/proxy/8501/"
     assert parse_qs(parsed.query)["data_id"]
+
+
+def test_launch_tree_resolves_target_and_features_case_insensitively(tmp_path):
+    df = pd.DataFrame({"age": [30, 40, 50], "risk_flag": [0, 1, 0]})
+
+    url = launch_tree(
+        df,
+        target="RISK_FLAG",
+        features=["AGE"],
+        start_server=False,
+        open_browser=False,
+        session_dir=tmp_path,
+    )
+
+    data_id = parse_qs(urlparse(url).query)["data_id"][0]
+    _, metadata = load_dataframe_session(data_id, session_dir=tmp_path)
+    assert metadata["target"] == "risk_flag"
+    assert metadata["features"] == ["age"]

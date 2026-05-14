@@ -71,6 +71,23 @@ def _resolve_session_dir(session_dir: str | Path | None = None) -> Path:
     return default_session_dir()
 
 
+def _resolve_dataframe_column(df: pd.DataFrame, column: str | None) -> str | None:
+    if column is None or column in df.columns:
+        return column
+
+    requested = str(column).casefold()
+    matches = [existing for existing in df.columns if str(existing).casefold() == requested]
+    if len(matches) == 1:
+        return str(matches[0])
+    return column
+
+
+def _resolve_dataframe_columns(df: pd.DataFrame, columns: list[str] | None) -> list[str] | None:
+    if columns is None:
+        return None
+    return [_resolve_dataframe_column(df, column) or column for column in columns]
+
+
 def _ensure_streamlit_server(port: int, session_dir: str | Path | None = None) -> None:
     if _server_is_ready(port):
         return
@@ -124,12 +141,14 @@ def launch_tree(
     _metadata: dict[str, Any] | None = None,
 ) -> str:
     resolved_session_dir = _resolve_session_dir(session_dir)
+    resolved_target = _resolve_dataframe_column(df, target)
+    resolved_features = _resolve_dataframe_columns(df, features)
     data_id, _ = save_dataframe_session(
         df,
         source=_source,
         name=session_name or "Notebook DataFrame",
-        target=target,
-        features=features,
+        target=resolved_target,
+        features=resolved_features,
         metadata=_metadata,
         session_dir=resolved_session_dir,
     )
