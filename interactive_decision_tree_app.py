@@ -42,7 +42,6 @@ CPU_COUNT = max(1, os.cpu_count() or 1)
 DEFAULT_PARALLEL_WORKERS = max(1, min(8, CPU_COUNT))
 DEFAULT_DEMO_ROWS = 5_000
 DEFAULT_MAX_VALIDATION_GINI_GAP = 0.10
-DEFAULT_MAX_VALIDATION_GINI_GAP_INCREASE = 0.02
 VALIDATION_CANDIDATE_LIMIT = 100
 
 
@@ -1447,7 +1446,6 @@ def build_optimal_tree(
     candidate_rows: int,
     parallel_workers: int,
     max_validation_gini_gap: float,
-    max_validation_gini_gap_increase: float,
 ) -> int:
     init_tree(df)
     split_count = 0
@@ -1501,7 +1499,6 @@ def build_optimal_tree(
                         node_id=leaf["id"],
                         candidate=validation_candidate,
                         max_gini_gap=max_validation_gini_gap,
-                        max_gini_gap_increase=max_validation_gini_gap_increase,
                         baseline_train_predictions=baseline_train_predictions,
                         baseline_test_predictions=baseline_test_predictions,
                     )
@@ -3143,7 +3140,6 @@ def candidate_split_summary_column_config(score_name: str) -> dict[str, Any]:
         "test_gini_after": st.column_config.NumberColumn(format="%.6f"),
         "test_gini_delta": st.column_config.NumberColumn(format="%.6f"),
         "gini_gap_after": st.column_config.NumberColumn(format="%.6f"),
-        "gini_gap_delta": st.column_config.NumberColumn(format="%.6f"),
     }
 
 
@@ -3530,7 +3526,6 @@ def candidate_validation_stats(
     node_id: int,
     candidate: SplitCandidate,
     max_gini_gap: float,
-    max_gini_gap_increase: float = DEFAULT_MAX_VALIDATION_GINI_GAP_INCREASE,
     baseline_train_predictions: pd.DataFrame | None = None,
     baseline_test_predictions: pd.DataFrame | None = None,
 ) -> dict[str, Any] | None:
@@ -3572,17 +3567,14 @@ def candidate_validation_stats(
     gap_after = gini_gap(train_gini_after, test_gini_after)
     test_delta = None if test_gini_before is None or test_gini_after is None else test_gini_after - test_gini_before
     train_delta = None if train_gini_before is None or train_gini_after is None else train_gini_after - train_gini_before
-    gap_delta = None if gap_before is None or gap_after is None else gap_after - gap_before
 
     if gap_after is None or test_delta is None:
         validation_safe = True
     else:
         allowed_gap = max(float(max_gini_gap), float(gap_before or 0.0))
-        allowed_gap_increase = max(0.0, float(max_gini_gap_increase))
         validation_safe = (
             test_delta >= -MIN_INFORMATION_GAIN_EPSILON
             and gap_after <= allowed_gap + MIN_INFORMATION_GAIN_EPSILON
-            and (gap_delta is None or gap_delta <= allowed_gap_increase + MIN_INFORMATION_GAIN_EPSILON)
         )
 
     return {
@@ -3594,9 +3586,7 @@ def candidate_validation_stats(
         "test_gini_delta": test_delta,
         "gini_gap_before": gap_before,
         "gini_gap_after": gap_after,
-        "gini_gap_delta": gap_delta,
         "max_gini_gap": max_gini_gap,
-        "max_gini_gap_increase": max_gini_gap_increase,
         "validation_safe": bool(validation_safe),
     }
 
@@ -3609,7 +3599,6 @@ def candidate_validation_row_values(stats: dict[str, Any] | None) -> dict[str, A
             "test_gini_after": None,
             "test_gini_delta": None,
             "gini_gap_after": None,
-            "gini_gap_delta": None,
         }
     return {
         "validation_safe": "yes" if stats.get("validation_safe") else "no",
@@ -3617,7 +3606,6 @@ def candidate_validation_row_values(stats: dict[str, Any] | None) -> dict[str, A
         "test_gini_after": stats.get("test_gini_after"),
         "test_gini_delta": stats.get("test_gini_delta"),
         "gini_gap_after": stats.get("gini_gap_after"),
-        "gini_gap_delta": stats.get("gini_gap_delta"),
     }
 
 
@@ -3678,7 +3666,6 @@ def build_candidate_validation_lookup(
     node_id: int,
     candidates: list[SplitCandidate],
     max_gini_gap: float,
-    max_gini_gap_increase: float = DEFAULT_MAX_VALIDATION_GINI_GAP_INCREASE,
     candidate_limit: int | None = None,
 ) -> dict[int, dict[str, Any]]:
     if test_df is None or infer_target_kind(train_df[target]) != "binary":
@@ -3695,7 +3682,6 @@ def build_candidate_validation_lookup(
             node_id=node_id,
             candidate=candidate,
             max_gini_gap=max_gini_gap,
-            max_gini_gap_increase=max_gini_gap_increase,
             baseline_train_predictions=baseline_train_predictions,
             baseline_test_predictions=baseline_test_predictions,
         )
@@ -4129,8 +4115,7 @@ def main() -> None:
             ),
         )
         if validation_guard_enabled:
-            gap_col1, gap_col2 = st.columns(2)
-            max_validation_gini_gap_input = gap_col1.number_input(
+            max_validation_gini_gap_input = st.number_input(
                 "Max Gini gap",
                 value=safe_float(
                     saved_auto_parameters.get("max_validation_gini_gap"),
@@ -4144,23 +4129,8 @@ def main() -> None:
                     "Train/Test Gini gap above this value."
                 ),
             )
-            max_validation_gini_gap_increase_input = gap_col2.number_input(
-                "Max gap increase",
-                value=safe_float(
-                    saved_auto_parameters.get("max_validation_gini_gap_increase"),
-                    default=DEFAULT_MAX_VALIDATION_GINI_GAP_INCREASE,
-                ),
-                min_value=0.0,
-                step=0.01,
-                format="%.4f",
-                help=(
-                    "Maximum allowed Train/Test Gini gap increase per accepted split. Use 0.0000 for a strict "
-                    "no-increase rule."
-                ),
-            )
         else:
             max_validation_gini_gap_input = DEFAULT_MAX_VALIDATION_GINI_GAP
-            max_validation_gini_gap_increase_input = DEFAULT_MAX_VALIDATION_GINI_GAP_INCREASE
         auto_max_depth = safe_int(auto_max_depth_input, default=3, minimum=1)
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
@@ -4169,10 +4139,6 @@ def main() -> None:
             max_validation_gini_gap_input,
             default=DEFAULT_MAX_VALIDATION_GINI_GAP,
         )
-        max_validation_gini_gap_increase = safe_float(
-            max_validation_gini_gap_increase_input,
-            default=DEFAULT_MAX_VALIDATION_GINI_GAP_INCREASE,
-        )
         auto_parameters = {
             "max_depth": auto_max_depth,
             "max_leaves": auto_max_leaves,
@@ -4180,7 +4146,6 @@ def main() -> None:
             "candidate_rows": auto_candidate_rows,
             "parallel_workers": parallel_workers,
             "max_validation_gini_gap": max_validation_gini_gap,
-            "max_validation_gini_gap_increase": max_validation_gini_gap_increase,
         }
 
         if st.button("Build optimal tree", width="stretch", disabled=not features):
@@ -4200,7 +4165,6 @@ def main() -> None:
                 candidate_rows=auto_candidate_rows,
                 parallel_workers=parallel_workers,
                 max_validation_gini_gap=max_validation_gini_gap,
-                max_validation_gini_gap_increase=max_validation_gini_gap_increase,
             )
             st.session_state.auto_tree_message = f"Optimal tree built with {split_count} split(s)."
             save_and_rerun()
@@ -4531,7 +4495,6 @@ def main() -> None:
                     node_id=current["id"],
                     candidates=all_candidates,
                     max_gini_gap=max_validation_gini_gap,
-                    max_gini_gap_increase=max_validation_gini_gap_increase,
                     candidate_limit=VALIDATION_CANDIDATE_LIMIT,
                 ) if validation_guard_enabled else {}
                 if validation_lookup:
@@ -4583,7 +4546,6 @@ def main() -> None:
                             "test_gini_after": st.column_config.NumberColumn(format="%.6f"),
                             "test_gini_delta": st.column_config.NumberColumn(format="%.6f"),
                             "gini_gap_after": st.column_config.NumberColumn(format="%.6f"),
-                            "gini_gap_delta": st.column_config.NumberColumn(format="%.6f"),
                         },
                     )
                     st.stop()
@@ -4635,7 +4597,6 @@ def main() -> None:
                         "test_gini_after": st.column_config.NumberColumn(format="%.6f"),
                         "test_gini_delta": st.column_config.NumberColumn(format="%.6f"),
                         "gini_gap_after": st.column_config.NumberColumn(format="%.6f"),
-                        "gini_gap_delta": st.column_config.NumberColumn(format="%.6f"),
                     },
                 )
 
@@ -4905,7 +4866,6 @@ def main() -> None:
                         node_id=current["id"],
                         candidate=manual_candidate,
                         max_gini_gap=max_validation_gini_gap,
-                        max_gini_gap_increase=max_validation_gini_gap_increase,
                     )
 
                 if manual_candidate is None:

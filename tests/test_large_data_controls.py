@@ -383,7 +383,6 @@ def test_build_optimal_tree_skips_validation_unsafe_split():
         candidate_rows=len(train),
         parallel_workers=1,
         max_validation_gini_gap=0.1,
-        max_validation_gini_gap_increase=0.0,
     )
 
     assert split_count == 0
