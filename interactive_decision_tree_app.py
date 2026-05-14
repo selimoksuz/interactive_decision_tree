@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import io
 import json
 import pickle
@@ -12,6 +13,7 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_agraph import Config, Edge, Node, agraph
 
 from interactive_decision_tree.session_store import (
@@ -31,6 +33,8 @@ WORK_ID_QUERY_PARAM = "work_id"
 CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
+GRAPH_TOOLTIP_LIMIT = 900
+GRAPH_LABEL_DETAIL_LIMIT = 25
 
 
 @dataclass(frozen=True)
@@ -2105,6 +2109,20 @@ def truncate_text(value: Any, max_len: int = 70) -> str:
     return text if len(text) <= max_len else text[: max_len - 3] + "..."
 
 
+def tooltip_text(value: Any, max_len: int = GRAPH_TOOLTIP_LIMIT) -> str:
+    return truncate_text(value, max_len)
+
+
+def incoming_branch_full_label(node: dict[str, Any]) -> str:
+    if node["id"] == 0:
+        return "root"
+    for parent in st.session_state.tree.values():
+        for child in get_node_children(parent):
+            if child["id"] == node["id"]:
+                return str(child["label"])
+    return ""
+
+
 def feature_summary_rows(
     candidates: list[SplitCandidate],
     features: list[str],
@@ -2270,6 +2288,118 @@ def graph_node_label(df: pd.DataFrame, target: str, node: dict[str, Any], data_k
     return "\n".join(lines)
 
 
+def graph_node_tooltip(df: pd.DataFrame, target: str, node: dict[str, Any], data_key: str) -> str:
+    summary = node_summary(df, target, node["row_idx"])
+    lines = [
+        graph_node_label(df, target, node, data_key),
+        f"Path: {node['path']}",
+    ]
+    incoming = incoming_branch_full_label(node)
+    if incoming:
+        lines.append(f"Incoming branch: {incoming}")
+    if node["split"] is not None:
+        split = node["split"]
+        lines.extend(
+            [
+                f"Split: {split['label']}",
+                f"Feature: {split['feature']}",
+                f"Split type: {split['split_type']}",
+            ]
+        )
+    else:
+        selected_feature = st.session_state.get(node_feature_key(data_key, target, node["id"]), "")
+        if selected_feature:
+            lines.append(f"Selected variable to try: {selected_feature}")
+    if summary["target_kind"] == "binary":
+        lines.append(f"Positive class: {summary.get('positive_class')}")
+        lines.append(f"Event count: {summary.get('event_count', 0)}")
+    return tooltip_text("\n".join(lines))
+
+
+def graph_label_detail_rows(edge_label_width: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for parent_id, parent in sorted(st.session_state.tree.items()):
+        for child in get_node_children(parent):
+            full_label = str(child["label"])
+            visible_label = truncate_text(full_label, edge_label_width)
+            if visible_label == full_label:
+                continue
+            child_node = st.session_state.tree.get(child["id"])
+            child_path = child_node.get("path", "") if isinstance(child_node, dict) else ""
+            rows.append(
+                {
+                    "kind": "Branch",
+                    "item": f"Node {parent_id} -> Node {child['id']}",
+                    "visible": visible_label,
+                    "full": full_label,
+                    "context": child_path,
+                }
+            )
+    return rows
+
+
+def copyable_text_block(text: str) -> None:
+    escaped_text = html_lib.escape(text)
+    js_text = json.dumps(text)
+    line_count = min(10, max(3, text.count("\n") + 1))
+    height = 64 + line_count * 20
+    components.html(
+        f"""
+        <div style="font-family: Arial, sans-serif;">
+          <button
+            id="copy-button"
+            style="border:1px solid #94a3b8;border-radius:6px;background:#ffffff;color:#111827;
+                   padding:6px 10px;font-size:13px;cursor:pointer;margin-bottom:6px;"
+          >Copy full text</button>
+          <pre style="white-space:pre-wrap;word-break:break-word;margin:0;padding:8px;
+                      border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;
+                      color:#111827;font-size:12px;line-height:1.35;">{escaped_text}</pre>
+        </div>
+        <script>
+        const button = document.getElementById("copy-button");
+        const value = {js_text};
+        button.addEventListener("click", async () => {{
+          try {{
+            await navigator.clipboard.writeText(value);
+            button.textContent = "Copied";
+          }} catch (err) {{
+            const area = document.createElement("textarea");
+            area.value = value;
+            document.body.appendChild(area);
+            area.select();
+            document.execCommand("copy");
+            document.body.removeChild(area);
+            button.textContent = "Copied";
+          }}
+        }});
+        </script>
+        """,
+        height=height,
+        scrolling=False,
+    )
+
+
+def render_graph_label_details(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    shown_rows = rows[:GRAPH_LABEL_DETAIL_LIMIT]
+    with st.expander(f"Shortened graph labels ({len(rows)})", expanded=False):
+        st.caption(
+            "Hover nodes/arrows for a quick preview. Use Copy full text to copy the complete label."
+        )
+        for index, row in enumerate(shown_rows, start=1):
+            st.markdown(f"**{index}. {row['kind']} | {row['item']}**")
+            st.caption(f"Visible on graph: {row['visible']}")
+            copyable_text_block(str(row["full"]))
+            if row.get("context"):
+                st.caption(f"Path: {row['context']}")
+        if len(rows) > GRAPH_LABEL_DETAIL_LIMIT:
+            st.caption(
+                f"Showing first {GRAPH_LABEL_DETAIL_LIMIT} shortened labels. "
+                "Select a node to see its full path in the detail panel."
+            )
+
+
 def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) -> int | None:
     ensure_tree_zoom()
     zoom = st.session_state.tree_zoom
@@ -2297,7 +2427,7 @@ def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) 
         graph_node = Node(
             id=str(node_id),
             label=graph_node_label(df, target, node, data_key),
-            title="",
+            title=graph_node_tooltip(df, target, node, data_key),
             shape="box",
             color={
                 "background": background,
@@ -2309,15 +2439,16 @@ def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) 
             widthConstraint={"minimum": node_min_width, "maximum": node_max_width},
             level=node["depth"],
         )
-        graph_node.title = ""
         graph_nodes.append(graph_node)
 
         for child in get_node_children(node):
+            full_edge_label = str(child["label"])
             graph_edges.append(
                 Edge(
                     source=str(node_id),
                     target=str(child["id"]),
-                    label=truncate_text(child["label"], edge_label_width),
+                    label=truncate_text(full_edge_label, edge_label_width),
+                    title=tooltip_text(full_edge_label),
                     color={"color": "#94a3b8", "highlight": "#c47f00"},
                     font={"size": edge_font_size, "align": "middle"},
                     arrows={"to": {"enabled": True, "scaleFactor": 0.7}},
@@ -2353,6 +2484,7 @@ def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) 
     )
     config.width = "100%"
     selected_node = agraph(graph_nodes, graph_edges, config)
+    render_graph_label_details(graph_label_detail_rows(edge_label_width))
     if selected_node is None:
         return None
     try:
