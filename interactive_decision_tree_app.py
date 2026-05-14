@@ -3137,6 +3137,33 @@ def candidate_impact_rows(
     ]
 
 
+def candidate_split_summary_rows(
+    df: pd.DataFrame,
+    target: str,
+    row_idx: list[int],
+    candidate: SplitCandidate,
+) -> list[dict[str, Any]]:
+    score_name = split_score_name(df[target])
+    return [
+        {
+            "split_type": candidate.split_type,
+            "split": candidate.label,
+            "branches": candidate.branch_count,
+            score_name: candidate.information_gain,
+            "weighted_tree_delta": candidate_total_gain_delta(df, candidate, row_idx),
+            "child_weighted_impurity": candidate.weighted_entropy,
+        }
+    ]
+
+
+def candidate_split_summary_column_config(score_name: str) -> dict[str, Any]:
+    return {
+        score_name: st.column_config.NumberColumn(format="%.6f"),
+        "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
+        "child_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
+    }
+
+
 def format_class_counts(counts: dict[Any, int]) -> str:
     return ", ".join(f"{value}: {count}" for value, count in counts.items())
 
@@ -4261,26 +4288,15 @@ def main() -> None:
                     st.warning("No valid split found for this variable.")
                 else:
                     selected_candidate = max(feature_candidates, key=lambda c: c.information_gain)
-                    rows = [
-                        {
-                            "split_type": selected_candidate.split_type,
-                            "split": selected_candidate.label,
-                            "branches": selected_candidate.branch_count,
-                            score_name: selected_candidate.information_gain,
-                            "weighted_tree_delta": candidate_total_gain_delta(df, selected_candidate, current["row_idx"]),
-                            "child_weighted_impurity": selected_candidate.weighted_entropy,
-                        }
-                    ]
-
                     st.dataframe(
-                        arrow_safe_dataframe(pd.DataFrame(rows)),
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                candidate_split_summary_rows(df, target, current["row_idx"], selected_candidate)
+                            )
+                        ),
                         hide_index=True,
                         width="stretch",
-                        column_config={
-                            score_name: st.column_config.NumberColumn(format="%.6f"),
-                            "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
-                            "child_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
-                        },
+                        column_config=candidate_split_summary_column_config(score_name),
                     )
 
                     st.caption("Branch details")
@@ -4510,6 +4526,17 @@ def main() -> None:
                 if manual_candidate is None:
                     st.caption("Enter a valid manual split to preview its impact.")
                 else:
+                    st.caption("Manual split summary")
+                    st.dataframe(
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                candidate_split_summary_rows(df, target, current["row_idx"], manual_candidate)
+                            )
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config=candidate_split_summary_column_config(score_name),
+                    )
                     st.caption("Manual branch details")
                     st.dataframe(
                         arrow_safe_dataframe(

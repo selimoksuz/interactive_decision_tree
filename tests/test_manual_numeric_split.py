@@ -4,6 +4,7 @@ import pandas as pd
 
 from interactive_decision_tree_app import (
     candidate_branch_detail_rows,
+    candidate_split_summary_rows,
     manual_numeric_branch_rows,
     parse_threshold_text,
     score_numeric_manual_bins,
@@ -50,3 +51,31 @@ def test_candidate_branch_detail_rows_expands_manual_split_branches():
     assert [row["rows"] for row in rows] == [2, 2, 2]
     assert [row["positive_class_count"] for row in rows] == [0, 1, 2]
     assert all("branch_impurity" in row for row in rows)
+
+
+def test_candidate_split_summary_rows_matches_manual_preview_columns():
+    df = pd.DataFrame(
+        {
+            "x": [10, 20, 25, 35, 45, 55],
+            "risk_flag": ["low", "low", "low", "high", "high", "high"],
+        }
+    )
+    candidate = score_numeric_manual_bins(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        feature="x",
+        thresholds=[20, 40],
+        min_leaf=1,
+    )
+    assert candidate is not None
+
+    rows = candidate_split_summary_rows(df, "risk_flag", df.index.tolist(), candidate)
+
+    assert len(rows) == 1
+    assert rows[0]["split_type"] == "numeric_manual_bins"
+    assert rows[0]["split"] == "x manual bins: 20, 40"
+    assert rows[0]["branches"] == 3
+    assert "information_gain" in rows[0]
+    assert "weighted_tree_delta" in rows[0]
+    assert "child_weighted_impurity" in rows[0]
