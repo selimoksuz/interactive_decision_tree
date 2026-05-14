@@ -36,7 +36,6 @@ CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
-GRAPH_LABEL_DETAIL_LIMIT = 25
 DEFAULT_CANDIDATE_SAMPLE_ROWS = 50_000
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
 CANDIDATE_RANDOM_STATE = 20260514
@@ -2823,27 +2822,24 @@ def graph_node_full_text(df: pd.DataFrame, target: str, node: dict[str, Any], da
     return "\n".join(lines)
 
 
-def edge_detail_rows(edge_label_width: int) -> list[dict[str, Any]]:
+def selected_node_branch_detail_rows(node_id: int, edge_label_width: int) -> list[dict[str, Any]]:
+    parent = st.session_state.tree.get(node_id)
+    if parent is None:
+        return []
     rows: list[dict[str, Any]] = []
-    for parent_id, parent in sorted(st.session_state.tree.items()):
-        for child in get_node_children(parent):
-            full_label = str(child["label"])
-            child_node = st.session_state.tree.get(child["id"])
-            child_path = child_node.get("path", "") if isinstance(child_node, dict) else ""
-            rows.append(
-                {
-                    "kind": "Branch",
-                    "item": f"Node {parent_id} -> Node {child['id']}",
-                    "visible": truncate_text(full_label, edge_label_width),
-                    "full": full_label,
-                    "context": child_path,
-                }
-            )
+    for child in get_node_children(parent):
+        full_label = str(child["label"])
+        child_node = st.session_state.tree.get(child["id"])
+        child_path = child_node.get("path", "") if isinstance(child_node, dict) else ""
+        rows.append(
+            {
+                "branch": f"Node {node_id} -> Node {child['id']}",
+                "visible": truncate_text(full_label, edge_label_width),
+                "full": full_label,
+                "child_path": child_path,
+            }
+        )
     return rows
-
-
-def graph_label_detail_rows(edge_label_width: int) -> list[dict[str, Any]]:
-    return [row for row in edge_detail_rows(edge_label_width) if row["visible"] != row["full"]]
 
 
 def copyable_text_block(text: str) -> None:
@@ -2855,7 +2851,7 @@ def copyable_text_block(text: str) -> None:
         f"""
         <div style="font-family: Arial, sans-serif;">
           <button
-            id="copy-button"
+            class="copy-button"
             style="border:1px solid #94a3b8;border-radius:6px;background:#ffffff;color:#111827;
                    padding:6px 10px;font-size:13px;cursor:pointer;margin-bottom:6px;"
           >Copy full text</button>
@@ -2864,7 +2860,8 @@ def copyable_text_block(text: str) -> None:
                       color:#111827;font-size:12px;line-height:1.35;">{escaped_text}</pre>
         </div>
         <script>
-        const button = document.getElementById("copy-button");
+        const root = document.currentScript.parentElement;
+        const button = root.querySelector(".copy-button");
         const value = {js_text};
         button.addEventListener("click", async () => {{
           try {{
@@ -2887,57 +2884,32 @@ def copyable_text_block(text: str) -> None:
     )
 
 
-def render_graph_label_details(rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    shown_rows = rows[:GRAPH_LABEL_DETAIL_LIMIT]
-    with st.expander(f"Shortened graph labels ({len(rows)})", expanded=False):
-        st.caption(
-            "Hover nodes/arrows for a quick preview. Use Copy full text to copy the complete label."
-        )
-        for index, row in enumerate(shown_rows, start=1):
-            st.markdown(f"**{index}. {row['kind']} | {row['item']}**")
-            st.caption(f"Visible on graph: {row['visible']}")
-            copyable_text_block(str(row["full"]))
-            if row.get("context"):
-                st.caption(f"Path: {row['context']}")
-        if len(rows) > GRAPH_LABEL_DETAIL_LIMIT:
-            st.caption(
-                f"Showing first {GRAPH_LABEL_DETAIL_LIMIT} shortened labels. "
-                "Select a node to see its full path in the detail panel."
-            )
-
-
-def render_copyable_tree_detail(df: pd.DataFrame, target: str, data_key: str, edge_label_width: int) -> None:
+def render_selected_tree_detail(df: pd.DataFrame, target: str, data_key: str, edge_label_width: int) -> None:
     current_node = st.session_state.tree.get(st.session_state.current_node_id)
     if current_node is None:
         return
-    with st.expander("Copy tree text", expanded=False):
-        node_options = [node["id"] for _, node in sorted(st.session_state.tree.items())]
-        selected_node_id = st.selectbox(
-            "Node text",
-            options=node_options,
-            index=node_options.index(current_node["id"]),
-            format_func=lambda node_id: f"Node {node_id}",
-            key=f"copy_tree_node::{data_key}::{target}",
-        )
-        node = st.session_state.tree[int(selected_node_id)]
-        copyable_text_block(graph_node_full_text(df, target, node, data_key))
+    with st.expander(f"Selected tree detail | Node {current_node['id']}", expanded=False):
+        st.caption("This panel follows the selected graph node. Use the button to copy full node or branch text.")
+        copyable_text_block(graph_node_full_text(df, target, current_node, data_key))
 
-        branches = edge_detail_rows(edge_label_width)
+        branches = selected_node_branch_detail_rows(current_node["id"], edge_label_width)
         if branches:
-            branch_options = list(range(len(branches)))
+            st.markdown("**Outgoing branches**")
+            st.dataframe(
+                arrow_safe_dataframe(pd.DataFrame(branches)),
+                hide_index=True,
+                width="stretch",
+            )
             selected_branch = st.selectbox(
-                "Branch text",
-                options=branch_options,
-                format_func=lambda idx: branches[int(idx)]["item"],
-                key=f"copy_tree_branch::{data_key}::{target}",
+                "Branch full text",
+                options=list(range(len(branches))),
+                format_func=lambda idx: branches[int(idx)]["branch"],
+                key=f"selected_branch_detail::{data_key}::{target}::{current_node['id']}",
             )
             branch = branches[int(selected_branch)]
-            st.caption(f"Visible on graph: {branch['visible']}")
             copyable_text_block(str(branch["full"]))
-            if branch.get("context"):
-                st.caption(f"Path: {branch['context']}")
+            if branch.get("child_path"):
+                st.caption(f"Child path: {branch['child_path']}")
 
 
 def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) -> int | None:
@@ -3024,8 +2996,7 @@ def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) 
     )
     config.width = "100%"
     selected_node = agraph(graph_nodes, graph_edges, config)
-    render_graph_label_details(graph_label_detail_rows(edge_label_width))
-    render_copyable_tree_detail(df, target, data_key, edge_label_width)
+    render_selected_tree_detail(df, target, data_key, edge_label_width)
     if selected_node is None:
         return None
     try:
