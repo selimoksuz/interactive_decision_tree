@@ -8,10 +8,12 @@ from interactive_decision_tree_app import (
     analysis_row_idx,
     candidate_cache_key,
     candidate_splits,
+    checkpoint_ui_state,
     evaluation_model_metrics,
     init_tree,
     model_performance_wide_table,
     restore_checkpoint_dataframe,
+    restore_checkpoint_ui_state,
     score_split,
     split_node,
     train_test_split_indices,
@@ -94,6 +96,32 @@ def test_model_performance_wide_table_pivots_train_test_columns():
         {"metric": "rows", "Train": 80, "Test": 20},
         {"metric": "accuracy", "Train": 0.8, "Test": 0.7},
     ]
+
+
+def test_checkpoint_ui_state_excludes_button_widget_values():
+    st.session_state.clear()
+    st.session_state["group_merge_category_groups::demo::risk_flag::5::product"] = [0, 1]
+    st.session_state["group_merge_button_category_groups::demo::risk_flag::5::product"] = True
+
+    saved = checkpoint_ui_state()
+
+    assert "group_merge_category_groups::demo::risk_flag::5::product" in saved
+    assert "group_merge_button_category_groups::demo::risk_flag::5::product" not in saved
+
+
+def test_restore_checkpoint_ui_state_skips_stale_button_widget_values():
+    st.session_state.clear()
+    restore_checkpoint_ui_state(
+        {
+            "ui_state": {
+                "group_merge_category_groups::demo::risk_flag::5::product": [0, 1],
+                "group_merge_button_category_groups::demo::risk_flag::5::product": True,
+            }
+        }
+    )
+
+    assert st.session_state["group_merge_category_groups::demo::risk_flag::5::product"] == [0, 1]
+    assert "group_merge_button_category_groups::demo::risk_flag::5::product" not in st.session_state
 
 
 def test_candidate_cache_key_changes_with_variable_set():

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import html as html_lib
 import io
 import json
 import os
@@ -15,7 +14,6 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_agraph import Config, Edge, Node, agraph
 
 from interactive_decision_tree.session_store import (
@@ -1954,17 +1952,6 @@ def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.
     return df, uploaded_name, data_key
 
 
-def restore_checkpoint_ui_state(checkpoint: dict[str, Any] | None) -> None:
-    if not checkpoint:
-        return
-    ui_state = checkpoint.get("ui_state")
-    if not isinstance(ui_state, dict):
-        return
-    for key, value in ui_state.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
 def int_or_none(value: Any) -> int | None:
     if value is None:
         return None
@@ -2044,7 +2031,18 @@ def restore_tree_state_from_checkpoint(
     return True
 
 
-def checkpoint_ui_state() -> dict[str, Any]:
+def is_checkpoint_ui_state_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    transient_widget_prefixes = (
+        "group_all_",
+        "group_single_",
+        "group_profile_",
+        "group_split_",
+        "group_merge_button_",
+    )
+    if key.startswith(transient_widget_prefixes):
+        return False
     prefixes = (
         "category_groups::",
         "node_features_v2::",
@@ -2063,9 +2061,24 @@ def checkpoint_ui_state() -> dict[str, Any]:
         "train_session_data_id",
         "test_session_data_id",
     }
+    return key.startswith(prefixes) or key in exact_keys
+
+
+def restore_checkpoint_ui_state(checkpoint: dict[str, Any] | None) -> None:
+    if not checkpoint:
+        return
+    ui_state = checkpoint.get("ui_state")
+    if not isinstance(ui_state, dict):
+        return
+    for key, value in ui_state.items():
+        if is_checkpoint_ui_state_key(key) and key not in st.session_state:
+            st.session_state[key] = value
+
+
+def checkpoint_ui_state() -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key in list(st.session_state.keys()):
-        if isinstance(key, str) and (key.startswith(prefixes) or key in exact_keys):
+        if is_checkpoint_ui_state_key(key):
             out[key] = json_safe(st.session_state[key])
     return out
 
@@ -2822,96 +2835,6 @@ def graph_node_full_text(df: pd.DataFrame, target: str, node: dict[str, Any], da
     return "\n".join(lines)
 
 
-def selected_node_branch_detail_rows(node_id: int, edge_label_width: int) -> list[dict[str, Any]]:
-    parent = st.session_state.tree.get(node_id)
-    if parent is None:
-        return []
-    rows: list[dict[str, Any]] = []
-    for child in get_node_children(parent):
-        full_label = str(child["label"])
-        child_node = st.session_state.tree.get(child["id"])
-        child_path = child_node.get("path", "") if isinstance(child_node, dict) else ""
-        rows.append(
-            {
-                "branch": f"Node {node_id} -> Node {child['id']}",
-                "visible": truncate_text(full_label, edge_label_width),
-                "full": full_label,
-                "child_path": child_path,
-            }
-        )
-    return rows
-
-
-def copyable_text_block(text: str) -> None:
-    escaped_text = html_lib.escape(text)
-    js_text = json.dumps(text)
-    line_count = min(10, max(3, text.count("\n") + 1))
-    height = 64 + line_count * 20
-    components.html(
-        f"""
-        <div style="font-family: Arial, sans-serif;">
-          <button
-            class="copy-button"
-            style="border:1px solid #94a3b8;border-radius:6px;background:#ffffff;color:#111827;
-                   padding:6px 10px;font-size:13px;cursor:pointer;margin-bottom:6px;"
-          >Copy full text</button>
-          <pre style="white-space:pre-wrap;word-break:break-word;margin:0;padding:8px;
-                      border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;
-                      color:#111827;font-size:12px;line-height:1.35;">{escaped_text}</pre>
-        </div>
-        <script>
-        const root = document.currentScript.parentElement;
-        const button = root.querySelector(".copy-button");
-        const value = {js_text};
-        button.addEventListener("click", async () => {{
-          try {{
-            await navigator.clipboard.writeText(value);
-            button.textContent = "Copied";
-          }} catch (err) {{
-            const area = document.createElement("textarea");
-            area.value = value;
-            document.body.appendChild(area);
-            area.select();
-            document.execCommand("copy");
-            document.body.removeChild(area);
-            button.textContent = "Copied";
-          }}
-        }});
-        </script>
-        """,
-        height=height,
-        scrolling=False,
-    )
-
-
-def render_selected_tree_detail(df: pd.DataFrame, target: str, data_key: str, edge_label_width: int) -> None:
-    current_node = st.session_state.tree.get(st.session_state.current_node_id)
-    if current_node is None:
-        return
-    with st.expander(f"Selected tree detail | Node {current_node['id']}", expanded=False):
-        st.caption("This panel follows the selected graph node. Use the button to copy full node or branch text.")
-        copyable_text_block(graph_node_full_text(df, target, current_node, data_key))
-
-        branches = selected_node_branch_detail_rows(current_node["id"], edge_label_width)
-        if branches:
-            st.markdown("**Outgoing branches**")
-            st.dataframe(
-                arrow_safe_dataframe(pd.DataFrame(branches)),
-                hide_index=True,
-                width="stretch",
-            )
-            selected_branch = st.selectbox(
-                "Branch full text",
-                options=list(range(len(branches))),
-                format_func=lambda idx: branches[int(idx)]["branch"],
-                key=f"selected_branch_detail::{data_key}::{target}::{current_node['id']}",
-            )
-            branch = branches[int(selected_branch)]
-            copyable_text_block(str(branch["full"]))
-            if branch.get("child_path"):
-                st.caption(f"Child path: {branch['child_path']}")
-
-
 def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) -> int | None:
     ensure_tree_zoom()
     zoom = st.session_state.tree_zoom
@@ -2996,7 +2919,6 @@ def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) 
     )
     config.width = "100%"
     selected_node = agraph(graph_nodes, graph_edges, config)
-    render_selected_tree_detail(df, target, data_key, edge_label_width)
     if selected_node is None:
         return None
     try:
