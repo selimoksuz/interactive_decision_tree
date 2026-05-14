@@ -3461,6 +3461,23 @@ def evaluation_model_metrics(
     return pd.DataFrame(rows)
 
 
+def model_performance_wide_table(metrics: pd.DataFrame) -> pd.DataFrame:
+    if metrics.empty or not {"dataset", "metric", "value"}.issubset(metrics.columns):
+        return metrics
+
+    dataset_order = list(dict.fromkeys(metrics["dataset"].astype(str).tolist()))
+    metric_order = list(dict.fromkeys(metrics["metric"].astype(str).tolist()))
+    rows: list[dict[str, Any]] = []
+    for metric in metric_order:
+        row: dict[str, Any] = {"metric": metric}
+        metric_rows = metrics[metrics["metric"].astype(str) == metric]
+        for dataset in dataset_order:
+            values = metric_rows.loc[metric_rows["dataset"].astype(str) == dataset, "value"]
+            row[dataset] = values.iloc[0] if not values.empty else None
+        rows.append(row)
+    return pd.DataFrame(rows, columns=["metric", *dataset_order])
+
+
 def model_metrics(df: pd.DataFrame, target: str) -> pd.DataFrame:
     target_kind = infer_target_kind(df[target])
     preds = tree_predictions(df, target)
@@ -3846,6 +3863,7 @@ def main() -> None:
         st.rerun()
 
     with st.sidebar.expander("Optimal tree", expanded=True):
+        st.caption("These settings are used only when you press Build optimal tree.")
         auto_max_depth_input = st.number_input(
             "Max depth",
             value=safe_int(saved_auto_parameters.get("max_depth"), default=3, minimum=1),
@@ -3859,13 +3877,17 @@ def main() -> None:
             format="%d",
         )
         auto_min_gain_input = st.number_input(
-            "Minimum split information gain",
+            "Auto tree minimum information gain",
             value=safe_float(saved_auto_parameters.get("min_information_gain"), default=0.005),
             step=0.001,
             format="%.6f",
+            help=(
+                "Only affects Build optimal tree. Splits below this gain are skipped. "
+                "Manual split preview and selected-leaf ranking are not filtered by this value."
+            ),
         )
         auto_candidate_rows_input = st.number_input(
-            "Rows per node for split search",
+            "Auto tree rows per node search",
             value=min(
                 len(df),
                 safe_int(saved_auto_parameters.get("candidate_rows"), default=len(df), minimum=1),
@@ -3875,7 +3897,8 @@ def main() -> None:
             step=10_000,
             format="%d",
             help=(
-                "Default is full data. If you lower it, rows are sampled in a target-stratified way."
+                "Only affects Build optimal tree. Default is full data. If you lower it, each leaf search "
+                "uses a target-stratified row sample. Manual selected-leaf ranking uses Advanced split search scope."
             ),
         )
         auto_max_depth = safe_int(auto_max_depth_input, default=3, minimum=1)
@@ -4076,8 +4099,9 @@ def main() -> None:
         metric_frames = [train_metrics]
         if test_df is not None:
             metric_frames.append(evaluation_model_metrics(df, test_df, target, "Test"))
+        performance_metrics = pd.concat(metric_frames, ignore_index=True)
         st.dataframe(
-            arrow_safe_dataframe(pd.concat(metric_frames, ignore_index=True)),
+            arrow_safe_dataframe(model_performance_wide_table(performance_metrics)),
             hide_index=True,
             width="stretch",
         )

@@ -10,6 +10,7 @@ from interactive_decision_tree_app import (
     candidate_splits,
     evaluation_model_metrics,
     init_tree,
+    model_performance_wide_table,
     restore_checkpoint_dataframe,
     score_split,
     split_node,
@@ -74,6 +75,25 @@ def test_validate_test_dataframe_requires_target_and_features():
     test_df = pd.DataFrame({"age": [30], "risk_flag": [1]})
 
     assert validate_test_dataframe(test_df, "risk_flag", ["age", "income"]) == ["income"]
+
+
+def test_model_performance_wide_table_pivots_train_test_columns():
+    metrics = pd.DataFrame(
+        [
+            {"dataset": "Train", "metric": "rows", "value": 80},
+            {"dataset": "Train", "metric": "accuracy", "value": 0.8},
+            {"dataset": "Test", "metric": "rows", "value": 20},
+            {"dataset": "Test", "metric": "accuracy", "value": 0.7},
+        ]
+    )
+
+    wide = model_performance_wide_table(metrics)
+
+    assert wide.columns.tolist() == ["metric", "Train", "Test"]
+    assert wide.to_dict("records") == [
+        {"metric": "rows", "Train": 80, "Test": 20},
+        {"metric": "accuracy", "Train": 0.8, "Test": 0.7},
+    ]
 
 
 def test_candidate_cache_key_changes_with_variable_set():
