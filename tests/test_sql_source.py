@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from interactive_decision_tree import launch_tree_sql
+from interactive_decision_tree.session_store import load_dataframe_session
 from interactive_decision_tree.sql_source import read_sql_dataframe
 
 
@@ -62,3 +64,25 @@ def test_sql_full_table(tmp_path):
     df = read_sql_dataframe(url, table="sample", full_table=True)
 
     assert len(df) == 5
+
+
+def test_launch_tree_sql_query_resolves_target_case_insensitively(tmp_path):
+    url = sqlite_url(tmp_path)
+    seed_table(url)
+    session_dir = tmp_path / "sessions"
+
+    ui_url = launch_tree_sql(
+        url,
+        query="select id, value, target as risk_flag from sample order by id",
+        target="RISK_FLAG",
+        full_table=True,
+        start_server=False,
+        open_browser=False,
+        session_dir=session_dir,
+    )
+
+    from urllib.parse import parse_qs, urlparse
+
+    data_id = parse_qs(urlparse(ui_url).query)["data_id"][0]
+    _, metadata = load_dataframe_session(data_id, session_dir=session_dir)
+    assert metadata["target"] == "risk_flag"
