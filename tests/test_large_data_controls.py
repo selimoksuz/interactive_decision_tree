@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from interactive_decision_tree.session_store import save_dataframe_session
+from interactive_decision_tree_app import (
+    analysis_row_idx,
+    candidate_cache_key,
+    candidate_splits,
+    evaluation_model_metrics,
+    init_tree,
+    restore_checkpoint_dataframe,
+    score_split,
+    split_node,
+)
+
+
+def test_analysis_row_idx_samples_stably():
+    row_idx = list(range(1_000))
+
+    first = analysis_row_idx(row_idx, max_rows=100, random_state=42)
+    second = analysis_row_idx(row_idx, max_rows=100, random_state=42)
+
+    assert first == second
+    assert len(first) == 100
+    assert first == sorted(first)
+    assert set(first).issubset(row_idx)
+
+
+def test_analysis_row_idx_keeps_small_inputs_unchanged():
+    row_idx = [4, 2, 9]
+
+    assert analysis_row_idx(row_idx, max_rows=10) == row_idx
+
+
+def test_analysis_row_idx_stratifies_by_target_when_sampling():
+    df = pd.DataFrame(
+        {
+            "target": ["bad"] * 80 + ["good"] * 20,
+        }
+    )
+
+    sampled = analysis_row_idx(df.index.tolist(), max_rows=20, random_state=7, df=df, target="target")
+    counts = df.loc[sampled, "target"].value_counts().to_dict()
+
+    assert counts == {"bad": 16, "good": 4}
+
+
+def test_candidate_cache_key_changes_with_variable_set():
+    base = {
+        "data_key": "data",
+        "target": "risk_flag",
+        "node_id": 0,
+        "row_count": 1_000_000,
+        "parameters": {"min_leaf": 20, "max_thresholds": 100},
+        "max_rows": 50_000,
+    }
+
+    all_features = candidate_cache_key(features=["age", "income", "segment"], **base)
+    reduced_features = candidate_cache_key(features=["age", "segment"], **base)
+
+    assert all_features != reduced_features
+
+
+def test_candidate_splits_parallel_matches_serial():
+    df = pd.DataFrame(
+        {
+            "age": [20, 25, 30, 35, 40, 45, 50, 55],
+            "segment": ["A", "A", "B", "B", "C", "C", "D", "D"],
+            "risk_flag": ["low", "low", "low", "high", "high", "high", "high", "low"],
+        }
+    )
+    kwargs = {
+        "df": df,
+        "target": "risk_flag",
+        "features": ["age", "segment"],
+        "row_idx": df.index.tolist(),
+        "min_leaf": 1,
+        "max_thresholds": 4,
+        "max_categories": 4,
+        "max_numeric_bins": 3,
+        "max_category_groups": 3,
+    }
+
+    serial = candidate_splits(**kwargs, parallel_workers=1)
+    parallel = candidate_splits(**kwargs, parallel_workers=2)
+
+    assert [(item.feature, item.label, item.information_gain) for item in parallel] == [
+        (item.feature, item.label, item.information_gain) for item in serial
+    ]
+
+
+def test_evaluation_model_metrics_scores_test_dataframe():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x": [1.5, 3.5],
+            "risk_flag": ["low", "high"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+    assert candidate is not None
+    split_node(train, 0, candidate, select_first_child=False)
+
+    metrics = evaluation_model_metrics(train, test, "risk_flag", "Test")
+
+    accuracy = metrics.loc[metrics["metric"] == "accuracy", "value"].iloc[0]
+    assert float(accuracy) == 1.0
+
+
+def test_restore_checkpoint_dataframe_uses_session_snapshot_without_embedded_frame(tmp_path, monkeypatch):
+    monkeypatch.setenv("INTERACTIVE_TREE_SESSION_DIR", str(tmp_path))
+    df = pd.DataFrame({"age": [30, 40], "risk_flag": [0, 1]})
+    data_id, _ = save_dataframe_session(df, target="risk_flag", features=["age"], name="upload")
+    checkpoint = {
+        "data": {
+            "source": "uploaded",
+            "name": "upload.csv",
+            "data_id": data_id,
+            "data_key": "uploaded-key",
+            "frame_json_omitted": True,
+        }
+    }
+
+    restored = restore_checkpoint_dataframe(checkpoint)
+
+    assert restored is not None
+    restored_df, restored_name, restored_key = restored
+    pd.testing.assert_frame_equal(restored_df, df)
+    assert restored_name == "upload.csv"
+    assert restored_key == "uploaded-key"

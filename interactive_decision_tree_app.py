@@ -4,7 +4,9 @@ import hashlib
 import html as html_lib
 import io
 import json
+import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,12 @@ POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
 GRAPH_LABEL_DETAIL_LIMIT = 25
+DEFAULT_CANDIDATE_SAMPLE_ROWS = 50_000
+AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
+CANDIDATE_RANDOM_STATE = 20260514
+CHECKPOINT_EMBED_MAX_ROWS = 50_000
+CPU_COUNT = max(1, os.cpu_count() or 1)
+DEFAULT_PARALLEL_WORKERS = max(1, min(8, CPU_COUNT))
 
 
 @dataclass(frozen=True)
@@ -325,6 +333,7 @@ def score_split(
     split_type: str,
     value: Any,
     min_leaf: int,
+    target_kind: str | None = None,
 ) -> SplitCandidate | None:
     frame = df.loc[row_idx, [feature, target]]
 
@@ -345,7 +354,7 @@ def score_split(
     else:
         raise ValueError(f"Unknown split_type: {split_type}")
 
-    scored = score_branch_split(frame, target, masks_and_labels, min_leaf, infer_target_kind(df[target]))
+    scored = score_branch_split(frame, target, masks_and_labels, min_leaf, target_kind or infer_target_kind(df[target]))
     if scored is None:
         return None
     parent_entropy, weighted_entropy, branch_labels, branch_ns, branch_entropies = scored
@@ -372,6 +381,7 @@ def score_numeric_multiway_split(
     feature: str,
     bin_count: int,
     min_leaf: int,
+    target_kind: str | None = None,
 ) -> SplitCandidate | None:
     frame = df.loc[row_idx, [feature, target]]
     numeric = pd.to_numeric(frame[feature], errors="coerce")
@@ -403,7 +413,7 @@ def score_numeric_multiway_split(
             f"{masks_and_labels[-1][1]} or missing",
         )
 
-    scored = score_branch_split(frame, target, masks_and_labels, min_leaf, infer_target_kind(df[target]))
+    scored = score_branch_split(frame, target, masks_and_labels, min_leaf, target_kind or infer_target_kind(df[target]))
     if scored is None:
         return None
     parent_entropy, weighted_entropy, branch_labels, branch_ns, branch_entropies = scored
@@ -464,13 +474,20 @@ def score_category_multiway_split(
     )
 
 
-def category_profile_order(df: pd.DataFrame, target: str, row_idx: list[int], feature: str) -> list[Any]:
+def category_profile_order(
+    df: pd.DataFrame,
+    target: str,
+    row_idx: list[int],
+    feature: str,
+    target_kind: str | None = None,
+    positive_class: Any = None,
+) -> list[Any]:
     frame = df.loc[row_idx, [feature, target]]
     values = frame[feature].astype("object").where(frame[feature].notna(), "__MISSING__")
-    target_kind = infer_target_kind(df[target])
+    target_kind = target_kind or infer_target_kind(df[target])
 
     if target_kind == "binary":
-        positive_class = choose_positive_class(df[target])
+        positive_class = positive_class if positive_class is not None else choose_positive_class(df[target])
         profile = (
             pd.DataFrame({"value": values, "event": frame[target] == positive_class})
             .groupby("value", dropna=False)
@@ -518,10 +535,20 @@ def score_category_profile_groups(
     feature: str,
     max_groups: int,
     min_leaf: int,
+    target_kind: str | None = None,
+    positive_class: Any = None,
 ) -> list[SplitCandidate]:
     frame = df.loc[row_idx, [feature, target]]
     values = frame[feature].astype("object").where(frame[feature].notna(), "__MISSING__")
-    ordered_values = category_profile_order(df, target, row_idx, feature)
+    resolved_target_kind = target_kind or infer_target_kind(df[target])
+    ordered_values = category_profile_order(
+        df,
+        target,
+        row_idx,
+        feature,
+        target_kind=resolved_target_kind,
+        positive_class=positive_class,
+    )
     if len(ordered_values) < 2:
         return []
 
@@ -536,7 +563,7 @@ def score_category_profile_groups(
             suffix = "" if len(group) <= 4 else f", +{len(group) - 4}"
             masks_and_labels.append((values.isin(group), f"{{{preview}{suffix}}}"))
 
-        scored = score_branch_split(frame, target, masks_and_labels, min_leaf, infer_target_kind(df[target]))
+        scored = score_branch_split(frame, target, masks_and_labels, min_leaf, resolved_target_kind)
         if scored is None:
             continue
         parent_impurity, weighted_impurity, branch_labels, branch_ns, branch_entropies = scored
@@ -845,6 +872,85 @@ def category_group_rows(
     return rows
 
 
+def candidate_splits_for_feature(
+    df: pd.DataFrame,
+    target: str,
+    feature: str,
+    row_idx: list[int],
+    min_leaf: int,
+    max_thresholds: int,
+    max_categories: int,
+    max_numeric_bins: int,
+    max_category_groups: int,
+    target_kind: str,
+    positive_class: Any = None,
+) -> list[SplitCandidate]:
+    candidates: list[SplitCandidate] = []
+    s = df.loc[row_idx, feature]
+
+    if pd.api.types.is_numeric_dtype(s):
+        for threshold in numeric_thresholds(s, max_thresholds):
+            candidate = score_split(
+                df=df,
+                target=target,
+                row_idx=row_idx,
+                feature=feature,
+                split_type="numeric_le",
+                value=threshold,
+                min_leaf=min_leaf,
+                target_kind=target_kind,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        for bin_count in range(3, max_numeric_bins + 1):
+            candidate = score_numeric_multiway_split(
+                df=df,
+                target=target,
+                row_idx=row_idx,
+                feature=feature,
+                bin_count=bin_count,
+                min_leaf=min_leaf,
+                target_kind=target_kind,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    else:
+        values = (
+            s.astype("object")
+            .where(s.notna(), "__MISSING__")
+            .value_counts()
+            .head(max_categories)
+            .index.tolist()
+        )
+        for value in values:
+            candidate = score_split(
+                df=df,
+                target=target,
+                row_idx=row_idx,
+                feature=feature,
+                split_type="category_eq",
+                value=value,
+                min_leaf=min_leaf,
+                target_kind=target_kind,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        candidates.extend(
+            score_category_profile_groups(
+                df=df,
+                target=target,
+                row_idx=row_idx,
+                feature=feature,
+                max_groups=max_category_groups,
+                min_leaf=min_leaf,
+                target_kind=target_kind,
+                positive_class=positive_class,
+            )
+        )
+
+    return candidates
+
+
 def candidate_splits(
     df: pd.DataFrame,
     target: str,
@@ -855,68 +961,165 @@ def candidate_splits(
     max_categories: int,
     max_numeric_bins: int,
     max_category_groups: int,
+    parallel_workers: int = 1,
 ) -> list[SplitCandidate]:
     candidates: list[SplitCandidate] = []
+    if not features:
+        return candidates
 
-    for feature in features:
-        s = df.loc[row_idx, feature]
+    target_kind = infer_target_kind(df[target])
+    positive_class = choose_positive_class(df[target]) if target_kind == "binary" else None
+    try:
+        worker_count = int(parallel_workers)
+    except (TypeError, ValueError):
+        worker_count = 1
+    worker_count = max(1, min(worker_count, len(features)))
 
-        if pd.api.types.is_numeric_dtype(s):
-            for threshold in numeric_thresholds(s, max_thresholds):
-                candidate = score_split(
-                    df=df,
-                    target=target,
-                    row_idx=row_idx,
-                    feature=feature,
-                    split_type="numeric_le",
-                    value=threshold,
-                    min_leaf=min_leaf,
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
-            for bin_count in range(3, max_numeric_bins + 1):
-                candidate = score_numeric_multiway_split(
-                    df=df,
-                    target=target,
-                    row_idx=row_idx,
-                    feature=feature,
-                    bin_count=bin_count,
-                    min_leaf=min_leaf,
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
-        else:
-            values = (
-                s.astype("object")
-                .where(s.notna(), "__MISSING__")
-                .value_counts()
-                .head(max_categories)
-                .index.tolist()
-            )
-            for value in values:
-                candidate = score_split(
-                    df=df,
-                    target=target,
-                    row_idx=row_idx,
-                    feature=feature,
-                    split_type="category_eq",
-                    value=value,
-                    min_leaf=min_leaf,
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
-            grouped_candidates = score_category_profile_groups(
-                df=df,
-                target=target,
-                row_idx=row_idx,
-                feature=feature,
-                max_groups=max_category_groups,
-                min_leaf=min_leaf,
-            )
-            candidates.extend(grouped_candidates)
+    def score_feature(feature: str) -> list[SplitCandidate]:
+        return candidate_splits_for_feature(
+            df=df,
+            target=target,
+            feature=feature,
+            row_idx=row_idx,
+            min_leaf=min_leaf,
+            max_thresholds=max_thresholds,
+            max_categories=max_categories,
+            max_numeric_bins=max_numeric_bins,
+            max_category_groups=max_category_groups,
+            target_kind=target_kind,
+            positive_class=positive_class,
+        )
+
+    if worker_count == 1:
+        for feature in features:
+            candidates.extend(score_feature(feature))
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for feature_candidates in executor.map(score_feature, features):
+                candidates.extend(feature_candidates)
 
     feature_rank = {feature: i for i, feature in enumerate(features)}
     return sorted(candidates, key=lambda x: (-x.information_gain, feature_rank.get(x.feature, 9999), x.label))
+
+
+def analysis_row_idx(
+    row_idx: list[int],
+    max_rows: int,
+    random_state: int = CANDIDATE_RANDOM_STATE,
+    df: pd.DataFrame | None = None,
+    target: str | None = None,
+) -> list[int]:
+    if max_rows <= 0 or len(row_idx) <= max_rows:
+        return row_idx
+    if df is not None and target is not None and target in df.columns:
+        labels = df.loc[row_idx, target].astype("object").where(df.loc[row_idx, target].notna(), "__MISSING__")
+        counts = labels.value_counts(dropna=False)
+        raw_take = counts / counts.sum() * max_rows
+        take = np.floor(raw_take).astype(int)
+        for value in take.index:
+            if take.sum() >= max_rows:
+                break
+            if counts[value] > 0 and take[value] == 0:
+                take[value] = 1
+        while take.sum() < max_rows:
+            available = counts[counts > take]
+            if available.empty:
+                break
+            remainders = (raw_take - take).reindex(available.index).sort_values(ascending=False)
+            take[remainders.index[0]] += 1
+        while take.sum() > max_rows:
+            removable = take[take > 1]
+            if removable.empty:
+                removable = take[take > 0]
+            remainders = (raw_take - take).reindex(removable.index).sort_values()
+            take[remainders.index[0]] -= 1
+
+        sampled_indices: list[int] = []
+        for value, n in take.items():
+            if int(n) <= 0:
+                continue
+            value_idx = labels[labels == value].index
+            sampled = value_idx.to_series(index=value_idx).sample(
+                n=min(int(n), len(value_idx)),
+                random_state=random_state,
+            )
+            sampled_indices.extend(sampled.tolist())
+        return sorted(sampled_indices)
+
+    index = pd.Index(row_idx)
+    sampled = index.to_series(index=index).sample(n=max_rows, random_state=random_state).sort_index()
+    return sampled.tolist()
+
+
+def candidate_cache_key(
+    data_key: str,
+    target: str,
+    node_id: int,
+    features: list[str],
+    row_count: int,
+    parameters: dict[str, Any],
+    max_rows: int,
+) -> str:
+    payload = {
+        "schema": TREE_SCHEMA_VERSION,
+        "data_key": data_key,
+        "target": target,
+        "node_id": node_id,
+        "features": list(features),
+        "row_count": int(row_count),
+        "parameters": json_safe(parameters),
+        "max_rows": int(max_rows),
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def candidate_state_key(data_key: str, target: str, node_id: int) -> str:
+    return f"candidate_cache::{data_key}::{target}::{node_id}"
+
+
+def clear_candidate_cache(data_key: str | None = None, target: str | None = None, node_id: int | None = None) -> None:
+    prefix = "candidate_cache::"
+    for key in list(st.session_state.keys()):
+        if not isinstance(key, str) or not key.startswith(prefix):
+            continue
+        if data_key is not None and f"::{data_key}::" not in key:
+            continue
+        if target is not None and f"::{target}::" not in key:
+            continue
+        if node_id is not None and not key.endswith(f"::{node_id}"):
+            continue
+        del st.session_state[key]
+
+
+def get_cached_candidates(data_key: str, target: str, node_id: int, cache_key: str) -> list[SplitCandidate] | None:
+    payload = st.session_state.get(candidate_state_key(data_key, target, node_id))
+    if not isinstance(payload, dict) or payload.get("cache_key") != cache_key:
+        return None
+    candidates = payload.get("candidates")
+    return candidates if isinstance(candidates, list) else None
+
+
+def store_cached_candidates(
+    data_key: str,
+    target: str,
+    node_id: int,
+    cache_key: str,
+    candidates: list[SplitCandidate],
+    analyzed_rows: int,
+    full_rows: int,
+) -> None:
+    st.session_state[candidate_state_key(data_key, target, node_id)] = {
+        "cache_key": cache_key,
+        "candidates": candidates,
+        "analyzed_rows": int(analyzed_rows),
+        "full_rows": int(full_rows),
+    }
+
+
+def cached_candidate_meta(data_key: str, target: str, node_id: int) -> dict[str, Any]:
+    payload = st.session_state.get(candidate_state_key(data_key, target, node_id))
+    return payload if isinstance(payload, dict) else {}
 
 
 def sync_feature_order(selected_features: list[str], data_key: str, target: str) -> list[str]:
@@ -1188,6 +1391,8 @@ def build_optimal_tree(
     max_depth: int,
     max_leaves: int,
     min_information_gain: float,
+    candidate_rows: int,
+    parallel_workers: int,
 ) -> int:
     init_tree(df)
     split_count = 0
@@ -1205,16 +1410,23 @@ def build_optimal_tree(
             if leaf["depth"] >= max_depth:
                 continue
 
+            search_row_idx = analysis_row_idx(
+                leaf["row_idx"],
+                candidate_rows,
+                df=df,
+                target=target,
+            )
             candidates = candidate_splits(
                 df=df,
                 target=target,
                 features=features,
-                row_idx=leaf["row_idx"],
+                row_idx=search_row_idx,
                 min_leaf=min_leaf,
                 max_thresholds=max_thresholds,
                 max_categories=max_categories,
                 max_numeric_bins=max_numeric_bins,
                 max_category_groups=max_category_groups,
+                parallel_workers=parallel_workers,
             )
             for candidate in candidates:
                 if candidate.information_gain < min_information_gain:
@@ -1453,6 +1665,16 @@ def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.
     data = checkpoint.get("data")
     if not isinstance(data, dict) or data.get("source") != "uploaded":
         return None
+    uploaded_name = str(data.get("name") or "restored_upload.csv")
+    data_id = normalize_data_id(data.get("data_id"))
+    if data_id is not None:
+        try:
+            df, metadata = load_dataframe_session(data_id)
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+            pass
+        else:
+            data_key = str(data.get("data_key") or session_data_key(data_id, df, metadata))
+            return df, uploaded_name, data_key
     frame_json = data.get("frame_json")
     if not isinstance(frame_json, str) or not frame_json:
         return None
@@ -1460,7 +1682,6 @@ def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.
         df = pd.read_json(io.StringIO(frame_json), orient="split")
     except ValueError:
         return None
-    uploaded_name = str(data.get("name") or "restored_upload.csv")
     data_key = str(data.get("data_key") or uploaded_data_key(uploaded_name, df))
     return df, uploaded_name, data_key
 
@@ -1596,8 +1817,11 @@ def save_work_checkpoint(
         "columns": [str(column) for column in df.columns],
         "metadata": json_safe(source_metadata or {}),
     }
-    if data_source == "uploaded":
+    if data_source == "uploaded" and len(df) <= CHECKPOINT_EMBED_MAX_ROWS:
         data_payload["frame_json"] = df.to_json(orient="split", date_format="iso", default_handler=str)
+    elif data_source == "uploaded":
+        data_payload["frame_json_omitted"] = True
+        data_payload["frame_json_omitted_reason"] = f"row_count_above_{CHECKPOINT_EMBED_MAX_ROWS}"
 
     payload = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -2719,6 +2943,122 @@ def tree_predictions(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return out
 
 
+def tree_predictions_for_dataframe(train_df: pd.DataFrame, eval_df: pd.DataFrame, target: str) -> pd.DataFrame:
+    target_kind = infer_target_kind(train_df[target])
+    positive_class = choose_positive_class(train_df[target]) if target_kind == "binary" else None
+    out = pd.DataFrame(index=eval_df.index)
+    out["leaf_id"] = np.nan
+
+    if target_kind == "regression":
+        out["prediction"] = np.nan
+    elif target_kind == "binary":
+        out["prediction"] = None
+        out["positive_rate"] = np.nan
+    else:
+        out["prediction"] = None
+
+    pending: list[tuple[int, list[int]]] = [(0, eval_df.index.tolist())]
+    while pending:
+        node_id, idx = pending.pop()
+        if not idx or node_id not in st.session_state.tree:
+            continue
+        node = st.session_state.tree[node_id]
+        children = get_node_children(node)
+        if node["split"] is None or not children:
+            summary = node_summary(train_df, target, node["row_idx"])
+            out.loc[idx, "leaf_id"] = node["id"]
+            if target_kind == "regression":
+                out.loc[idx, "prediction"] = summary.get("target_mean", np.nan)
+            elif target_kind == "binary":
+                rate = float(summary.get("default_rate", np.nan))
+                out.loc[idx, "positive_rate"] = rate
+                negative_classes = [
+                    cls for cls in train_df[target].dropna().unique() if not class_values_equal(cls, positive_class)
+                ]
+                out.loc[idx, "prediction"] = positive_class if rate >= 0.5 else (
+                    negative_classes[0] if negative_classes else None
+                )
+            else:
+                out.loc[idx, "prediction"] = summary["prediction"]
+            continue
+
+        conditions = split_branch_conditions(node["split"])
+        remaining = pd.Index(idx)
+        for child_index, child in enumerate(children):
+            if child_index == len(children) - 1:
+                child_idx = remaining.tolist()
+            else:
+                condition = conditions[child_index] if child_index < len(conditions) else {}
+                mask = export_condition_mask(eval_df, remaining.tolist(), condition)
+                child_idx = eval_df.loc[remaining].loc[mask].index.tolist()
+                remaining = remaining.difference(child_idx, sort=False)
+            pending.append((child["id"], child_idx))
+
+    return out
+
+
+def evaluated_tree_total_gain(eval_df: pd.DataFrame, target: str, predictions: pd.DataFrame) -> tuple[float, float, float]:
+    target_kind = infer_target_kind(eval_df[target])
+    root_impurity = target_impurity(eval_df[target], target_kind)
+    weighted_leaf_impurity = 0.0
+    valid = predictions["leaf_id"].notna()
+    if not valid.any():
+        return 0.0, root_impurity, root_impurity
+    for _, group in predictions[valid].groupby("leaf_id"):
+        y_leaf = eval_df.loc[group.index, target]
+        weighted_leaf_impurity += (len(y_leaf) / len(eval_df)) * target_impurity(y_leaf, target_kind)
+    return root_impurity - weighted_leaf_impurity, root_impurity, weighted_leaf_impurity
+
+
+def evaluation_model_metrics(
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
+    target: str,
+    dataset_name: str,
+) -> pd.DataFrame:
+    target_kind = infer_target_kind(train_df[target])
+    preds = tree_predictions_for_dataframe(train_df, eval_df, target)
+    y = eval_df[target]
+    valid = preds["prediction"].notna() & y.notna()
+    rows: list[dict[str, Any]] = [{"dataset": dataset_name, "metric": "rows", "value": len(eval_df)}]
+    rows.append({"dataset": dataset_name, "metric": "scored_rows", "value": int(valid.sum())})
+
+    if target_kind == "binary":
+        positive_class = choose_positive_class(train_df[target])
+        y_binary = (y == positive_class).astype(int)
+        auc = binary_auc(y_binary[valid], preds.loc[valid, "positive_rate"])
+        accuracy = float((preds.loc[valid, "prediction"] == y[valid]).mean()) if valid.any() else None
+        rows.append({"dataset": dataset_name, "metric": "target_type", "value": "binary"})
+        rows.append({"dataset": dataset_name, "metric": "positive_class", "value": positive_class})
+        rows.append({"dataset": dataset_name, "metric": "default_rate", "value": float(y_binary.mean())})
+        rows.append({"dataset": dataset_name, "metric": "auc", "value": auc})
+        rows.append({"dataset": dataset_name, "metric": "gini", "value": None if auc is None else 2 * auc - 1})
+        rows.append({"dataset": dataset_name, "metric": "accuracy", "value": accuracy})
+    elif target_kind == "regression":
+        y_num = pd.to_numeric(y, errors="coerce")
+        pred_num = pd.to_numeric(preds["prediction"], errors="coerce")
+        mask = y_num.notna() & pred_num.notna()
+        residual = y_num[mask] - pred_num[mask]
+        baseline = y_num[mask] - y_num[mask].mean()
+        sse = float((residual**2).sum())
+        sst = float((baseline**2).sum())
+        rows.append({"dataset": dataset_name, "metric": "target_type", "value": "regression"})
+        rows.append({"dataset": dataset_name, "metric": "rmse", "value": float(np.sqrt((residual**2).mean())) if len(residual) else None})
+        rows.append({"dataset": dataset_name, "metric": "mae", "value": float(residual.abs().mean()) if len(residual) else None})
+        rows.append({"dataset": dataset_name, "metric": "r2", "value": None if sst == 0 else 1 - sse / sst})
+    else:
+        accuracy = float((preds.loc[valid, "prediction"] == y[valid]).mean()) if valid.any() else None
+        rows.append({"dataset": dataset_name, "metric": "target_type", "value": "classification"})
+        rows.append({"dataset": dataset_name, "metric": "accuracy", "value": accuracy})
+
+    total_gain, root_impurity, leaf_impurity = evaluated_tree_total_gain(eval_df, target, preds)
+    rows.append({"dataset": dataset_name, "metric": "tree_total_gain", "value": total_gain})
+    rows.append({"dataset": dataset_name, "metric": "root_impurity", "value": root_impurity})
+    rows.append({"dataset": dataset_name, "metric": "weighted_leaf_impurity", "value": leaf_impurity})
+    rows.append({"dataset": dataset_name, "metric": "leaf_count", "value": len(current_leaves())})
+    return pd.DataFrame(rows)
+
+
 def model_metrics(df: pd.DataFrame, target: str) -> pd.DataFrame:
     target_kind = infer_target_kind(df[target])
     preds = tree_predictions(df, target)
@@ -2941,6 +3281,27 @@ def main() -> None:
         default=default_selected_features,
     )
     features = selected_features
+    test_df: pd.DataFrame | None = None
+    with st.sidebar.expander("Test data", expanded=False):
+        test_upload = st.file_uploader(
+            "Optional test CSV/Excel",
+            type=["csv", "xlsx", "xls"],
+            key="test_data_upload",
+            help="Upload a holdout/test set with the same target and split variable columns.",
+        )
+        if test_upload is not None:
+            try:
+                loaded_test_df = read_uploaded_table(test_upload)
+            except Exception as exc:
+                st.error(f"Test file load failed: {exc}")
+                st.stop()
+            required_test_columns = [target] + features
+            missing_test_columns = [column for column in required_test_columns if column not in loaded_test_df.columns]
+            if missing_test_columns:
+                st.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
+                st.stop()
+            test_df = loaded_test_df
+            st.caption(f"Loaded test rows: {len(test_df):,}")
 
     saved_parameters = (
         checkpoint.get("parameters")
@@ -2979,12 +3340,22 @@ def main() -> None:
         step=1,
         format="%d",
     )
+    parallel_workers_input = st.sidebar.number_input(
+        "Parallel split workers",
+        value=safe_int(saved_parameters.get("parallel_workers"), default=DEFAULT_PARALLEL_WORKERS, minimum=1),
+        min_value=1,
+        max_value=CPU_COUNT,
+        step=1,
+        format="%d",
+        help="Split candidates are scored feature-by-feature in parallel. Thread workers avoid copying the full DataFrame.",
+    )
 
     min_leaf = safe_int(min_leaf_input, default=20, minimum=1)
     max_thresholds = safe_int(max_thresholds_input, default=40, minimum=1)
     max_numeric_bins = safe_int(max_numeric_bins_input, default=4, minimum=2)
     max_categories = safe_int(max_categories_input, default=20, minimum=1)
     max_category_groups = safe_int(max_category_groups_input, default=5, minimum=2)
+    parallel_workers = safe_int(parallel_workers_input, default=DEFAULT_PARALLEL_WORKERS, minimum=1)
 
     state_key = (data_key, target, TREE_SCHEMA_VERSION)
     if "state_key" not in st.session_state or st.session_state.state_key != state_key:
@@ -2998,6 +3369,7 @@ def main() -> None:
         "max_numeric_bins": max_numeric_bins,
         "max_categories": max_categories,
         "max_category_groups": max_category_groups,
+        "parallel_workers": parallel_workers,
     }
     saved_auto_parameters = (
         checkpoint.get("auto_parameters")
@@ -3043,13 +3415,30 @@ def main() -> None:
             step=0.001,
             format="%.6f",
         )
+        auto_candidate_rows_input = st.number_input(
+            "Rows per node for split search",
+            value=min(
+                len(df),
+                safe_int(saved_auto_parameters.get("candidate_rows"), default=len(df), minimum=1),
+            ),
+            min_value=1,
+            max_value=max(1, len(df)),
+            step=10_000,
+            format="%d",
+            help=(
+                "Default is full data. If you lower it, rows are sampled in a target-stratified way."
+            ),
+        )
         auto_max_depth = safe_int(auto_max_depth_input, default=3, minimum=1)
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
+        auto_candidate_rows = min(len(df), safe_int(auto_candidate_rows_input, default=len(df), minimum=1))
         auto_parameters = {
             "max_depth": auto_max_depth,
             "max_leaves": auto_max_leaves,
             "min_information_gain": auto_min_gain,
+            "candidate_rows": auto_candidate_rows,
+            "parallel_workers": parallel_workers,
         }
 
         if st.button("Build optimal tree", width="stretch", disabled=not features):
@@ -3065,6 +3454,8 @@ def main() -> None:
                 max_depth=auto_max_depth,
                 max_leaves=auto_max_leaves,
                 min_information_gain=auto_min_gain,
+                candidate_rows=auto_candidate_rows,
+                parallel_workers=parallel_workers,
             )
             st.session_state.auto_tree_message = f"Optimal tree built with {split_count} split(s)."
             save_and_rerun()
@@ -3107,10 +3498,12 @@ def main() -> None:
 
     if st.sidebar.button("Reset tree", width="stretch"):
         init_tree(df)
+        clear_candidate_cache(data_key, target)
         save_and_rerun()
 
     if st.sidebar.button("Undo last split", width="stretch", disabled=not st.session_state.get("split_history")):
         undo_last_split()
+        clear_candidate_cache(data_key, target)
         save_and_rerun()
 
     tree = st.session_state.tree
@@ -3143,7 +3536,16 @@ def main() -> None:
     summary = node_summary(df, target, current["row_idx"])
 
     with st.expander("Model performance", expanded=True):
-        st.dataframe(arrow_safe_dataframe(model_metrics(df, target)), hide_index=True, width="stretch")
+        train_metrics = model_metrics(df, target)
+        train_metrics.insert(0, "dataset", "Train")
+        metric_frames = [train_metrics]
+        if test_df is not None:
+            metric_frames.append(evaluation_model_metrics(df, test_df, target, "Test"))
+        st.dataframe(
+            arrow_safe_dataframe(pd.concat(metric_frames, ignore_index=True)),
+            hide_index=True,
+            width="stretch",
+        )
 
     left_col, right_col = st.columns([1.1, 1.5])
 
@@ -3174,6 +3576,7 @@ def main() -> None:
                     save_and_rerun()
             if st.button("Revise this split", width="stretch"):
                 prune_node(current["id"])
+                clear_candidate_cache(data_key, target)
                 save_and_rerun()
 
     with right_col:
@@ -3183,73 +3586,159 @@ def main() -> None:
             elif not features:
                 st.warning("Select at least one feature.")
             else:
-                all_candidates = candidate_splits(
-                    df=df,
-                    target=target,
-                    features=features,
-                    row_idx=current["row_idx"],
-                    min_leaf=int(min_leaf),
-                    max_thresholds=int(max_thresholds),
-                    max_categories=int(max_categories),
-                    max_numeric_bins=int(max_numeric_bins),
-                    max_category_groups=int(max_category_groups),
-                )
-
-                if not all_candidates:
-                    st.warning("No valid split found for current settings.")
-                else:
-                    feature_rows = feature_summary_rows(all_candidates, features)
-                    feature_stats = {row["variable"]: row for row in feature_rows}
-                    leaf_feature_options = ordered_features_by_gain(features, feature_stats)
-                    positive_candidates = [
-                        candidate
-                        for candidate in all_candidates
-                        if candidate.information_gain > MIN_INFORMATION_GAIN_EPSILON
-                    ]
-                    if not leaf_feature_options or not positive_candidates:
-                        st.warning("No split with positive information gain found for this leaf.")
-                        st.dataframe(
-                            arrow_safe_dataframe(
-                                pd.DataFrame(
-                                    feature_summary_rows(
-                                        all_candidates,
-                                        features,
-                                        include_zero_gain=True,
-                                    )
-                                )
-                            ),
-                            hide_index=True,
-                            width="stretch",
-                            column_config={
-                                "total_information_gain": st.column_config.NumberColumn(format="%.6f"),
-                                "best_information_gain": st.column_config.NumberColumn(format="%.6f"),
-                            },
-                        )
-                        st.stop()
-                    leaf_feature_key = node_feature_key(data_key, target, current["id"])
-                    ensure_node_feature(leaf_feature_key, leaf_feature_options, feature_stats)
-
-                    st.subheader("Variable for this leaf")
-                    selected_feature = st.selectbox(
-                        "Choose one variable to try under this leaf",
-                        options=leaf_feature_options,
-                        key=leaf_feature_key,
-                        format_func=lambda feature: (
-                            f"{feature} | total IG={feature_stats[feature]['total_information_gain']:.6f} | "
-                            f"best={feature_stats[feature]['best_information_gain']:.6f}"
+                current_row_count = len(current["row_idx"])
+                large_leaf = current_row_count > AUTO_COMPUTE_CANDIDATE_ROWS
+                candidate_sample_key = f"candidate_sample_rows::{data_key}::{target}::{current['id']}"
+                if candidate_sample_key not in st.session_state:
+                    st.session_state[candidate_sample_key] = current_row_count
+                candidate_features_key = f"candidate_features::{data_key}::{target}::{current['id']}"
+                if candidate_features_key not in st.session_state:
+                    st.session_state[candidate_features_key] = features.copy()
+                st.session_state[candidate_features_key] = [
+                    feature for feature in st.session_state[candidate_features_key] if feature in features
+                ]
+                if not st.session_state[candidate_features_key]:
+                    st.session_state[candidate_features_key] = features.copy()
+                with st.form(key=f"candidate_form::{data_key}::{target}::{current['id']}"):
+                    candidate_sample_rows = st.number_input(
+                        "Rows to scan for split ranking",
+                        min_value=1,
+                        max_value=max(1, current_row_count),
+                        step=10_000,
+                        format="%d",
+                        key=candidate_sample_key,
+                        help=(
+                            "Default is the full leaf. If you lower it, ranking uses a target-stratified sample. "
+                            "Applied splits still split the full leaf."
                         ),
                     )
+                    candidate_features = st.multiselect(
+                        "Variables to rank for this leaf",
+                        options=features,
+                        key=candidate_features_key,
+                        help=(
+                            "Change this list freely; split ranking runs only when you submit the form."
+                        ),
+                    )
+                    compute_candidates = st.form_submit_button(
+                        "Compute split candidates",
+                        type="primary",
+                        width="stretch",
+                    )
+                if not candidate_features:
+                    st.warning("Select at least one variable to compute split candidates for this leaf.")
+                    st.stop()
+                candidate_max_rows = min(current_row_count, safe_int(candidate_sample_rows, DEFAULT_CANDIDATE_SAMPLE_ROWS))
 
-                    selected_stats = feature_stats[selected_feature]
-                    current_total_gain, _, _ = tree_total_gain(df, target)
-                    score_name = split_score_name(df[target])
-                    metric_col1, metric_col2, metric_col3 = st.columns(3)
-                    metric_col1.metric(f"Tree total {score_name}", f"{current_total_gain:.6f}")
-                    metric_col2.metric(f"{selected_feature} total", f"{selected_stats['total_information_gain']:.6f}")
-                    metric_col3.metric(f"{selected_feature} best", f"{selected_stats['best_information_gain']:.6f}")
+                candidate_key = candidate_cache_key(
+                    data_key=data_key,
+                    target=target,
+                    node_id=current["id"],
+                    features=candidate_features,
+                    row_count=current_row_count,
+                    parameters=parameters,
+                    max_rows=candidate_max_rows,
+                )
+                cached_meta = cached_candidate_meta(data_key, target, current["id"])
+                cached_candidates = get_cached_candidates(data_key, target, current["id"], candidate_key)
+                has_candidate_cache = cached_candidates is not None
+                all_candidates = cached_candidates if cached_candidates is not None else []
+                compute_caption = (
+                    f"Compute candidates on {candidate_max_rows:,} of {current_row_count:,} rows "
+                    f"across {len(candidate_features):,} variable(s)."
+                )
+                if large_leaf and not cached_meta:
+                    st.warning(
+                        "Large leaf mode: split candidates are not recomputed automatically. "
+                        "Adjust variables/workers, then compute when ready."
+                    )
+                if compute_candidates:
+                    sampled_row_idx = analysis_row_idx(current["row_idx"], candidate_max_rows, df=df, target=target)
+                    with st.spinner(compute_caption):
+                        all_candidates = candidate_splits(
+                            df=df,
+                            target=target,
+                            features=candidate_features,
+                            row_idx=sampled_row_idx,
+                            min_leaf=int(min_leaf),
+                            max_thresholds=int(max_thresholds),
+                            max_categories=int(max_categories),
+                            max_numeric_bins=int(max_numeric_bins),
+                            max_category_groups=int(max_category_groups),
+                            parallel_workers=parallel_workers,
+                        )
+                    store_cached_candidates(
+                        data_key,
+                        target,
+                        current["id"],
+                        candidate_key,
+                        all_candidates,
+                        analyzed_rows=len(sampled_row_idx),
+                        full_rows=current_row_count,
+                    )
+                    st.rerun()
 
+                if not all_candidates and not large_leaf and not has_candidate_cache:
+                    sampled_row_idx = analysis_row_idx(current["row_idx"], candidate_max_rows, df=df, target=target)
+                    with st.spinner(compute_caption):
+                        all_candidates = candidate_splits(
+                            df=df,
+                            target=target,
+                            features=candidate_features,
+                            row_idx=sampled_row_idx,
+                            min_leaf=int(min_leaf),
+                            max_thresholds=int(max_thresholds),
+                            max_categories=int(max_categories),
+                            max_numeric_bins=int(max_numeric_bins),
+                            max_category_groups=int(max_category_groups),
+                            parallel_workers=parallel_workers,
+                        )
+                    store_cached_candidates(
+                        data_key,
+                        target,
+                        current["id"],
+                        candidate_key,
+                        all_candidates,
+                        analyzed_rows=len(sampled_row_idx),
+                        full_rows=current_row_count,
+                    )
+                    has_candidate_cache = True
+
+                if not all_candidates:
+                    if has_candidate_cache:
+                        st.warning("No valid split found for the current variables and split settings.")
+                    else:
+                        st.info("Press Compute split candidates after choosing variables for this leaf.")
+                    st.stop()
+
+                meta = cached_candidate_meta(data_key, target, current["id"])
+                analyzed_rows = int(meta.get("analyzed_rows", current_row_count) or current_row_count)
+                if analyzed_rows < current_row_count:
+                    st.caption(
+                        f"Split ranking uses a stable sample of {analyzed_rows:,} / {current_row_count:,} rows. "
+                        "Applied splits still use the full leaf."
+                    )
+
+                feature_rows = feature_summary_rows(all_candidates, candidate_features)
+                feature_stats = {row["variable"]: row for row in feature_rows}
+                leaf_feature_options = ordered_features_by_gain(candidate_features, feature_stats)
+                positive_candidates = [
+                    candidate
+                    for candidate in all_candidates
+                    if candidate.information_gain > MIN_INFORMATION_GAIN_EPSILON
+                ]
+                if not leaf_feature_options or not positive_candidates:
+                    st.warning("No split with positive information gain found for this leaf.")
                     st.dataframe(
-                        arrow_safe_dataframe(pd.DataFrame(feature_summary_rows(all_candidates, features, [selected_feature]))),
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                feature_summary_rows(
+                                    all_candidates,
+                                    candidate_features,
+                                    include_zero_gain=True,
+                                )
+                            )
+                        ),
                         hide_index=True,
                         width="stretch",
                         column_config={
@@ -3257,259 +3746,294 @@ def main() -> None:
                             "best_information_gain": st.column_config.NumberColumn(format="%.6f"),
                         },
                     )
+                    st.stop()
 
-                    feature_candidates = [
-                        c
-                        for c in all_candidates
-                        if c.feature == selected_feature and c.information_gain > MIN_INFORMATION_GAIN_EPSILON
+                leaf_feature_key = node_feature_key(data_key, target, current["id"])
+                ensure_node_feature(leaf_feature_key, leaf_feature_options, feature_stats)
+
+                st.subheader("Variable for this leaf")
+                selected_feature = st.selectbox(
+                    "Choose one variable to try under this leaf",
+                    options=leaf_feature_options,
+                    key=leaf_feature_key,
+                    format_func=lambda feature: (
+                        f"{feature} | total IG={feature_stats[feature]['total_information_gain']:.6f} | "
+                        f"best={feature_stats[feature]['best_information_gain']:.6f}"
+                    ),
+                )
+
+                selected_stats = feature_stats[selected_feature]
+                current_total_gain, _, _ = tree_total_gain(df, target)
+                score_name = split_score_name(df[target])
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                metric_col1.metric(f"Tree total {score_name}", f"{current_total_gain:.6f}")
+                metric_col2.metric(f"{selected_feature} total", f"{selected_stats['total_information_gain']:.6f}")
+                metric_col3.metric(f"{selected_feature} best", f"{selected_stats['best_information_gain']:.6f}")
+
+                st.dataframe(
+                    arrow_safe_dataframe(pd.DataFrame(feature_summary_rows(all_candidates, candidate_features, [selected_feature]))),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "total_information_gain": st.column_config.NumberColumn(format="%.6f"),
+                        "best_information_gain": st.column_config.NumberColumn(format="%.6f"),
+                    },
+                )
+
+                feature_candidates = [
+                    c
+                    for c in all_candidates
+                    if c.feature == selected_feature and c.information_gain > MIN_INFORMATION_GAIN_EPSILON
+                ]
+                st.subheader(f"Strongest auto split for {selected_feature}")
+
+                if not feature_candidates:
+                    st.warning("No valid split found for this variable.")
+                else:
+                    selected_candidate = max(feature_candidates, key=lambda c: c.information_gain)
+                    rows = [
+                        {
+                            "split_type": selected_candidate.split_type,
+                            "split": selected_candidate.label,
+                            "branches": selected_candidate.branch_count,
+                            score_name: selected_candidate.information_gain,
+                            "weighted_tree_delta": candidate_total_gain_delta(df, selected_candidate, current["row_idx"]),
+                            "child_weighted_impurity": selected_candidate.weighted_entropy,
+                            "branch_rows": " / ".join(str(n) for n in selected_candidate.branch_ns),
+                            "branch_impurity": " / ".join(f"{x:.3f}" for x in selected_candidate.branch_entropies),
+                        }
                     ]
-                    st.subheader(f"Strongest auto split for {selected_feature}")
 
-                    if not feature_candidates:
-                        st.warning("No valid split found for this variable.")
-                    else:
-                        selected_candidate = max(feature_candidates, key=lambda c: c.information_gain)
-                        rows = [
-                            {
-                                "split_type": selected_candidate.split_type,
-                                "split": selected_candidate.label,
-                                "branches": selected_candidate.branch_count,
-                                score_name: selected_candidate.information_gain,
-                                "weighted_tree_delta": candidate_total_gain_delta(df, selected_candidate, current["row_idx"]),
-                                "child_weighted_impurity": selected_candidate.weighted_entropy,
-                                "branch_rows": " / ".join(str(n) for n in selected_candidate.branch_ns),
-                                "branch_impurity": " / ".join(f"{x:.3f}" for x in selected_candidate.branch_entropies),
-                            }
-                        ]
+                    st.dataframe(
+                        arrow_safe_dataframe(pd.DataFrame(rows)),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            score_name: st.column_config.NumberColumn(format="%.6f"),
+                            "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
+                            "child_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
+                        },
+                    )
 
-                        st.dataframe(
-                            arrow_safe_dataframe(pd.DataFrame(rows)),
-                            hide_index=True,
-                            width="stretch",
-                            column_config={
-                                score_name: st.column_config.NumberColumn(format="%.6f"),
-                                "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
-                                "child_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
-                            },
-                        )
+                    st.dataframe(
+                        arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], selected_candidate))),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    if st.button(
+                        f"Apply auto {selected_feature} split",
+                        key=f"apply_split_{current['id']}_{selected_feature}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        apply_split(df, selected_candidate)
+                        clear_candidate_cache(data_key, target)
+                        save_and_rerun()
 
-                        st.dataframe(
-                            arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], selected_candidate))),
-                            hide_index=True,
-                            width="stretch",
-                        )
-                        if st.button(
-                            f"Apply auto {selected_feature} split",
-                            key=f"apply_split_{current['id']}_{selected_feature}",
-                            type="primary",
-                            width="stretch",
-                        ):
-                            apply_split(df, selected_candidate)
-                            save_and_rerun()
+                st.subheader("Manual split")
+                selected_series = df.loc[current["row_idx"], selected_feature]
+                manual_candidate: SplitCandidate | None = None
 
-                    st.subheader("Manual split")
-                    selected_series = df.loc[current["row_idx"], selected_feature]
-                    manual_candidate: SplitCandidate | None = None
-
-                    if pd.api.types.is_numeric_dtype(selected_series):
-                        manual_text = st.text_input(
-                            "Manual numeric threshold(s)",
-                            value="",
-                            placeholder="Example: 42000 or 30000, 60000",
-                            key=f"manual_thresholds_{current['id']}_{selected_feature}",
-                        )
-                        if manual_text.strip():
-                            try:
-                                thresholds = parse_threshold_text(manual_text)
-                                branch_rows = manual_numeric_branch_rows(
-                                    df,
-                                    current["row_idx"],
-                                    selected_feature,
-                                    thresholds,
+                if pd.api.types.is_numeric_dtype(selected_series):
+                    manual_text = st.text_input(
+                        "Manual numeric threshold(s)",
+                        value="",
+                        placeholder="Example: 42000 or 30000, 60000",
+                        key=f"manual_thresholds_{current['id']}_{selected_feature}",
+                    )
+                    if manual_text.strip():
+                        try:
+                            thresholds = parse_threshold_text(manual_text)
+                            branch_rows = manual_numeric_branch_rows(
+                                df,
+                                current["row_idx"],
+                                selected_feature,
+                                thresholds,
+                            )
+                            if branch_rows:
+                                st.dataframe(
+                                    arrow_safe_dataframe(pd.DataFrame(branch_rows)),
+                                    hide_index=True,
+                                    width="stretch",
                                 )
-                                if branch_rows:
-                                    st.dataframe(
-                                        arrow_safe_dataframe(pd.DataFrame(branch_rows)),
-                                        hide_index=True,
-                                        width="stretch",
-                                    )
-                                manual_candidate = score_numeric_manual_bins(
-                                    df=df,
-                                    target=target,
-                                    row_idx=current["row_idx"],
-                                    feature=selected_feature,
-                                    thresholds=thresholds,
-                                    min_leaf=int(min_leaf),
-                                )
-                                if manual_candidate is None:
-                                    low_branches = [
-                                        row
-                                        for row in branch_rows
-                                        if int(row["rows"]) < int(min_leaf)
-                                    ]
-                                    if low_branches:
-                                        branch_text = ", ".join(
-                                            f"{row['branch']} n={row['rows']}" for row in low_branches
-                                        )
-                                        st.warning(
-                                            "Manual split is not valid because every branch must have "
-                                            f"at least {int(min_leaf)} rows. Low-count branch(es): {branch_text}."
-                                        )
-                                    else:
-                                        st.warning("Manual split is not valid for the current node.")
-                            except ValueError:
-                                st.warning("Manual thresholds must be numeric values separated by comma.")
-                    else:
-                        levels = (
-                            selected_series.astype("object")
-                            .where(selected_series.notna(), "__MISSING__")
-                            .drop_duplicates()
-                            .tolist()
-                        )
-                        levels = sorted(levels, key=lambda x: str(x))
-                        level_texts = [str(level) for level in levels]
-                        text_to_value = {str(level): level for level in levels}
-                        group_key = category_group_state_key(data_key, target, current["id"], selected_feature)
-
-                        if group_key not in st.session_state:
-                            st.session_state[group_key] = [level_texts.copy()]
-                        st.session_state[group_key] = normalize_category_groups(st.session_state[group_key], level_texts)
-                        groups = st.session_state[group_key]
-
-                        st.caption("Select values, split them into a new group, or merge groups back together.")
-                        seed_col1, seed_col2, seed_col3 = st.columns(3)
-                        if seed_col1.button("All in one", key=f"group_all_{group_key}", width="stretch"):
-                            st.session_state[group_key] = [level_texts.copy()]
-                            save_and_rerun()
-                        if seed_col2.button("One per value", key=f"group_single_{group_key}", width="stretch"):
-                            st.session_state[group_key] = [[value] for value in level_texts]
-                            save_and_rerun()
-                        if seed_col3.button("Profile groups", key=f"group_profile_{group_key}", width="stretch"):
-                            st.session_state[group_key] = profile_group_texts(
+                            manual_candidate = score_numeric_manual_bins(
                                 df=df,
                                 target=target,
                                 row_idx=current["row_idx"],
                                 feature=selected_feature,
-                                max_groups=int(max_category_groups),
+                                thresholds=thresholds,
+                                min_leaf=int(min_leaf),
                             )
-                            save_and_rerun()
-
-                        st.dataframe(
-                            arrow_safe_dataframe(
-                                pd.DataFrame(
-                                    category_level_rows(df, target, current["row_idx"], selected_feature)
-                                )
-                            ),
-                            hide_index=True,
-                            width="stretch",
-                            column_config={
-                                "default_rate": st.column_config.NumberColumn(format="%.6f"),
-                                "impurity": st.column_config.NumberColumn(format="%.6f"),
-                                "target_mean": st.column_config.NumberColumn(format="%.6f"),
-                                "target_std": st.column_config.NumberColumn(format="%.6f"),
-                            },
-                        )
-
-                        st.dataframe(
-                            arrow_safe_dataframe(
-                                pd.DataFrame(
-                                    category_group_rows(
-                                        df=df,
-                                        target=target,
-                                        row_idx=current["row_idx"],
-                                        feature=selected_feature,
-                                        groups=groups,
-                                        text_to_value=text_to_value,
-                                    )
-                                )
-                            ),
-                            hide_index=True,
-                            width="stretch",
-                            column_config={
-                                "default_rate": st.column_config.NumberColumn(format="%.6f"),
-                                "impurity": st.column_config.NumberColumn(format="%.6f"),
-                                "target_mean": st.column_config.NumberColumn(format="%.6f"),
-                                "target_std": st.column_config.NumberColumn(format="%.6f"),
-                            },
-                        )
-
-                        source_group_index = st.selectbox(
-                            "Group to split",
-                            range(len(groups)),
-                            format_func=lambda i: f"G{i + 1}: {', '.join(groups[i])}",
-                            key=f"group_source_{group_key}",
-                        )
-                        values_to_split = st.multiselect(
-                            "Values to move into a new group",
-                            options=groups[int(source_group_index)],
-                            key=f"group_values_{group_key}",
-                        )
-                        if st.button("Move selected to new group", key=f"group_split_{group_key}", width="stretch"):
-                            source_index = int(source_group_index)
-                            selected_values = set(values_to_split)
-                            if selected_values and selected_values != set(groups[source_index]):
-                                st.session_state[group_key][source_index] = [
-                                    value for value in groups[source_index] if value not in selected_values
+                            if manual_candidate is None:
+                                low_branches = [
+                                    row
+                                    for row in branch_rows
+                                    if int(row["rows"]) < int(min_leaf)
                                 ]
-                                st.session_state[group_key].append(list(values_to_split))
-                                st.session_state[group_key] = normalize_category_groups(
-                                    st.session_state[group_key], level_texts
-                                )
-                                save_and_rerun()
-                            else:
-                                st.warning("Select some, but not all, values from the source group.")
+                                if low_branches:
+                                    branch_text = ", ".join(
+                                        f"{row['branch']} n={row['rows']}" for row in low_branches
+                                    )
+                                    st.warning(
+                                        "Manual split is not valid because every branch must have "
+                                        f"at least {int(min_leaf)} rows. Low-count branch(es): {branch_text}."
+                                    )
+                                else:
+                                    st.warning("Manual split is not valid for the current node.")
+                        except ValueError:
+                            st.warning("Manual thresholds must be numeric values separated by comma.")
+                else:
+                    levels = (
+                        selected_series.astype("object")
+                        .where(selected_series.notna(), "__MISSING__")
+                        .drop_duplicates()
+                        .tolist()
+                    )
+                    levels = sorted(levels, key=lambda x: str(x))
+                    level_texts = [str(level) for level in levels]
+                    text_to_value = {str(level): level for level in levels}
+                    group_key = category_group_state_key(data_key, target, current["id"], selected_feature)
 
-                        merge_options = list(range(len(groups)))
-                        groups_to_merge = st.multiselect(
-                            "Groups to merge",
-                            options=merge_options,
-                            format_func=lambda i: f"G{i + 1}: {', '.join(groups[i])}",
-                            key=f"group_merge_{group_key}",
-                        )
-                        if st.button("Merge selected groups", key=f"group_merge_button_{group_key}", width="stretch"):
-                            selected_group_ids = sorted(set(int(i) for i in groups_to_merge))
-                            if len(selected_group_ids) >= 2:
-                                merged: list[str] = []
-                                next_groups: list[list[str]] = []
-                                for i, group in enumerate(groups):
-                                    if i in selected_group_ids:
-                                        merged.extend(group)
-                                    else:
-                                        next_groups.append(group)
-                                next_groups.append(merged)
-                                st.session_state[group_key] = normalize_category_groups(next_groups, level_texts)
-                                save_and_rerun()
-                            else:
-                                st.warning("Select at least two groups to merge.")
+                    if group_key not in st.session_state:
+                        st.session_state[group_key] = [level_texts.copy()]
+                    st.session_state[group_key] = normalize_category_groups(st.session_state[group_key], level_texts)
+                    groups = st.session_state[group_key]
 
-                        actual_groups = [
-                            [text_to_value[value] for value in group if value in text_to_value]
-                            for group in st.session_state[group_key]
-                        ]
-                        manual_candidate = score_category_manual_groups(
+                    st.caption("Select values, split them into a new group, or merge groups back together.")
+                    seed_col1, seed_col2, seed_col3 = st.columns(3)
+                    if seed_col1.button("All in one", key=f"group_all_{group_key}", width="stretch"):
+                        st.session_state[group_key] = [level_texts.copy()]
+                        save_and_rerun()
+                    if seed_col2.button("One per value", key=f"group_single_{group_key}", width="stretch"):
+                        st.session_state[group_key] = [[value] for value in level_texts]
+                        save_and_rerun()
+                    if seed_col3.button("Profile groups", key=f"group_profile_{group_key}", width="stretch"):
+                        st.session_state[group_key] = profile_group_texts(
                             df=df,
                             target=target,
                             row_idx=current["row_idx"],
                             feature=selected_feature,
-                            groups=actual_groups,
-                            min_leaf=int(min_leaf),
+                            max_groups=int(max_category_groups),
                         )
+                        save_and_rerun()
 
-                    if manual_candidate is None:
-                        st.caption("Enter a valid manual split to preview its impact.")
-                    else:
-                        st.dataframe(
-                            arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], manual_candidate))),
-                            hide_index=True,
-                            width="stretch",
-                        )
-                        if st.button(
-                            f"Apply manual {selected_feature} split",
-                            key=f"apply_manual_split_{current['id']}_{selected_feature}",
-                            width="stretch",
-                        ):
-                            apply_split(df, manual_candidate)
+                    st.dataframe(
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                category_level_rows(df, target, current["row_idx"], selected_feature)
+                            )
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "default_rate": st.column_config.NumberColumn(format="%.6f"),
+                            "impurity": st.column_config.NumberColumn(format="%.6f"),
+                            "target_mean": st.column_config.NumberColumn(format="%.6f"),
+                            "target_std": st.column_config.NumberColumn(format="%.6f"),
+                        },
+                    )
+
+                    st.dataframe(
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                category_group_rows(
+                                    df=df,
+                                    target=target,
+                                    row_idx=current["row_idx"],
+                                    feature=selected_feature,
+                                    groups=groups,
+                                    text_to_value=text_to_value,
+                                )
+                            )
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "default_rate": st.column_config.NumberColumn(format="%.6f"),
+                            "impurity": st.column_config.NumberColumn(format="%.6f"),
+                            "target_mean": st.column_config.NumberColumn(format="%.6f"),
+                            "target_std": st.column_config.NumberColumn(format="%.6f"),
+                        },
+                    )
+
+                    source_group_index = st.selectbox(
+                        "Group to split",
+                        range(len(groups)),
+                        format_func=lambda i: f"G{i + 1}: {', '.join(groups[i])}",
+                        key=f"group_source_{group_key}",
+                    )
+                    values_to_split = st.multiselect(
+                        "Values to move into a new group",
+                        options=groups[int(source_group_index)],
+                        key=f"group_values_{group_key}",
+                    )
+                    if st.button("Move selected to new group", key=f"group_split_{group_key}", width="stretch"):
+                        source_index = int(source_group_index)
+                        selected_values = set(values_to_split)
+                        if selected_values and selected_values != set(groups[source_index]):
+                            st.session_state[group_key][source_index] = [
+                                value for value in groups[source_index] if value not in selected_values
+                            ]
+                            st.session_state[group_key].append(list(values_to_split))
+                            st.session_state[group_key] = normalize_category_groups(
+                                st.session_state[group_key], level_texts
+                            )
                             save_and_rerun()
+                        else:
+                            st.warning("Select some, but not all, values from the source group.")
+
+                    merge_options = list(range(len(groups)))
+                    groups_to_merge = st.multiselect(
+                        "Groups to merge",
+                        options=merge_options,
+                        format_func=lambda i: f"G{i + 1}: {', '.join(groups[i])}",
+                        key=f"group_merge_{group_key}",
+                    )
+                    if st.button("Merge selected groups", key=f"group_merge_button_{group_key}", width="stretch"):
+                        selected_group_ids = sorted(set(int(i) for i in groups_to_merge))
+                        if len(selected_group_ids) >= 2:
+                            merged: list[str] = []
+                            next_groups: list[list[str]] = []
+                            for i, group in enumerate(groups):
+                                if i in selected_group_ids:
+                                    merged.extend(group)
+                                else:
+                                    next_groups.append(group)
+                            next_groups.append(merged)
+                            st.session_state[group_key] = normalize_category_groups(next_groups, level_texts)
+                            save_and_rerun()
+                        else:
+                            st.warning("Select at least two groups to merge.")
+
+                    actual_groups = [
+                        [text_to_value[value] for value in group if value in text_to_value]
+                        for group in st.session_state[group_key]
+                    ]
+                    manual_candidate = score_category_manual_groups(
+                        df=df,
+                        target=target,
+                        row_idx=current["row_idx"],
+                        feature=selected_feature,
+                        groups=actual_groups,
+                        min_leaf=int(min_leaf),
+                    )
+
+                if manual_candidate is None:
+                    st.caption("Enter a valid manual split to preview its impact.")
+                else:
+                    st.dataframe(
+                        arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], manual_candidate))),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    if st.button(
+                        f"Apply manual {selected_feature} split",
+                        key=f"apply_manual_split_{current['id']}_{selected_feature}",
+                        width="stretch",
+                    ):
+                        apply_split(df, manual_candidate)
+                        clear_candidate_cache(data_key, target)
+                        save_and_rerun()
         else:
             st.info("Use 'Revise this split' to clear this node's children. Then choose a new variable or manual split for the same node.")
 
