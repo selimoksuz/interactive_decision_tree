@@ -11,6 +11,8 @@ from interactive_decision_tree_app import (
     checkpoint_ui_state,
     evaluation_model_metrics,
     init_tree,
+    leaf_performance_rows,
+    model_metrics,
     model_performance_wide_table,
     restore_checkpoint_dataframe,
     restore_checkpoint_ui_state,
@@ -199,6 +201,106 @@ def test_evaluation_model_metrics_scores_test_dataframe():
 
     accuracy = metrics.loc[metrics["metric"] == "accuracy", "value"].iloc[0]
     assert float(accuracy) == 1.0
+
+
+def test_model_metrics_includes_train_rows_and_scored_rows():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    init_tree(train)
+
+    metrics = model_metrics(train, "risk_flag")
+
+    values = metrics.set_index("metric")["value"].to_dict()
+    assert values["rows"] == 4
+    assert values["scored_rows"] == 4
+
+
+def test_model_performance_train_and_test_are_scored_independently():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x": [1.5, 3.5],
+            "risk_flag": ["high", "high"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+    assert candidate is not None
+    split_node(train, 0, candidate, select_first_child=False)
+
+    train_metrics = model_metrics(train, "risk_flag")
+    train_metrics.insert(0, "dataset", "Train")
+    test_metrics = evaluation_model_metrics(train, test, "risk_flag", "Test")
+    wide = model_performance_wide_table(pd.concat([train_metrics, test_metrics], ignore_index=True))
+
+    values = wide.set_index("metric")
+    assert values.loc["rows", "Train"] == 4
+    assert values.loc["rows", "Test"] == 2
+    assert float(values.loc["accuracy", "Train"]) == 1.0
+    assert float(values.loc["accuracy", "Test"]) == 0.5
+
+
+def test_leaf_performance_rows_measure_test_when_eval_dataframe_is_present():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x": [1.5, 3.5],
+            "risk_flag": ["high", "high"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+    assert candidate is not None
+    split_node(train, 0, candidate, select_first_child=False)
+
+    rows = leaf_performance_rows(
+        train,
+        "risk_flag",
+        "data",
+        eval_df=test,
+        dataset_name="Test",
+    )
+
+    by_leaf = {row["leaf"]: row for row in rows}
+    assert by_leaf[1]["dataset"] == "Test"
+    assert by_leaf[1]["n"] == 1
+    assert by_leaf[1]["predict"] == "low"
+    assert by_leaf[1]["default_rate"] == 1.0
+    assert by_leaf[2]["n"] == 1
+    assert by_leaf[2]["predict"] == "high"
 
 
 def test_restore_checkpoint_dataframe_uses_session_snapshot_without_embedded_frame(tmp_path, monkeypatch):

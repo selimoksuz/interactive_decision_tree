@@ -231,16 +231,23 @@ def impurity_label(y: pd.Series, target_kind: str | None = None) -> str:
 
 
 def node_summary(df: pd.DataFrame, target: str, row_idx: list[int]) -> dict[str, Any]:
-    y = df.loc[row_idx, target]
     target_kind = infer_target_kind(df[target])
-    counts = y.value_counts(dropna=False)
     positive_class = choose_positive_class(df[target]) if target_kind == "binary" else None
+    return target_series_summary(df.loc[row_idx, target], target_kind, positive_class)
+
+
+def target_series_summary(
+    y: pd.Series,
+    target_kind: str,
+    positive_class: Any = None,
+) -> dict[str, Any]:
+    counts = y.value_counts(dropna=False)
     numeric = pd.to_numeric(y, errors="coerce") if target_kind == "regression" else None
     prediction = float(numeric.mean()) if target_kind == "regression" and numeric is not None else (
         counts.index[0] if not counts.empty else None
     )
     out = {
-        "n": len(row_idx),
+        "n": len(y),
         "entropy": entropy(y),
         "impurity": target_impurity(y, target_kind),
         "impurity_label": impurity_label(y, target_kind),
@@ -3372,57 +3379,40 @@ def model_performance_wide_table(metrics: pd.DataFrame) -> pd.DataFrame:
 
 
 def model_metrics(df: pd.DataFrame, target: str) -> pd.DataFrame:
-    target_kind = infer_target_kind(df[target])
-    preds = tree_predictions(df, target)
-    y = df[target]
-    rows: list[dict[str, Any]] = []
-
-    if target_kind == "binary":
-        positive_class = choose_positive_class(y)
-        y_binary = (y == positive_class).astype(int)
-        auc = binary_auc(y_binary, preds["positive_rate"])
-        accuracy = float((preds["prediction"] == y).mean())
-        rows.append({"metric": "target_type", "value": "binary"})
-        rows.append({"metric": "positive_class", "value": positive_class})
-        rows.append({"metric": "default_rate", "value": float(y_binary.mean())})
-        rows.append({"metric": "auc", "value": auc})
-        rows.append({"metric": "gini", "value": None if auc is None else 2 * auc - 1})
-        rows.append({"metric": "accuracy", "value": accuracy})
-    elif target_kind == "regression":
-        y_num = pd.to_numeric(y, errors="coerce")
-        pred_num = pd.to_numeric(preds["prediction"], errors="coerce")
-        mask = y_num.notna() & pred_num.notna()
-        residual = y_num[mask] - pred_num[mask]
-        baseline = y_num[mask] - y_num[mask].mean()
-        sse = float((residual**2).sum())
-        sst = float((baseline**2).sum())
-        rows.append({"metric": "target_type", "value": "regression"})
-        rows.append({"metric": "rmse", "value": float(np.sqrt((residual**2).mean())) if len(residual) else None})
-        rows.append({"metric": "mae", "value": float(residual.abs().mean()) if len(residual) else None})
-        rows.append({"metric": "r2", "value": None if sst == 0 else 1 - sse / sst})
-    else:
-        rows.append({"metric": "target_type", "value": "classification"})
-        rows.append({"metric": "accuracy", "value": float((preds["prediction"] == y).mean())})
-
-    total_gain, root_impurity, leaf_impurity = tree_total_gain(df, target)
-    rows.append({"metric": "tree_total_gain", "value": total_gain})
-    rows.append({"metric": "root_impurity", "value": root_impurity})
-    rows.append({"metric": "weighted_leaf_impurity", "value": leaf_impurity})
-    rows.append({"metric": "leaf_count", "value": len(current_leaves())})
-    return pd.DataFrame(rows)
+    metrics = evaluation_model_metrics(df, df, target, "Train")
+    return metrics.drop(columns=["dataset"])
 
 
-def leaf_performance_rows(df: pd.DataFrame, target: str, data_key: str) -> list[dict[str, Any]]:
-    target_kind = infer_target_kind(df[target])
+def leaf_performance_rows(
+    train_df: pd.DataFrame,
+    target: str,
+    data_key: str,
+    eval_df: pd.DataFrame | None = None,
+    dataset_name: str = "Train",
+) -> list[dict[str, Any]]:
+    target_kind = infer_target_kind(train_df[target])
+    positive_class = choose_positive_class(train_df[target]) if target_kind == "binary" else None
+    measurement_df = eval_df if eval_df is not None else train_df
+    eval_predictions = None if eval_df is None else tree_predictions_for_dataframe(train_df, measurement_df, target)
     rows: list[dict[str, Any]] = []
     for leaf in current_leaves():
-        summary = node_summary(df, target, leaf["row_idx"])
+        if eval_predictions is None:
+            measurement_idx = leaf["row_idx"]
+        else:
+            measurement_idx = eval_predictions.index[eval_predictions["leaf_id"] == leaf["id"]].tolist()
+        summary = target_series_summary(
+            measurement_df.loc[measurement_idx, target],
+            target_kind,
+            positive_class,
+        )
+        train_summary = node_summary(train_df, target, leaf["row_idx"])
         selected_feature = st.session_state.get(node_feature_key(data_key, target, leaf["id"]), "")
         row = {
+            "dataset": dataset_name,
             "leaf": leaf["id"],
             "selected_variable": selected_feature,
             "n": summary["n"],
-            "predict": summary["prediction"],
+            "predict": train_summary["prediction"],
             "impurity": summary["impurity"],
             "path": leaf["path"],
         }
@@ -3881,8 +3871,19 @@ def main() -> None:
         selected_graph_node_id = render_interactive_tree_graph(df, target, data_key)
         if selected_graph_node_id is not None and selected_graph_node_id != st.session_state.current_node_id:
             st.session_state.current_node_id = selected_graph_node_id
-        leaf_rows = leaf_performance_rows(df, target, data_key)
+        leaf_eval_df = test_df if test_df is not None else None
+        leaf_dataset_name = "Test" if test_df is not None else "Train"
+        leaf_rows = leaf_performance_rows(
+            df,
+            target,
+            data_key,
+            eval_df=leaf_eval_df,
+            dataset_name=leaf_dataset_name,
+        )
         if leaf_rows:
+            st.caption(
+                f"Leaf performance is measured on {leaf_dataset_name}. Splits and predictions are fitted on Train."
+            )
             st.dataframe(
                 arrow_safe_dataframe(pd.DataFrame(leaf_rows)),
                 hide_index=True,
