@@ -60,6 +60,17 @@ class SplitCandidate:
     label: str
 
 
+@dataclass(frozen=True)
+class LoadedDataSource:
+    df: pd.DataFrame
+    name: str | None
+    data_key: str
+    source: str
+    data_id: str | None
+    metadata: dict[str, Any]
+    restored_upload: bool = False
+
+
 def make_demo_data(n: int = 500) -> pd.DataFrame:
     rng = np.random.default_rng(7)
     age = rng.integers(21, 72, size=n)
@@ -1051,6 +1062,39 @@ def analysis_row_idx(
     return sampled.tolist()
 
 
+def train_test_split_indices(
+    df: pd.DataFrame,
+    target: str,
+    test_fraction: float,
+    random_state: int = CANDIDATE_RANDOM_STATE,
+    stratify: bool = True,
+) -> tuple[list[int], list[int]]:
+    if len(df) < 2:
+        return df.index.tolist(), []
+    bounded_fraction = min(max(float(test_fraction), 0.01), 0.9)
+    test_rows = int(round(len(df) * bounded_fraction))
+    test_rows = max(1, min(len(df) - 1, test_rows))
+    if stratify and target in df.columns and infer_target_kind(df[target]) != "regression":
+        test_idx = analysis_row_idx(
+            df.index.tolist(),
+            max_rows=test_rows,
+            random_state=random_state,
+            df=df,
+            target=target,
+        )
+    else:
+        index = pd.Index(df.index)
+        test_idx = index.to_series(index=index).sample(n=test_rows, random_state=random_state).sort_index().tolist()
+    test_set = set(test_idx)
+    train_idx = [idx for idx in df.index.tolist() if idx not in test_set]
+    return train_idx, test_idx
+
+
+def validate_test_dataframe(test_df: pd.DataFrame, target: str, features: list[str]) -> list[str]:
+    required_columns = [target] + features
+    return [column for column in required_columns if column not in test_df.columns]
+
+
 def candidate_cache_key(
     data_key: str,
     target: str,
@@ -1588,29 +1632,198 @@ def save_source_session(
     return data_id
 
 
-def render_sql_source_loader(container: Any = st.sidebar) -> None:
+def persist_source_session(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    name: str,
+    target: str | None = None,
+    features: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    update_query_params: bool = False,
+) -> str:
+    if update_query_params:
+        return save_source_session(
+            df,
+            source=source,
+            name=name,
+            target=target,
+            features=features,
+            metadata=metadata,
+        )
+    data_id, _ = save_dataframe_session(
+        df,
+        source=source,
+        name=name,
+        target=target,
+        features=features,
+        metadata=metadata,
+    )
+    return data_id
+
+
+def loaded_source_from_session(data_id: str, fallback_name: str | None = None) -> LoadedDataSource:
+    df, metadata = load_dataframe_session(data_id)
+    name = str(metadata.get("name") or fallback_name or "Session DataFrame")
+    source = str(metadata.get("source") or "session")
+    return LoadedDataSource(
+        df=df,
+        name=name,
+        data_key=session_data_key(data_id, df, metadata),
+        source=source,
+        data_id=data_id,
+        metadata=metadata,
+    )
+
+
+def render_session_source_loader(
+    container: Any,
+    *,
+    role: str,
+    query_session: tuple[pd.DataFrame, dict[str, Any], str, str] | None = None,
+) -> LoadedDataSource | None:
+    session_key = f"{role}_session_data_id"
+    if role == "train" and query_session is not None:
+        query_data_id = query_session[2]
+        widget_marker_key = f"{role}_session_widget_query_data_id"
+        if st.session_state.get(widget_marker_key) != query_data_id:
+            st.session_state[session_key] = query_data_id
+            st.session_state[widget_marker_key] = query_data_id
+
+    data_id_text = container.text_input(
+        "Session data_id",
+        key=session_key,
+        help="Notebook launch_tree(...) URL'indeki data_id degerini kullanir; raw dosya path kabul edilmez.",
+    )
+    data_id = normalize_data_id(data_id_text)
+    if data_id is None:
+        container.info("Session DataFrame icin notebook URL'indeki data_id degerini girin.")
+        return None
+    if query_session is not None and data_id == query_session[2]:
+        df, metadata, source_data_id, data_key = query_session
+        return LoadedDataSource(
+            df=df,
+            name=str(metadata.get("name") or "Session DataFrame"),
+            data_key=data_key,
+            source=str(metadata.get("source") or "session"),
+            data_id=source_data_id,
+            metadata=metadata,
+        )
+    try:
+        return loaded_source_from_session(data_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        container.error(f"Session data could not be loaded: {exc}")
+        return None
+
+
+def render_upload_source_loader(
+    container: Any,
+    *,
+    role: str,
+    checkpoint: dict[str, Any] | None = None,
+    allow_checkpoint_restore: bool = False,
+    update_query_params: bool = False,
+) -> LoadedDataSource | None:
+    uploaded = container.file_uploader(
+        "CSV veya Excel yukle",
+        type=["csv", "xlsx", "xls"],
+        key=f"{role}_csv_excel_upload",
+    )
+    if uploaded is None:
+        if allow_checkpoint_restore:
+            restored_dataframe = restore_checkpoint_dataframe(checkpoint)
+            if restored_dataframe is not None:
+                df, uploaded_name, data_key = restored_dataframe
+                return LoadedDataSource(
+                    df=df,
+                    name=uploaded_name,
+                    data_key=data_key,
+                    source="uploaded",
+                    data_id=None,
+                    metadata={"source": "uploaded", "name": uploaded_name},
+                    restored_upload=True,
+                )
+        container.info("CSV veya Excel dosyasi yukleyin.")
+        return None
+
+    try:
+        df = read_uploaded_table(uploaded)
+    except Exception as exc:
+        container.error(f"File load failed: {exc}")
+        return None
+
+    upload_key = uploaded_data_key(uploaded.name, df)
+    metadata = {
+        "source": "uploaded",
+        "name": uploaded.name,
+        "upload_name": uploaded.name,
+        "fingerprint": dataframe_fingerprint(df),
+    }
+    cache_key = f"_{role}_uploaded_session"
+    cached_upload = st.session_state.get(cache_key, {})
+    if cached_upload.get("upload_key") == upload_key:
+        data_id = cached_upload.get("data_id")
+    else:
+        data_id = persist_source_session(
+            df,
+            source="uploaded",
+            name=uploaded.name,
+            metadata={"upload_name": uploaded.name},
+            update_query_params=update_query_params,
+        )
+        st.session_state[cache_key] = {"upload_key": upload_key, "data_id": data_id}
+
+    return LoadedDataSource(
+        df=df,
+        name=uploaded.name,
+        data_key=session_data_key(str(data_id), df, metadata),
+        source="uploaded",
+        data_id=str(data_id),
+        metadata=metadata,
+    )
+
+
+def render_sql_source_loader(
+    container: Any = st.sidebar,
+    *,
+    role: str = "train",
+    update_query_params: bool = True,
+) -> LoadedDataSource | None:
+    loaded_key = f"{role}_sql_loaded_source"
+    loaded_payload = st.session_state.get(loaded_key)
+    if isinstance(loaded_payload, dict):
+        loaded_data_id = normalize_data_id(loaded_payload.get("data_id"))
+        if loaded_data_id is not None:
+            try:
+                return loaded_source_from_session(
+                    loaded_data_id,
+                    fallback_name=str(loaded_payload.get("name") or "SQL data"),
+                )
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                st.session_state.pop(loaded_key, None)
+
     connections = secret_sql_connections()
     connection_mode_options = ["Manual SQLAlchemy URL"]
     if connections:
         connection_mode_options.insert(0, "Saved secret connection")
 
-    with container.form("sql_source_form"):
-        connection_mode = st.selectbox("SQL connection", connection_mode_options)
+    with container.form(f"{role}_sql_source_form"):
+        connection_mode = st.selectbox("SQL connection", connection_mode_options, key=f"{role}_sql_connection_mode")
         if connection_mode == "Saved secret connection":
-            selected_connection = st.selectbox("Saved connection", sorted(connections))
+            selected_connection = st.selectbox("Saved connection", sorted(connections), key=f"{role}_sql_saved_connection")
             connection_url = connections[selected_connection]
         else:
-            connection_url = st.text_input("SQLAlchemy connection URL", type="password")
+            connection_url = st.text_input("SQLAlchemy connection URL", type="password", key=f"{role}_sql_connection_url")
 
-        sql_mode = st.radio("SQL mode", ["Table", "Query"], horizontal=True)
+        sql_mode = st.radio("SQL mode", ["Table", "Query"], horizontal=True, key=f"{role}_sql_mode")
         table_name = ""
         query_text = ""
         if sql_mode == "Table":
-            table_name = st.text_input("Table name")
+            table_name = st.text_input("Table name", key=f"{role}_sql_table")
         else:
-            query_text = st.text_area("SQL query", height=120)
+            query_text = st.text_area("SQL query", height=120, key=f"{role}_sql_query")
 
-        full_table = st.checkbox("Load full result", value=False)
+        full_table = st.checkbox("Load full result", value=False, key=f"{role}_sql_full_table")
         limit_value = st.number_input(
             "Row limit",
             value=DEFAULT_SQL_LIMIT,
@@ -1618,17 +1831,25 @@ def render_sql_source_loader(container: Any = st.sidebar) -> None:
             step=1000,
             disabled=full_table,
             format="%d",
+            key=f"{role}_sql_limit",
         )
-        sample_n_value = st.number_input("Optional sample rows", value=0, min_value=0, step=100, format="%d")
-        submitted = st.form_submit_button("Load SQL data", width="stretch")
+        sample_n_value = st.number_input(
+            "Optional sample rows",
+            value=0,
+            min_value=0,
+            step=100,
+            format="%d",
+            key=f"{role}_sql_sample_n",
+        )
+        submitted = st.form_submit_button(f"Load {role} SQL data", width="stretch")
 
     if not submitted:
         container.info("Choose a SQL source in the sidebar and load data.")
-        st.stop()
+        return None
 
     if not connection_url:
         container.error("SQL connection URL is required.")
-        st.stop()
+        return None
 
     try:
         df = read_sql_dataframe(
@@ -1639,24 +1860,72 @@ def render_sql_source_loader(container: Any = st.sidebar) -> None:
             sample_n=int(sample_n_value) or None,
             full_table=bool(full_table),
         )
-        save_source_session(
+        metadata = {
+            "sql": {
+                "mode": sql_mode.lower(),
+                "table": table_name.strip() or None,
+                "limit": None if full_table else int(limit_value),
+                "sample_n": int(sample_n_value) or None,
+                "full_table": bool(full_table),
+            }
+        }
+        source_name = table_name.strip() or "SQL query"
+        data_id = persist_source_session(
             df,
             source="sql",
-            name=table_name.strip() or "SQL query",
-            metadata={
-                "sql": {
-                    "mode": sql_mode.lower(),
-                    "table": table_name.strip() or None,
-                    "limit": None if full_table else int(limit_value),
-                    "sample_n": int(sample_n_value) or None,
-                    "full_table": bool(full_table),
-                }
-            },
+            name=source_name,
+            metadata=metadata,
+            update_query_params=update_query_params,
         )
-        st.rerun()
+        st.session_state[loaded_key] = {"data_id": data_id, "name": source_name}
+        if update_query_params:
+            st.rerun()
+        return LoadedDataSource(
+            df=df,
+            name=source_name,
+            data_key=session_data_key(str(data_id), df, {"source": "sql", "name": source_name, **metadata}),
+            source="sql",
+            data_id=str(data_id),
+            metadata={"source": "sql", "name": source_name, **metadata},
+        )
     except Exception as exc:
         container.error(f"SQL load failed: {exc}")
-        st.stop()
+        return None
+
+
+def render_dataframe_source_loader(
+    container: Any,
+    *,
+    role: str,
+    source_choice: str,
+    query_session: tuple[pd.DataFrame, dict[str, Any], str, str] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    allow_checkpoint_restore: bool = False,
+    update_query_params: bool = False,
+) -> LoadedDataSource | None:
+    if source_choice == "Session DataFrame":
+        return render_session_source_loader(container, role=role, query_session=query_session)
+    if source_choice == "CSV / Excel Upload":
+        return render_upload_source_loader(
+            container,
+            role=role,
+            checkpoint=checkpoint,
+            allow_checkpoint_restore=allow_checkpoint_restore,
+            update_query_params=update_query_params,
+        )
+    if source_choice == "SQL":
+        return render_sql_source_loader(container, role=role, update_query_params=update_query_params)
+
+    df = make_demo_data()
+    metadata = {"source": "demo", "name": "Demo"}
+    return LoadedDataSource(
+        df=df,
+        name="Demo",
+        data_key="demo",
+        source="demo",
+        data_id=None,
+        metadata=metadata,
+    )
 
 
 def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.DataFrame, str, str] | None:
@@ -1785,9 +2054,19 @@ def checkpoint_ui_state() -> dict[str, Any]:
         "group_values_",
         "group_merge_",
     )
+    exact_keys = {
+        "data_source_choice",
+        "validation_source_mode",
+        "validation_test_share",
+        "validation_split_seed",
+        "validation_stratify_target",
+        "test_data_source_choice",
+        "train_session_data_id",
+        "test_session_data_id",
+    }
     out: dict[str, Any] = {}
     for key in list(st.session_state.keys()):
-        if isinstance(key, str) and key.startswith(prefixes):
+        if isinstance(key, str) and (key.startswith(prefixes) or key in exact_keys):
             out[key] = json_safe(st.session_state[key])
     return out
 
@@ -2513,6 +2792,10 @@ def graph_node_label(df: pd.DataFrame, target: str, node: dict[str, Any], data_k
 
 
 def graph_node_tooltip(df: pd.DataFrame, target: str, node: dict[str, Any], data_key: str) -> str:
+    return tooltip_text(graph_node_full_text(df, target, node, data_key))
+
+
+def graph_node_full_text(df: pd.DataFrame, target: str, node: dict[str, Any], data_key: str) -> str:
     summary = node_summary(df, target, node["row_idx"])
     lines = [
         graph_node_label(df, target, node, data_key),
@@ -2537,29 +2820,30 @@ def graph_node_tooltip(df: pd.DataFrame, target: str, node: dict[str, Any], data
     if summary["target_kind"] == "binary":
         lines.append(f"Positive class: {summary.get('positive_class')}")
         lines.append(f"Event count: {summary.get('event_count', 0)}")
-    return tooltip_text("\n".join(lines))
+    return "\n".join(lines)
 
 
-def graph_label_detail_rows(edge_label_width: int) -> list[dict[str, Any]]:
+def edge_detail_rows(edge_label_width: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for parent_id, parent in sorted(st.session_state.tree.items()):
         for child in get_node_children(parent):
             full_label = str(child["label"])
-            visible_label = truncate_text(full_label, edge_label_width)
-            if visible_label == full_label:
-                continue
             child_node = st.session_state.tree.get(child["id"])
             child_path = child_node.get("path", "") if isinstance(child_node, dict) else ""
             rows.append(
                 {
                     "kind": "Branch",
                     "item": f"Node {parent_id} -> Node {child['id']}",
-                    "visible": visible_label,
+                    "visible": truncate_text(full_label, edge_label_width),
                     "full": full_label,
                     "context": child_path,
                 }
             )
     return rows
+
+
+def graph_label_detail_rows(edge_label_width: int) -> list[dict[str, Any]]:
+    return [row for row in edge_detail_rows(edge_label_width) if row["visible"] != row["full"]]
 
 
 def copyable_text_block(text: str) -> None:
@@ -2622,6 +2906,38 @@ def render_graph_label_details(rows: list[dict[str, Any]]) -> None:
                 f"Showing first {GRAPH_LABEL_DETAIL_LIMIT} shortened labels. "
                 "Select a node to see its full path in the detail panel."
             )
+
+
+def render_copyable_tree_detail(df: pd.DataFrame, target: str, data_key: str, edge_label_width: int) -> None:
+    current_node = st.session_state.tree.get(st.session_state.current_node_id)
+    if current_node is None:
+        return
+    with st.expander("Copy tree text", expanded=False):
+        node_options = [node["id"] for _, node in sorted(st.session_state.tree.items())]
+        selected_node_id = st.selectbox(
+            "Node text",
+            options=node_options,
+            index=node_options.index(current_node["id"]),
+            format_func=lambda node_id: f"Node {node_id}",
+            key=f"copy_tree_node::{data_key}::{target}",
+        )
+        node = st.session_state.tree[int(selected_node_id)]
+        copyable_text_block(graph_node_full_text(df, target, node, data_key))
+
+        branches = edge_detail_rows(edge_label_width)
+        if branches:
+            branch_options = list(range(len(branches)))
+            selected_branch = st.selectbox(
+                "Branch text",
+                options=branch_options,
+                format_func=lambda idx: branches[int(idx)]["item"],
+                key=f"copy_tree_branch::{data_key}::{target}",
+            )
+            branch = branches[int(selected_branch)]
+            st.caption(f"Visible on graph: {branch['visible']}")
+            copyable_text_block(str(branch["full"]))
+            if branch.get("context"):
+                st.caption(f"Path: {branch['context']}")
 
 
 def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) -> int | None:
@@ -2709,6 +3025,7 @@ def render_interactive_tree_graph(df: pd.DataFrame, target: str, data_key: str) 
     config.width = "100%"
     selected_node = agraph(graph_nodes, graph_edges, config)
     render_graph_label_details(graph_label_detail_rows(edge_label_width))
+    render_copyable_tree_detail(df, target, data_key, edge_label_width)
     if selected_node is None:
         return None
     try:
@@ -2817,9 +3134,67 @@ def candidate_impact_rows(
         {"metric": f"tree_total_{score_name}_before", "value": current_total_gain},
         {"metric": f"tree_total_{score_name}_after", "value": current_total_gain + total_delta},
         {"metric": "split_branches", "value": candidate.branch_count},
-        {"metric": "branch_rows", "value": " / ".join(str(n) for n in candidate.branch_ns)},
-        {"metric": "branch_impurity", "value": " / ".join(f"{x:.6f}" for x in candidate.branch_entropies)},
     ]
+
+
+def format_class_counts(counts: dict[Any, int]) -> str:
+    return ", ".join(f"{value}: {count}" for value, count in counts.items())
+
+
+def candidate_branch_detail_rows(
+    df: pd.DataFrame,
+    target: str,
+    row_idx: list[int],
+    candidate: SplitCandidate,
+) -> list[dict[str, Any]]:
+    target_kind = infer_target_kind(df[target])
+    score_name = split_score_name(df[target])
+    total_rows = len(row_idx)
+    total_delta = candidate_total_gain_delta(df, candidate, row_idx)
+    branch_indices = split_branch_indices(df, row_idx, candidate)
+    rows: list[dict[str, Any]] = []
+
+    for branch_no, (condition, child_idx) in enumerate(branch_indices, start=1):
+        summary = node_summary(df, target, child_idx)
+        row_share = len(child_idx) / total_rows if total_rows else 0.0
+        row: dict[str, Any] = {
+            "split_type": candidate.split_type,
+            "split": candidate.label,
+            "branch": branch_no,
+            "condition": condition,
+            "rows": len(child_idx),
+            "row_share": row_share,
+            "prediction": summary["prediction"],
+            score_name: candidate.information_gain,
+            "weighted_tree_delta": total_delta,
+            "branch_impurity": summary["impurity"],
+            "branch_weighted_impurity": row_share * summary["impurity"],
+        }
+        if target_kind == "binary":
+            row["positive_class"] = summary["positive_class"]
+            row["positive_class_rate"] = summary.get("default_rate", np.nan)
+            row["positive_class_count"] = summary.get("event_count", 0)
+        elif target_kind == "regression":
+            row["target_mean"] = summary.get("target_mean", np.nan)
+            row["target_std"] = summary.get("target_std", np.nan)
+        else:
+            row["class_distribution"] = format_class_counts(summary["class_counts"])
+        rows.append(row)
+
+    return rows
+
+
+def branch_detail_column_config(score_name: str) -> dict[str, Any]:
+    return {
+        "row_share": st.column_config.NumberColumn(format="%.2f"),
+        score_name: st.column_config.NumberColumn(format="%.6f"),
+        "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
+        "branch_impurity": st.column_config.NumberColumn(format="%.6f"),
+        "branch_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
+        "positive_class_rate": st.column_config.NumberColumn(format="%.6f"),
+        "target_mean": st.column_config.NumberColumn(format="%.6f"),
+        "target_std": st.column_config.NumberColumn(format="%.6f"),
+    }
 
 
 def parse_threshold_text(text: str) -> list[float]:
@@ -3149,75 +3524,41 @@ def main() -> None:
     elif remembered_source not in source_options:
         st.session_state.pop("data_source_choice", None)
         remembered_source = default_source
-    train_panel = st.sidebar.expander("Train data", expanded=True)
+    train_panel = st.sidebar.expander("Data source", expanded=True)
     source_choice = train_panel.radio(
-        "Data source",
+        "Train data source",
         source_options,
         index=source_options.index(str(remembered_source)),
         key="data_source_choice",
     )
 
-    uploaded_name: str | None = None
-    source_metadata: dict[str, Any] = {}
-    source_data_id: str | None = None
-    data_source = "demo"
-    restored_upload = False
-    if source_choice == "Session DataFrame":
-        if query_session is None:
-            st.info("No valid session DataFrame was found. Choose another data source in the sidebar.")
-            st.stop()
-        df, source_metadata, source_data_id, data_key = query_session
-        uploaded_name = str(source_metadata.get("name") or "Session DataFrame")
-        data_source = str(source_metadata.get("source") or "session")
-    elif source_choice == "CSV / Excel Upload":
-        uploaded = train_panel.file_uploader("CSV veya Excel yukle", type=["csv", "xlsx", "xls"])
-        if uploaded is None:
-            restored_dataframe = restore_checkpoint_dataframe(checkpoint)
-            if restored_dataframe is not None:
-                df, uploaded_name, data_key = restored_dataframe
-                data_source = "uploaded"
-                restored_upload = True
-            else:
-                st.info("Upload a CSV or Excel file from the sidebar.")
-                st.stop()
-        else:
-            try:
-                df = read_uploaded_table(uploaded)
-            except Exception as exc:
-                st.sidebar.error(f"File load failed: {exc}")
-                st.stop()
-            uploaded_name = uploaded.name
-            data_source = "uploaded"
-            upload_key = uploaded_data_key(uploaded.name, df)
-            source_metadata = {
-                "source": "uploaded",
-                "name": uploaded.name,
-                "upload_name": uploaded.name,
-                "fingerprint": dataframe_fingerprint(df),
-            }
-            cache_key = "_uploaded_session"
-            cached_upload = st.session_state.get(cache_key, {})
-            if cached_upload.get("upload_key") == upload_key:
-                source_data_id = cached_upload.get("data_id")
-            else:
-                source_data_id = save_source_session(
-                    df,
-                    source="uploaded",
-                    name=uploaded.name,
-                    metadata={"upload_name": uploaded.name},
-                )
-                st.session_state[cache_key] = {"upload_key": upload_key, "data_id": source_data_id}
-            data_key = session_data_key(str(source_data_id), df, source_metadata)
-        if source_data_id and normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM)) != source_data_id:
-            st.query_params[DATA_ID_QUERY_PARAM] = source_data_id
-            st.rerun()
-    elif source_choice == "SQL":
-        render_sql_source_loader(train_panel)
-    else:
-        df = make_demo_data()
-        data_key = "demo"
+    train_source = render_dataframe_source_loader(
+        train_panel,
+        role="train",
+        source_choice=source_choice,
+        query_session=query_session,
+        checkpoint=checkpoint,
+        allow_checkpoint_restore=True,
+        update_query_params=True,
+    )
+    if train_source is None:
+        st.info("Train datasini yuklemek icin Data source panelinden bir kaynak secin.")
+        st.stop()
 
-    train_panel.caption(f"Rows: {len(df):,} | Columns: {len(df.columns):,}")
+    df = train_source.df
+    uploaded_name = train_source.name
+    source_metadata = dict(train_source.metadata)
+    source_data_id = train_source.data_id
+    data_key = train_source.data_key
+    data_source = train_source.source
+    restored_upload = train_source.restored_upload
+    if source_data_id and normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM)) != source_data_id:
+        st.query_params[DATA_ID_QUERY_PARAM] = source_data_id
+        st.rerun()
+
+    source_df = df
+    source_data_key = data_key
+    train_panel.caption(f"Train source rows: {len(source_df):,} | Columns: {len(source_df.columns):,}")
     if restored_upload and uploaded_name is not None:
         train_panel.caption(f"Restored uploaded data: {uploaded_name}")
     if source_data_id:
@@ -3228,9 +3569,10 @@ def main() -> None:
 
     checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
     checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
-    saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) and checkpoint_data_key == data_key else None
+    checkpoint_source_match = checkpoint_data_key == data_key or str(checkpoint_data_key).startswith(f"{data_key}:")
+    saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) and checkpoint_source_match else None
     source_target = source_metadata_value(source_metadata, "target")
-    target_options = df.columns.tolist()
+    target_options = source_df.columns.tolist()
     default_target_index = target_options.index("risk_flag") if "risk_flag" in target_options else len(target_options) - 1
     if saved_target in target_options:
         default_target_index = target_options.index(saved_target)
@@ -3241,18 +3583,18 @@ def main() -> None:
         options=target_options,
         index=default_target_index,
     )
-    target_kind = infer_target_kind(df[target])
+    target_kind = infer_target_kind(source_df[target])
     if target_kind == "binary":
-        positive_class_options = list(df[target].dropna().unique())
+        positive_class_options = list(source_df[target].dropna().unique())
         positive_class_key = f"positive_class::{data_key}::{target}"
         checkpoint_positive_class = (
             checkpoint.get("positive_class")
-            if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
+            if isinstance(checkpoint, dict) and checkpoint_source_match
             else None
         )
         remembered_positive_class = st.session_state.get(positive_class_key, checkpoint_positive_class)
         default_positive_class = choose_positive_class(
-            df[target],
+            source_df[target],
             preferred=remembered_positive_class,
             use_session_default=False,
         )
@@ -3267,10 +3609,10 @@ def main() -> None:
     else:
         st.session_state[POSITIVE_CLASS_SESSION_KEY] = None
 
-    default_features = [c for c in df.columns if c != target]
+    default_features = [c for c in source_df.columns if c != target]
     checkpoint_features = (
         checkpoint.get("selected_features")
-        if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
+        if isinstance(checkpoint, dict) and checkpoint_source_match
         else None
     )
     source_features = source_metadata_value(source_metadata, "features")
@@ -3287,26 +3629,101 @@ def main() -> None:
     )
     features = selected_features
     test_df: pd.DataFrame | None = None
-    with st.sidebar.expander("Test data", expanded=False):
-        test_upload = st.file_uploader(
-            "Optional test CSV/Excel",
-            type=["csv", "xlsx", "xls"],
-            key="test_data_upload",
-            help="Upload a holdout/test set with the same target and split variable columns.",
+    validation_mode = train_panel.radio(
+        "Test / validation source",
+        ["No test data", "Split train data", "Separate data source"],
+        key="validation_source_mode",
+        help="Train datasini kullan, ayni tabloyu train/test bol veya ayri bir test kaynagi yukle.",
+    )
+    if validation_mode == "Split train data":
+        split_col1, split_col2 = train_panel.columns(2)
+        test_fraction = split_col1.slider(
+            "Test share",
+            min_value=0.05,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            key="validation_test_share",
         )
-        if test_upload is not None:
-            try:
-                loaded_test_df = read_uploaded_table(test_upload)
-            except Exception as exc:
-                st.error(f"Test file load failed: {exc}")
-                st.stop()
-            required_test_columns = [target] + features
-            missing_test_columns = [column for column in required_test_columns if column not in loaded_test_df.columns]
+        split_seed = split_col2.number_input(
+            "Split seed",
+            value=CANDIDATE_RANDOM_STATE,
+            step=1,
+            key="validation_split_seed",
+        )
+        stratify_split = train_panel.checkbox(
+            "Stratify by target",
+            value=target_kind != "regression",
+            disabled=target_kind == "regression",
+            key="validation_stratify_target",
+        )
+        train_idx, test_idx = train_test_split_indices(
+            source_df,
+            target,
+            test_fraction=float(test_fraction),
+            random_state=int(split_seed),
+            stratify=bool(stratify_split),
+        )
+        df = source_df.loc[train_idx].copy()
+        test_df = source_df.loc[test_idx].copy()
+        data_key = (
+            f"{source_data_key}:train_split:{float(test_fraction):.4f}:"
+            f"{int(split_seed)}:{dataframe_fingerprint(df)}"
+        )
+        source_metadata = {
+            **source_metadata,
+            "validation": {
+                "mode": "split_train_data",
+                "test_fraction": float(test_fraction),
+                "random_state": int(split_seed),
+                "stratify": bool(stratify_split),
+                "source_rows": int(len(source_df)),
+                "train_rows": int(len(df)),
+                "test_rows": int(len(test_df)),
+            },
+        }
+        train_panel.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
+    elif validation_mode == "Separate data source":
+        test_source_choice = train_panel.radio(
+            "Test data source",
+            source_options,
+            index=source_options.index("CSV / Excel Upload"),
+            key="test_data_source_choice",
+        )
+        test_source = render_dataframe_source_loader(
+            train_panel,
+            role="test",
+            source_choice=test_source_choice,
+            query_session=None,
+            checkpoint=None,
+            allow_checkpoint_restore=False,
+            update_query_params=False,
+        )
+        if test_source is not None:
+            missing_test_columns = validate_test_dataframe(test_source.df, target, features)
             if missing_test_columns:
-                st.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
-                st.stop()
-            test_df = loaded_test_df
-            st.caption(f"Loaded test rows: {len(test_df):,}")
+                train_panel.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
+            else:
+                test_df = test_source.df
+                source_metadata = {
+                    **source_metadata,
+                    "validation": {
+                        "mode": "separate_data_source",
+                        "source": test_source.source,
+                        "name": test_source.name,
+                        "data_id": test_source.data_id,
+                        "rows": int(len(test_df)),
+                    },
+                }
+                train_panel.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
+    else:
+        train_panel.caption(f"Active train rows: {len(df):,}")
+
+    if test_df is not None:
+        missing_test_columns = validate_test_dataframe(test_df, target, features)
+        if missing_test_columns:
+            train_panel.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
+            st.stop()
 
     saved_parameters = (
         checkpoint.get("parameters")
@@ -3542,6 +3959,7 @@ def main() -> None:
     current_row_count = len(current["row_idx"])
     candidate_sample_rows = current_row_count
     candidate_features = features
+    compute_candidates = False
     if current["split"] is None and features:
         candidate_sample_key = f"candidate_sample_rows::{data_key}::{target}::{current['id']}"
         if candidate_sample_key not in st.session_state:
@@ -3606,6 +4024,21 @@ def main() -> None:
                 key=candidate_features_key,
                 help="Only these variables will be scored for the selected leaf.",
             )
+        train_panel.caption(
+            f"Split search will rank {len(candidate_features):,} variable(s) on "
+            f"{min(current_row_count, safe_int(candidate_sample_rows, current_row_count)):,} "
+            f"of {current_row_count:,} row(s)."
+        )
+        compute_candidates = train_panel.button(
+            "Compute split ranking",
+            key=f"compute_split_ranking::{data_key}::{target}::{current['id']}",
+            type="primary",
+            width="stretch",
+            help=(
+                "Scores candidate splits for the selected leaf. Results are cached until scope, parameters, "
+                "target, data, or tree state changes."
+            ),
+        )
     elif features:
         train_panel.markdown("**Advanced split search scope**")
         train_panel.caption("Select a leaf node to adjust split search scope.")
@@ -3662,21 +4095,6 @@ def main() -> None:
                 st.warning("Select at least one feature.")
             else:
                 large_leaf = current_row_count > AUTO_COMPUTE_CANDIDATE_ROWS
-                with st.form(key=f"candidate_form::{data_key}::{target}::{current['id']}"):
-                    st.caption(
-                        f"Split search will rank {len(candidate_features):,} variable(s) on "
-                        f"{min(current_row_count, safe_int(candidate_sample_rows, current_row_count)):,} "
-                        f"of {current_row_count:,} row(s)."
-                    )
-                    compute_candidates = st.form_submit_button(
-                        "Compute split ranking",
-                        type="primary",
-                        width="stretch",
-                        help=(
-                            "Scores candidate splits for this leaf. Results are cached until scope, parameters, "
-                            "target, data, or tree state changes."
-                        ),
-                    )
                 if not candidate_features:
                     st.warning("Select at least one variable for split ranking.")
                     st.stop()
@@ -3851,8 +4269,6 @@ def main() -> None:
                             score_name: selected_candidate.information_gain,
                             "weighted_tree_delta": candidate_total_gain_delta(df, selected_candidate, current["row_idx"]),
                             "child_weighted_impurity": selected_candidate.weighted_entropy,
-                            "branch_rows": " / ".join(str(n) for n in selected_candidate.branch_ns),
-                            "branch_impurity": " / ".join(f"{x:.3f}" for x in selected_candidate.branch_entropies),
                         }
                     ]
 
@@ -3865,6 +4281,18 @@ def main() -> None:
                             "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
                             "child_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
                         },
+                    )
+
+                    st.caption("Branch details")
+                    st.dataframe(
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                candidate_branch_detail_rows(df, target, current["row_idx"], selected_candidate)
+                            )
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config=branch_detail_column_config(score_name),
                     )
 
                     st.dataframe(
@@ -3902,12 +4330,6 @@ def main() -> None:
                                 selected_feature,
                                 thresholds,
                             )
-                            if branch_rows:
-                                st.dataframe(
-                                    arrow_safe_dataframe(pd.DataFrame(branch_rows)),
-                                    hide_index=True,
-                                    width="stretch",
-                                )
                             manual_candidate = score_numeric_manual_bins(
                                 df=df,
                                 target=target,
@@ -3923,6 +4345,11 @@ def main() -> None:
                                     if int(row["rows"]) < int(min_leaf)
                                 ]
                                 if low_branches:
+                                    st.dataframe(
+                                        arrow_safe_dataframe(pd.DataFrame(branch_rows)),
+                                        hide_index=True,
+                                        width="stretch",
+                                    )
                                     branch_text = ", ".join(
                                         f"{row['branch']} n={row['rows']}" for row in low_branches
                                     )
@@ -3953,13 +4380,13 @@ def main() -> None:
 
                     st.caption("Select values, split them into a new group, or merge groups back together.")
                     seed_col1, seed_col2, seed_col3 = st.columns(3)
-                    if seed_col1.button("All in one", key=f"group_all_{group_key}", width="stretch"):
+                    if seed_col1.button("All in one", key=f"group_all_{group_key}", type="primary", width="stretch"):
                         st.session_state[group_key] = [level_texts.copy()]
                         save_and_rerun()
-                    if seed_col2.button("One per value", key=f"group_single_{group_key}", width="stretch"):
+                    if seed_col2.button("One per value", key=f"group_single_{group_key}", type="primary", width="stretch"):
                         st.session_state[group_key] = [[value] for value in level_texts]
                         save_and_rerun()
-                    if seed_col3.button("Profile groups", key=f"group_profile_{group_key}", width="stretch"):
+                    if seed_col3.button("Profile groups", key=f"group_profile_{group_key}", type="primary", width="stretch"):
                         st.session_state[group_key] = profile_group_texts(
                             df=df,
                             target=target,
@@ -4019,7 +4446,12 @@ def main() -> None:
                         options=groups[int(source_group_index)],
                         key=f"group_values_{group_key}",
                     )
-                    if st.button("Move selected to new group", key=f"group_split_{group_key}", width="stretch"):
+                    if st.button(
+                        "Move selected to new group",
+                        key=f"group_split_{group_key}",
+                        type="primary",
+                        width="stretch",
+                    ):
                         source_index = int(source_group_index)
                         selected_values = set(values_to_split)
                         if selected_values and selected_values != set(groups[source_index]):
@@ -4041,7 +4473,12 @@ def main() -> None:
                         format_func=lambda i: f"G{i + 1}: {', '.join(groups[i])}",
                         key=f"group_merge_{group_key}",
                     )
-                    if st.button("Merge selected groups", key=f"group_merge_button_{group_key}", width="stretch"):
+                    if st.button(
+                        "Merge selected groups",
+                        key=f"group_merge_button_{group_key}",
+                        type="primary",
+                        width="stretch",
+                    ):
                         selected_group_ids = sorted(set(int(i) for i in groups_to_merge))
                         if len(selected_group_ids) >= 2:
                             merged: list[str] = []
@@ -4073,6 +4510,17 @@ def main() -> None:
                 if manual_candidate is None:
                     st.caption("Enter a valid manual split to preview its impact.")
                 else:
+                    st.caption("Manual branch details")
+                    st.dataframe(
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                candidate_branch_detail_rows(df, target, current["row_idx"], manual_candidate)
+                            )
+                        ),
+                        hide_index=True,
+                        width="stretch",
+                        column_config=branch_detail_column_config(score_name),
+                    )
                     st.dataframe(
                         arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], manual_candidate))),
                         hide_index=True,
@@ -4081,6 +4529,7 @@ def main() -> None:
                     if st.button(
                         f"Apply manual {selected_feature} split",
                         key=f"apply_manual_split_{current['id']}_{selected_feature}",
+                        type="primary",
                         width="stretch",
                     ):
                         apply_split(df, manual_candidate)

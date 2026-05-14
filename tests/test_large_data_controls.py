@@ -13,6 +13,8 @@ from interactive_decision_tree_app import (
     restore_checkpoint_dataframe,
     score_split,
     split_node,
+    train_test_split_indices,
+    validate_test_dataframe,
 )
 
 
@@ -45,6 +47,33 @@ def test_analysis_row_idx_stratifies_by_target_when_sampling():
     counts = df.loc[sampled, "target"].value_counts().to_dict()
 
     assert counts == {"bad": 16, "good": 4}
+
+
+def test_train_test_split_indices_stratifies_target():
+    df = pd.DataFrame(
+        {
+            "x": range(100),
+            "risk_flag": ["high"] * 30 + ["low"] * 70,
+        }
+    )
+
+    train_idx, test_idx = train_test_split_indices(
+        df,
+        target="risk_flag",
+        test_fraction=0.2,
+        random_state=11,
+        stratify=True,
+    )
+
+    assert len(train_idx) == 80
+    assert len(test_idx) == 20
+    assert df.loc[test_idx, "risk_flag"].value_counts().to_dict() == {"low": 14, "high": 6}
+
+
+def test_validate_test_dataframe_requires_target_and_features():
+    test_df = pd.DataFrame({"age": [30], "risk_flag": [1]})
+
+    assert validate_test_dataframe(test_df, "risk_flag", ["age", "income"]) == ["income"]
 
 
 def test_candidate_cache_key_changes_with_variable_set():
