@@ -1588,13 +1588,13 @@ def save_source_session(
     return data_id
 
 
-def render_sql_source_loader() -> None:
+def render_sql_source_loader(container: Any = st.sidebar) -> None:
     connections = secret_sql_connections()
     connection_mode_options = ["Manual SQLAlchemy URL"]
     if connections:
         connection_mode_options.insert(0, "Saved secret connection")
 
-    with st.sidebar.form("sql_source_form"):
+    with container.form("sql_source_form"):
         connection_mode = st.selectbox("SQL connection", connection_mode_options)
         if connection_mode == "Saved secret connection":
             selected_connection = st.selectbox("Saved connection", sorted(connections))
@@ -1623,11 +1623,11 @@ def render_sql_source_loader() -> None:
         submitted = st.form_submit_button("Load SQL data", width="stretch")
 
     if not submitted:
-        st.info("Choose a SQL source in the sidebar and load data.")
+        container.info("Choose a SQL source in the sidebar and load data.")
         st.stop()
 
     if not connection_url:
-        st.sidebar.error("SQL connection URL is required.")
+        container.error("SQL connection URL is required.")
         st.stop()
 
     try:
@@ -1655,7 +1655,7 @@ def render_sql_source_loader() -> None:
         )
         st.rerun()
     except Exception as exc:
-        st.sidebar.error(f"SQL load failed: {exc}")
+        container.error(f"SQL load failed: {exc}")
         st.stop()
 
 
@@ -3149,7 +3149,8 @@ def main() -> None:
     elif remembered_source not in source_options:
         st.session_state.pop("data_source_choice", None)
         remembered_source = default_source
-    source_choice = st.sidebar.radio(
+    train_panel = st.sidebar.expander("Train data", expanded=True)
+    source_choice = train_panel.radio(
         "Data source",
         source_options,
         index=source_options.index(str(remembered_source)),
@@ -3169,7 +3170,7 @@ def main() -> None:
         uploaded_name = str(source_metadata.get("name") or "Session DataFrame")
         data_source = str(source_metadata.get("source") or "session")
     elif source_choice == "CSV / Excel Upload":
-        uploaded = st.sidebar.file_uploader("CSV veya Excel yukle", type=["csv", "xlsx", "xls"])
+        uploaded = train_panel.file_uploader("CSV veya Excel yukle", type=["csv", "xlsx", "xls"])
         if uploaded is None:
             restored_dataframe = restore_checkpoint_dataframe(checkpoint)
             if restored_dataframe is not None:
@@ -3207,20 +3208,20 @@ def main() -> None:
                 )
                 st.session_state[cache_key] = {"upload_key": upload_key, "data_id": source_data_id}
             data_key = session_data_key(str(source_data_id), df, source_metadata)
-            if normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM)) != source_data_id:
-                st.query_params[DATA_ID_QUERY_PARAM] = source_data_id
-                st.rerun()
+        if source_data_id and normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM)) != source_data_id:
+            st.query_params[DATA_ID_QUERY_PARAM] = source_data_id
+            st.rerun()
     elif source_choice == "SQL":
-        render_sql_source_loader()
+        render_sql_source_loader(train_panel)
     else:
         df = make_demo_data()
         data_key = "demo"
 
-    st.sidebar.caption(f"Rows: {len(df):,} | Columns: {len(df.columns):,}")
+    train_panel.caption(f"Rows: {len(df):,} | Columns: {len(df.columns):,}")
     if restored_upload and uploaded_name is not None:
-        st.sidebar.caption(f"Restored uploaded data: {uploaded_name}")
+        train_panel.caption(f"Restored uploaded data: {uploaded_name}")
     if source_data_id:
-        st.sidebar.caption(f"Data id: {source_data_id}")
+        train_panel.caption(f"Data id: {source_data_id}")
     st.sidebar.caption(f"Autosave work id: {work_id}")
     if st.session_state.get("_checkpoint_error"):
         st.sidebar.warning(f"Autosave failed: {st.session_state['_checkpoint_error']}")
@@ -3235,7 +3236,7 @@ def main() -> None:
         default_target_index = target_options.index(saved_target)
     elif source_target in target_options:
         default_target_index = target_options.index(source_target)
-    target = st.sidebar.selectbox(
+    target = train_panel.selectbox(
         "Target",
         options=target_options,
         index=default_target_index,
@@ -3255,7 +3256,7 @@ def main() -> None:
             preferred=remembered_positive_class,
             use_session_default=False,
         )
-        positive_class = st.sidebar.selectbox(
+        positive_class = train_panel.selectbox(
             "Positive class",
             options=positive_class_options,
             index=class_option_index(positive_class_options, default_positive_class),
@@ -3279,7 +3280,7 @@ def main() -> None:
         default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
     else:
         default_selected_features = default_features
-    selected_features = st.sidebar.multiselect(
+    selected_features = train_panel.multiselect(
         "Available split variables",
         default_features,
         default=default_selected_features,
@@ -3538,6 +3539,76 @@ def main() -> None:
         st.session_state.current_node_id = 0
     current = tree[st.session_state.current_node_id]
     summary = node_summary(df, target, current["row_idx"])
+    current_row_count = len(current["row_idx"])
+    candidate_sample_rows = current_row_count
+    candidate_features = features
+    if current["split"] is None and features:
+        candidate_sample_key = f"candidate_sample_rows::{data_key}::{target}::{current['id']}"
+        if candidate_sample_key not in st.session_state:
+            st.session_state[candidate_sample_key] = current_row_count
+        candidate_features_key = f"candidate_features::{data_key}::{target}::{current['id']}"
+        if candidate_features_key not in st.session_state:
+            st.session_state[candidate_features_key] = features.copy()
+        st.session_state[candidate_features_key] = [
+            feature for feature in st.session_state[candidate_features_key] if feature in features
+        ]
+        if not st.session_state[candidate_features_key]:
+            st.session_state[candidate_features_key] = features.copy()
+
+        use_all_rows_key = f"candidate_use_all_rows::{data_key}::{target}::{current['id']}"
+        use_all_features_key = f"candidate_use_all_features::{data_key}::{target}::{current['id']}"
+        if use_all_rows_key not in st.session_state:
+            st.session_state[use_all_rows_key] = True
+        if use_all_features_key not in st.session_state:
+            st.session_state[use_all_features_key] = True
+
+        train_panel.markdown("**Advanced split search scope**")
+        use_all_rows = train_panel.checkbox(
+            "Use all rows in selected leaf",
+            key=use_all_rows_key,
+            help=(
+                "Keep this on for full-data ranking. Turn it off only when a selected leaf is too large "
+                "and you need a target-stratified row limit."
+            ),
+        )
+        if use_all_rows:
+            candidate_sample_rows = current_row_count
+            train_panel.caption(f"Row scope: all {current_row_count:,} rows in selected leaf.")
+        else:
+            candidate_sample_rows = train_panel.number_input(
+                "Row limit for split ranking",
+                min_value=1,
+                max_value=max(1, current_row_count),
+                step=10_000,
+                format="%d",
+                key=candidate_sample_key,
+                help=(
+                    "Ranking uses a target-stratified sample at this limit. "
+                    "The chosen split is still applied to the full leaf."
+                ),
+            )
+
+        use_all_features = train_panel.checkbox(
+            "Use all available split variables",
+            key=use_all_features_key,
+            help=(
+                "Keep this on to rank every variable selected above. "
+                "Turn it off only to test a smaller variable subset."
+            ),
+        )
+        if use_all_features:
+            candidate_features = features
+            train_panel.caption(f"Variable scope: all {len(features):,} available split variable(s).")
+        else:
+            candidate_features = train_panel.multiselect(
+                "Variable subset for split ranking",
+                options=features,
+                key=candidate_features_key,
+                help="Only these variables will be scored for the selected leaf.",
+            )
+    elif features:
+        train_panel.markdown("**Advanced split search scope**")
+        train_panel.caption("Select a leaf node to adjust split search scope.")
 
     with st.expander("Model performance", expanded=True):
         train_metrics = model_metrics(df, target)
@@ -3590,76 +3661,8 @@ def main() -> None:
             elif not features:
                 st.warning("Select at least one feature.")
             else:
-                current_row_count = len(current["row_idx"])
                 large_leaf = current_row_count > AUTO_COMPUTE_CANDIDATE_ROWS
-                candidate_sample_key = f"candidate_sample_rows::{data_key}::{target}::{current['id']}"
-                if candidate_sample_key not in st.session_state:
-                    st.session_state[candidate_sample_key] = current_row_count
-                candidate_features_key = f"candidate_features::{data_key}::{target}::{current['id']}"
-                if candidate_features_key not in st.session_state:
-                    st.session_state[candidate_features_key] = features.copy()
-                st.session_state[candidate_features_key] = [
-                    feature for feature in st.session_state[candidate_features_key] if feature in features
-                ]
-                if not st.session_state[candidate_features_key]:
-                    st.session_state[candidate_features_key] = features.copy()
                 with st.form(key=f"candidate_form::{data_key}::{target}::{current['id']}"):
-                    use_all_rows_key = f"candidate_use_all_rows::{data_key}::{target}::{current['id']}"
-                    use_all_features_key = f"candidate_use_all_features::{data_key}::{target}::{current['id']}"
-                    if use_all_rows_key not in st.session_state:
-                        st.session_state[use_all_rows_key] = True
-                    if use_all_features_key not in st.session_state:
-                        st.session_state[use_all_features_key] = True
-
-                    use_all_rows = True
-                    use_all_features = True
-                    candidate_sample_rows = current_row_count
-                    candidate_features = features
-                    with st.expander("Advanced split search scope", expanded=False):
-                        use_all_rows = st.checkbox(
-                            "Use all rows in this leaf",
-                            key=use_all_rows_key,
-                            help=(
-                                "Keep this on for full-data ranking. Turn it off only when a leaf is too large "
-                                "and you need a target-stratified row limit."
-                            ),
-                        )
-                        if use_all_rows:
-                            candidate_sample_rows = current_row_count
-                            st.caption(f"Row scope: all {current_row_count:,} rows in this leaf.")
-                        else:
-                            candidate_sample_rows = st.number_input(
-                                "Row limit for ranking",
-                                min_value=1,
-                                max_value=max(1, current_row_count),
-                                step=10_000,
-                                format="%d",
-                                key=candidate_sample_key,
-                                help=(
-                                    "Ranking uses a target-stratified sample at this limit. "
-                                    "The chosen split is still applied to the full leaf."
-                                ),
-                            )
-
-                        use_all_features = st.checkbox(
-                            "Use all available split variables",
-                            key=use_all_features_key,
-                            help=(
-                                "Keep this on to rank every variable selected in the sidebar. "
-                                "Turn it off only to test a smaller variable subset."
-                            ),
-                        )
-                        if use_all_features:
-                            candidate_features = features
-                            st.caption(f"Variable scope: all {len(features):,} available split variable(s).")
-                        else:
-                            candidate_features = st.multiselect(
-                                "Variable subset for ranking",
-                                options=features,
-                                key=candidate_features_key,
-                                help="Only these variables will be scored for this leaf.",
-                            )
-
                     st.caption(
                         f"Split search will rank {len(candidate_features):,} variable(s) on "
                         f"{min(current_row_count, safe_int(candidate_sample_rows, current_row_count)):,} "
