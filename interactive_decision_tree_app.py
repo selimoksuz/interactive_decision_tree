@@ -32,6 +32,7 @@ CHECKPOINT_SCHEMA_VERSION = 1
 WORK_ID_QUERY_PARAM = "work_id"
 CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
+APPLIED_DATA_CONTEXT_KEY = "_interactive_tree_applied_data_context"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
@@ -1770,6 +1771,17 @@ def source_metadata_value(metadata: dict[str, Any], key: str) -> Any:
     if value in ("", [], {}):
         return None
     return value
+
+
+def data_context_signature(context: dict[str, Any] | None) -> tuple[Any, ...] | None:
+    if not context:
+        return None
+    return (
+        str(context.get("data_key") or ""),
+        str(context.get("target") or ""),
+        tuple(str(feature) for feature in context.get("features", []) or []),
+        str(context.get("positive_class") or ""),
+    )
 
 
 def secret_sql_connections() -> dict[str, str]:
@@ -3923,6 +3935,7 @@ def main() -> None:
     remembered_source = st.session_state.get("data_source_choice")
     if query_data_id and st.session_state.get("_last_query_data_id") != query_data_id:
         st.session_state.pop("data_source_choice", None)
+        st.session_state.pop(APPLIED_DATA_CONTEXT_KEY, None)
         remembered_source = "Session DataFrame"
         st.session_state["_last_query_data_id"] = query_data_id
     elif remembered_source == "CSV Upload":
@@ -3948,325 +3961,392 @@ def main() -> None:
         allow_checkpoint_restore=True,
         update_query_params=True,
     )
-    if train_source is None:
-        st.info("Train datasini yuklemek icin Data source panelinden bir kaynak secin.")
-        st.stop()
-
-    df = train_source.df
-    uploaded_name = train_source.name
-    source_metadata = dict(train_source.metadata)
-    source_data_id = train_source.data_id
-    data_key = train_source.data_key
-    data_source = train_source.source
-    restored_upload = train_source.restored_upload
-    if source_data_id and normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM)) != source_data_id:
-        st.query_params[DATA_ID_QUERY_PARAM] = source_data_id
-        st.rerun()
-
-    source_df = df
-    source_data_key = data_key
-    train_panel.caption(f"Train source rows: {len(source_df):,} | Columns: {len(source_df.columns):,}")
-    if restored_upload and uploaded_name is not None:
-        train_panel.caption(f"Restored uploaded data: {uploaded_name}")
-    if source_data_id:
-        train_panel.caption(f"Data id: {source_data_id}")
     st.sidebar.caption(f"Autosave work id: {work_id}")
     if st.session_state.get("_checkpoint_error"):
         st.sidebar.warning(f"Autosave failed: {st.session_state['_checkpoint_error']}")
 
-    checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
-    checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
-    checkpoint_source_match = checkpoint_data_key == data_key or str(checkpoint_data_key).startswith(f"{data_key}:")
-    saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) and checkpoint_source_match else None
-    source_target = source_metadata_value(source_metadata, "target")
-    target_options = source_df.columns.tolist()
-    default_target_index = target_options.index("risk_flag") if "risk_flag" in target_options else len(target_options) - 1
-    if saved_target in target_options:
-        default_target_index = target_options.index(saved_target)
-    elif source_target in target_options:
-        default_target_index = target_options.index(source_target)
-    target = train_panel.selectbox(
-        "Target",
-        options=target_options,
-        index=default_target_index,
-    )
-    target_kind = infer_target_kind(source_df[target])
-    if target_kind == "binary":
-        positive_class_options = list(source_df[target].dropna().unique())
-        positive_class_key = f"positive_class::{data_key}::{target}"
-        checkpoint_positive_class = (
-            checkpoint.get("positive_class")
-            if isinstance(checkpoint, dict) and checkpoint_source_match
+    draft_context: dict[str, Any] | None = None
+    if train_source is None:
+        train_panel.info("Configure a draft train source, then click Apply data setup.")
+    else:
+        draft_source_df = train_source.df
+        draft_uploaded_name = train_source.name
+        draft_source_metadata = dict(train_source.metadata)
+        draft_source_data_id = train_source.data_id
+        draft_source_data_key = train_source.data_key
+        draft_data_source = train_source.source
+        restored_upload = train_source.restored_upload
+
+        train_panel.caption(
+            f"Draft train source rows: {len(draft_source_df):,} | Columns: {len(draft_source_df.columns):,}"
+        )
+        if restored_upload and draft_uploaded_name is not None:
+            train_panel.caption(f"Restored uploaded data: {draft_uploaded_name}")
+        if draft_source_data_id:
+            train_panel.caption(f"Draft data id: {draft_source_data_id}")
+
+        checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
+        checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
+        draft_checkpoint_source_match = checkpoint_data_key == draft_source_data_key or str(
+            checkpoint_data_key
+        ).startswith(f"{draft_source_data_key}:")
+        saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) and draft_checkpoint_source_match else None
+        source_target = source_metadata_value(draft_source_metadata, "target")
+        target_options = draft_source_df.columns.tolist()
+        default_target_index = (
+            target_options.index("risk_flag") if "risk_flag" in target_options else len(target_options) - 1
+        )
+        if saved_target in target_options:
+            default_target_index = target_options.index(saved_target)
+        elif source_target in target_options:
+            default_target_index = target_options.index(source_target)
+        draft_target = train_panel.selectbox(
+            "Target",
+            options=target_options,
+            index=default_target_index,
+        )
+        draft_target_kind = infer_target_kind(draft_source_df[draft_target])
+        draft_positive_class = None
+        if draft_target_kind == "binary":
+            positive_class_options = list(draft_source_df[draft_target].dropna().unique())
+            positive_class_key = f"positive_class::{draft_source_data_key}::{draft_target}"
+            checkpoint_positive_class = (
+                checkpoint.get("positive_class")
+                if isinstance(checkpoint, dict) and draft_checkpoint_source_match
+                else None
+            )
+            remembered_positive_class = st.session_state.get(positive_class_key, checkpoint_positive_class)
+            default_positive_class = choose_positive_class(
+                draft_source_df[draft_target],
+                preferred=remembered_positive_class,
+                use_session_default=False,
+            )
+            draft_positive_class = train_panel.selectbox(
+                "Positive class",
+                options=positive_class_options,
+                index=class_option_index(positive_class_options, default_positive_class),
+                key=positive_class_key,
+                format_func=lambda value: str(value),
+            )
+
+        default_features = [c for c in draft_source_df.columns if c != draft_target]
+        checkpoint_features = (
+            checkpoint.get("selected_features")
+            if isinstance(checkpoint, dict) and draft_checkpoint_source_match
             else None
         )
-        remembered_positive_class = st.session_state.get(positive_class_key, checkpoint_positive_class)
-        default_positive_class = choose_positive_class(
-            source_df[target],
-            preferred=remembered_positive_class,
-            use_session_default=False,
+        source_features = source_metadata_value(draft_source_metadata, "features")
+        if isinstance(checkpoint_features, list):
+            default_selected_features = [
+                str(feature) for feature in checkpoint_features if str(feature) in default_features
+            ]
+        elif isinstance(source_features, list):
+            default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
+        else:
+            default_selected_features = default_features
+        draft_features = train_panel.multiselect(
+            "Available split variables",
+            default_features,
+            default=default_selected_features,
         )
-        positive_class = train_panel.selectbox(
-            "Positive class",
-            options=positive_class_options,
-            index=class_option_index(positive_class_options, default_positive_class),
-            key=positive_class_key,
-            format_func=lambda value: str(value),
+
+        draft_test_df: pd.DataFrame | None = None
+        draft_working_df = draft_source_df
+        draft_working_data_key = draft_source_data_key
+        data_sample_tab, validation_tab = train_panel.tabs(["Sample", "Test / validation"])
+
+        default_stratify_columns = [draft_target] if draft_target_kind != "regression" else []
+        with data_sample_tab:
+            sample_enabled = st.checkbox(
+                "Use sampled working data",
+                value=False,
+                key="data_sample_enabled",
+                help="Samples the loaded train source before tree building or train/test splitting.",
+            )
+            sample_col1, sample_col2 = st.columns(2)
+            sample_rows_input = sample_col1.number_input(
+                "Sample rows",
+                min_value=1,
+                max_value=max(1, len(draft_source_df)),
+                value=min(len(draft_source_df), DEFAULT_DATA_SAMPLE_ROWS),
+                step=10_000,
+                format="%d",
+                key="data_sample_rows",
+                disabled=not sample_enabled,
+            )
+            sample_seed_input = sample_col2.number_input(
+                "Sample seed",
+                value=CANDIDATE_RANDOM_STATE,
+                step=1,
+                key="data_sample_seed",
+                disabled=not sample_enabled,
+            )
+            sample_stratify_columns = st.multiselect(
+                "Sample stratify columns",
+                options=draft_source_df.columns.tolist(),
+                default=default_stratify_columns,
+                key="data_sample_stratify_columns",
+                disabled=not sample_enabled,
+                help=(
+                    "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
+                    "before the stratified sample is drawn."
+                ),
+            )
+            sample_numeric_bins_input = st.number_input(
+                "Numeric stratify bins",
+                min_value=2,
+                max_value=50,
+                value=DEFAULT_STRATIFY_NUMERIC_BINS,
+                step=1,
+                format="%d",
+                key="data_sample_stratify_numeric_bins",
+                disabled=not sample_enabled or not sample_stratify_columns,
+            )
+            sample_rows = min(
+                len(draft_source_df),
+                safe_int(sample_rows_input, default=len(draft_source_df), minimum=1),
+            )
+            sample_seed = int(sample_seed_input)
+            sample_numeric_bins = safe_int(
+                sample_numeric_bins_input,
+                default=DEFAULT_STRATIFY_NUMERIC_BINS,
+                minimum=2,
+            )
+            sample_stratify_columns = normalize_stratify_columns(draft_source_df, sample_stratify_columns)
+            if sample_enabled and sample_rows < len(draft_source_df):
+                sample_idx = analysis_row_idx(
+                    draft_source_df.index.tolist(),
+                    max_rows=sample_rows,
+                    random_state=sample_seed,
+                    df=draft_source_df,
+                    stratify_columns=sample_stratify_columns,
+                    stratify_numeric_bins=sample_numeric_bins,
+                )
+                draft_working_df = draft_source_df.loc[sample_idx].copy()
+                draft_working_data_key = (
+                    f"{draft_source_data_key}:sample:{sample_rows}:{sample_seed}:"
+                    f"{','.join(sample_stratify_columns) or 'random'}:{sample_numeric_bins}:"
+                    f"{dataframe_fingerprint(draft_working_df)}"
+                )
+                draft_source_metadata = {
+                    **draft_source_metadata,
+                    "sample": {
+                        "enabled": True,
+                        "source_rows": int(len(draft_source_df)),
+                        "sample_rows": int(len(draft_working_df)),
+                        "random_state": sample_seed,
+                        "stratify_columns": list(sample_stratify_columns),
+                        "numeric_bins": sample_numeric_bins,
+                    },
+                }
+                st.caption(
+                    f"Draft sampled data: {len(draft_working_df):,} / {len(draft_source_df):,} rows "
+                    f"using {', '.join(sample_stratify_columns) if sample_stratify_columns else 'random'} strata."
+                )
+            elif sample_enabled:
+                st.caption("Sample rows is greater than or equal to source rows; the full source is used.")
+            else:
+                st.caption("Sampling is off; the full train source is used.")
+
+        draft_df = draft_working_df
+        draft_data_key = draft_working_data_key
+        validation_mode = validation_tab.radio(
+            "Test / validation source",
+            ["No test data", "Split train data", "Separate data source"],
+            key="validation_source_mode",
+            help="Train datasini kullan, ayni tabloyu train/test bol veya ayri bir test kaynagi yukle.",
         )
-        st.session_state[POSITIVE_CLASS_SESSION_KEY] = positive_class
+        draft_error: str | None = None
+        if validation_mode == "Split train data":
+            split_col1, split_col2 = validation_tab.columns(2)
+            test_fraction = split_col1.slider(
+                "Test share",
+                min_value=0.05,
+                max_value=0.5,
+                value=0.2,
+                step=0.05,
+                key="validation_test_share",
+            )
+            split_seed = split_col2.number_input(
+                "Split seed",
+                value=CANDIDATE_RANDOM_STATE,
+                step=1,
+                key="validation_split_seed",
+            )
+            split_stratify_columns = validation_tab.multiselect(
+                "Split stratify columns",
+                options=draft_working_df.columns.tolist(),
+                default=default_stratify_columns,
+                key="validation_stratify_columns",
+                help=(
+                    "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
+                    "before the train/test split is drawn."
+                ),
+            )
+            split_numeric_bins_input = validation_tab.number_input(
+                "Split numeric stratify bins",
+                min_value=2,
+                max_value=50,
+                value=DEFAULT_STRATIFY_NUMERIC_BINS,
+                step=1,
+                format="%d",
+                key="validation_stratify_numeric_bins",
+                disabled=not split_stratify_columns,
+            )
+            split_stratify_columns = normalize_stratify_columns(draft_working_df, split_stratify_columns)
+            split_numeric_bins = safe_int(
+                split_numeric_bins_input,
+                default=DEFAULT_STRATIFY_NUMERIC_BINS,
+                minimum=2,
+            )
+            train_idx, test_idx = train_test_split_indices(
+                draft_working_df,
+                draft_target,
+                test_fraction=float(test_fraction),
+                random_state=int(split_seed),
+                stratify=bool(split_stratify_columns),
+                stratify_columns=split_stratify_columns,
+                stratify_numeric_bins=split_numeric_bins,
+            )
+            draft_df = draft_working_df.loc[train_idx].copy()
+            draft_test_df = draft_working_df.loc[test_idx].copy()
+            draft_data_key = (
+                f"{draft_working_data_key}:train_split:{float(test_fraction):.4f}:"
+                f"{int(split_seed)}:{','.join(split_stratify_columns) or 'random'}:"
+                f"{split_numeric_bins}:{dataframe_fingerprint(draft_df)}"
+            )
+            draft_source_metadata = {
+                **draft_source_metadata,
+                "validation": {
+                    "mode": "split_train_data",
+                    "test_fraction": float(test_fraction),
+                    "random_state": int(split_seed),
+                    "stratify_columns": list(split_stratify_columns),
+                    "numeric_bins": split_numeric_bins,
+                    "source_rows": int(len(draft_working_df)),
+                    "train_rows": int(len(draft_df)),
+                    "test_rows": int(len(draft_test_df)),
+                },
+            }
+            validation_tab.caption(f"Draft train rows: {len(draft_df):,} | Test rows: {len(draft_test_df):,}")
+        elif validation_mode == "Separate data source":
+            test_source_choice = validation_tab.radio(
+                "Test data source",
+                source_options,
+                index=source_options.index("CSV / Excel Upload"),
+                key="test_data_source_choice",
+            )
+            test_source = render_dataframe_source_loader(
+                validation_tab,
+                role="test",
+                source_choice=test_source_choice,
+                query_session=None,
+                checkpoint=None,
+                allow_checkpoint_restore=False,
+                update_query_params=False,
+            )
+            if test_source is not None:
+                missing_test_columns = validate_test_dataframe(test_source.df, draft_target, draft_features)
+                if missing_test_columns:
+                    draft_error = f"Test data is missing column(s): {', '.join(missing_test_columns)}"
+                    validation_tab.error(draft_error)
+                else:
+                    draft_test_df = test_source.df
+                    draft_source_metadata = {
+                        **draft_source_metadata,
+                        "validation": {
+                            "mode": "separate_data_source",
+                            "source": test_source.source,
+                            "name": test_source.name,
+                            "data_id": test_source.data_id,
+                            "rows": int(len(draft_test_df)),
+                        },
+                    }
+                    validation_tab.caption(f"Draft train rows: {len(draft_df):,} | Test rows: {len(draft_test_df):,}")
+        else:
+            validation_tab.caption(f"Draft train rows: {len(draft_df):,}")
+
+        if draft_test_df is not None:
+            missing_test_columns = validate_test_dataframe(draft_test_df, draft_target, draft_features)
+            if missing_test_columns:
+                draft_error = f"Test data is missing column(s): {', '.join(missing_test_columns)}"
+                validation_tab.error(draft_error)
+
+        if draft_error is None:
+            draft_context = {
+                "df": draft_df,
+                "test_df": draft_test_df,
+                "uploaded_name": draft_uploaded_name,
+                "source_metadata": draft_source_metadata,
+                "source_data_id": draft_source_data_id,
+                "data_key": draft_data_key,
+                "data_source": draft_data_source,
+                "target": draft_target,
+                "target_kind": draft_target_kind,
+                "features": list(draft_features),
+                "positive_class": draft_positive_class,
+            }
+
+    apply_clicked = train_panel.button(
+        "Apply data setup",
+        width="stretch",
+        type="primary",
+        disabled=draft_context is None,
+        help="Only after this click does the configured source/sample/test setup become active for the tree.",
+    )
+    if apply_clicked and draft_context is not None:
+        st.session_state[APPLIED_DATA_CONTEXT_KEY] = draft_context
+        st.session_state["_data_setup_message"] = (
+            f"Applied train rows: {len(draft_context['df']):,}"
+            + (
+                f" | Test rows: {len(draft_context['test_df']):,}"
+                if draft_context.get("test_df") is not None
+                else ""
+            )
+        )
+        applied_data_id = normalize_data_id(draft_context.get("source_data_id"))
+        if applied_data_id is not None:
+            st.query_params[DATA_ID_QUERY_PARAM] = applied_data_id
+        clear_candidate_cache()
+        st.rerun()
+
+    applied_context = st.session_state.get(APPLIED_DATA_CONTEXT_KEY)
+    if applied_context is None and draft_context is not None:
+        st.session_state[APPLIED_DATA_CONTEXT_KEY] = draft_context
+        applied_context = draft_context
+    if applied_context is None:
+        st.info("Configure a data source and click Apply data setup to start the tree.")
+        st.stop()
+
+    if draft_context is not None and data_context_signature(draft_context) != data_context_signature(applied_context):
+        train_panel.warning("Draft data setup has unapplied changes. The tree still uses the last applied data.")
+    if st.session_state.get("_data_setup_message"):
+        train_panel.caption(st.session_state["_data_setup_message"])
+
+    df = applied_context["df"]
+    test_df = applied_context.get("test_df")
+    uploaded_name = applied_context.get("uploaded_name")
+    source_metadata = dict(applied_context.get("source_metadata") or {})
+    source_data_id = applied_context.get("source_data_id")
+    data_key = str(applied_context["data_key"])
+    data_source = str(applied_context.get("data_source") or "data")
+    target = str(applied_context["target"])
+    features = [str(feature) for feature in applied_context.get("features", []) if str(feature) in df.columns]
+    target_kind = infer_target_kind(df[target])
+    if target_kind == "binary":
+        st.session_state[POSITIVE_CLASS_SESSION_KEY] = applied_context.get("positive_class")
     else:
         st.session_state[POSITIVE_CLASS_SESSION_KEY] = None
 
-    default_features = [c for c in source_df.columns if c != target]
-    checkpoint_features = (
-        checkpoint.get("selected_features")
-        if isinstance(checkpoint, dict) and checkpoint_source_match
-        else None
-    )
-    source_features = source_metadata_value(source_metadata, "features")
-    if isinstance(checkpoint_features, list):
-        default_selected_features = [str(feature) for feature in checkpoint_features if str(feature) in default_features]
-    elif isinstance(source_features, list):
-        default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
-    else:
-        default_selected_features = default_features
-    selected_features = train_panel.multiselect(
-        "Available split variables",
-        default_features,
-        default=default_selected_features,
-    )
-    features = selected_features
-    test_df: pd.DataFrame | None = None
-    working_df = source_df
-    working_data_key = source_data_key
-    data_sample_tab, validation_tab = train_panel.tabs(["Sample", "Test / validation"])
-
-    default_stratify_columns = [target] if target_kind != "regression" else []
-    if "data_sample_rows" in st.session_state:
-        st.session_state["data_sample_rows"] = min(
-            len(source_df),
-            safe_int(st.session_state["data_sample_rows"], default=len(source_df), minimum=1),
-        )
-    if "data_sample_stratify_columns" in st.session_state:
-        st.session_state["data_sample_stratify_columns"] = normalize_stratify_columns(
-            source_df,
-            st.session_state["data_sample_stratify_columns"],
-        )
-    with data_sample_tab:
-        sample_enabled = st.checkbox(
-            "Use sampled working data",
-            value=False,
-            key="data_sample_enabled",
-            help="Samples the loaded train source before tree building or train/test splitting.",
-        )
-        sample_col1, sample_col2 = st.columns(2)
-        sample_rows_input = sample_col1.number_input(
-            "Sample rows",
-            min_value=1,
-            max_value=max(1, len(source_df)),
-            value=min(len(source_df), DEFAULT_DATA_SAMPLE_ROWS),
-            step=10_000,
-            format="%d",
-            key="data_sample_rows",
-            disabled=not sample_enabled,
-        )
-        sample_seed_input = sample_col2.number_input(
-            "Sample seed",
-            value=CANDIDATE_RANDOM_STATE,
-            step=1,
-            key="data_sample_seed",
-            disabled=not sample_enabled,
-        )
-        sample_stratify_columns = st.multiselect(
-            "Sample stratify columns",
-            options=source_df.columns.tolist(),
-            default=default_stratify_columns,
-            key="data_sample_stratify_columns",
-            disabled=not sample_enabled,
-            help=(
-                "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
-                "before the stratified sample is drawn."
-            ),
-        )
-        sample_numeric_bins_input = st.number_input(
-            "Numeric stratify bins",
-            min_value=2,
-            max_value=50,
-            value=DEFAULT_STRATIFY_NUMERIC_BINS,
-            step=1,
-            format="%d",
-            key="data_sample_stratify_numeric_bins",
-            disabled=not sample_enabled or not sample_stratify_columns,
-        )
-        sample_rows = min(len(source_df), safe_int(sample_rows_input, default=len(source_df), minimum=1))
-        sample_seed = int(sample_seed_input)
-        sample_numeric_bins = safe_int(
-            sample_numeric_bins_input,
-            default=DEFAULT_STRATIFY_NUMERIC_BINS,
-            minimum=2,
-        )
-        sample_stratify_columns = normalize_stratify_columns(source_df, sample_stratify_columns)
-        if sample_enabled and sample_rows < len(source_df):
-            sample_idx = analysis_row_idx(
-                source_df.index.tolist(),
-                max_rows=sample_rows,
-                random_state=sample_seed,
-                df=source_df,
-                stratify_columns=sample_stratify_columns,
-                stratify_numeric_bins=sample_numeric_bins,
-            )
-            working_df = source_df.loc[sample_idx].copy()
-            working_data_key = (
-                f"{source_data_key}:sample:{sample_rows}:{sample_seed}:"
-                f"{','.join(sample_stratify_columns) or 'random'}:{sample_numeric_bins}:"
-                f"{dataframe_fingerprint(working_df)}"
-            )
-            source_metadata = {
-                **source_metadata,
-                "sample": {
-                    "enabled": True,
-                    "source_rows": int(len(source_df)),
-                    "sample_rows": int(len(working_df)),
-                    "random_state": sample_seed,
-                    "stratify_columns": list(sample_stratify_columns),
-                    "numeric_bins": sample_numeric_bins,
-                },
-            }
-            st.caption(
-                f"Sampled working data: {len(working_df):,} / {len(source_df):,} rows "
-                f"using {', '.join(sample_stratify_columns) if sample_stratify_columns else 'random'} strata."
-            )
-        elif sample_enabled:
-            st.caption("Sample rows is greater than or equal to source rows; the full source is used.")
-        else:
-            st.caption("Sampling is off; the full train source is used.")
-
-    df = working_df
-    data_key = working_data_key
-    validation_mode = validation_tab.radio(
-        "Test / validation source",
-        ["No test data", "Split train data", "Separate data source"],
-        key="validation_source_mode",
-        help="Train datasini kullan, ayni tabloyu train/test bol veya ayri bir test kaynagi yukle.",
-    )
-    if validation_mode == "Split train data":
-        split_col1, split_col2 = validation_tab.columns(2)
-        test_fraction = split_col1.slider(
-            "Test share",
-            min_value=0.05,
-            max_value=0.5,
-            value=0.2,
-            step=0.05,
-            key="validation_test_share",
-        )
-        split_seed = split_col2.number_input(
-            "Split seed",
-            value=CANDIDATE_RANDOM_STATE,
-            step=1,
-            key="validation_split_seed",
-        )
-        if "validation_stratify_columns" in st.session_state:
-            st.session_state["validation_stratify_columns"] = normalize_stratify_columns(
-                working_df,
-                st.session_state["validation_stratify_columns"],
-            )
-        split_stratify_columns = validation_tab.multiselect(
-            "Split stratify columns",
-            options=working_df.columns.tolist(),
-            default=default_stratify_columns,
-            key="validation_stratify_columns",
-            help=(
-                "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
-                "before the train/test split is drawn."
-            ),
-        )
-        split_numeric_bins_input = validation_tab.number_input(
-            "Split numeric stratify bins",
-            min_value=2,
-            max_value=50,
-            value=DEFAULT_STRATIFY_NUMERIC_BINS,
-            step=1,
-            format="%d",
-            key="validation_stratify_numeric_bins",
-            disabled=not split_stratify_columns,
-        )
-        split_stratify_columns = normalize_stratify_columns(working_df, split_stratify_columns)
-        split_numeric_bins = safe_int(
-            split_numeric_bins_input,
-            default=DEFAULT_STRATIFY_NUMERIC_BINS,
-            minimum=2,
-        )
-        train_idx, test_idx = train_test_split_indices(
-            working_df,
-            target,
-            test_fraction=float(test_fraction),
-            random_state=int(split_seed),
-            stratify=bool(split_stratify_columns),
-            stratify_columns=split_stratify_columns,
-            stratify_numeric_bins=split_numeric_bins,
-        )
-        df = working_df.loc[train_idx].copy()
-        test_df = working_df.loc[test_idx].copy()
-        data_key = (
-            f"{working_data_key}:train_split:{float(test_fraction):.4f}:"
-            f"{int(split_seed)}:{','.join(split_stratify_columns) or 'random'}:"
-            f"{split_numeric_bins}:{dataframe_fingerprint(df)}"
-        )
-        source_metadata = {
-            **source_metadata,
-            "validation": {
-                "mode": "split_train_data",
-                "test_fraction": float(test_fraction),
-                "random_state": int(split_seed),
-                "stratify_columns": list(split_stratify_columns),
-                "numeric_bins": split_numeric_bins,
-                "source_rows": int(len(working_df)),
-                "train_rows": int(len(df)),
-                "test_rows": int(len(test_df)),
-            },
-        }
-        validation_tab.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
-    elif validation_mode == "Separate data source":
-        test_source_choice = validation_tab.radio(
-            "Test data source",
-            source_options,
-            index=source_options.index("CSV / Excel Upload"),
-            key="test_data_source_choice",
-        )
-        test_source = render_dataframe_source_loader(
-            validation_tab,
-            role="test",
-            source_choice=test_source_choice,
-            query_session=None,
-            checkpoint=None,
-            allow_checkpoint_restore=False,
-            update_query_params=False,
-        )
-        if test_source is not None:
-            missing_test_columns = validate_test_dataframe(test_source.df, target, features)
-            if missing_test_columns:
-                validation_tab.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
-            else:
-                test_df = test_source.df
-                source_metadata = {
-                    **source_metadata,
-                    "validation": {
-                        "mode": "separate_data_source",
-                        "source": test_source.source,
-                        "name": test_source.name,
-                        "data_id": test_source.data_id,
-                        "rows": int(len(test_df)),
-                    },
-                }
-                validation_tab.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
-    else:
-        validation_tab.caption(f"Active train rows: {len(df):,}")
-
+    active_caption = f"Active train rows: {len(df):,}"
     if test_df is not None:
-        missing_test_columns = validate_test_dataframe(test_df, target, features)
-        if missing_test_columns:
-            train_panel.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
-            st.stop()
+        active_caption += f" | Test rows: {len(test_df):,}"
+    train_panel.caption(active_caption)
     validation_guard_enabled = test_df is not None and target_kind == "binary"
+
+    checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
+    checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
+    checkpoint_source_match = checkpoint_data_key == data_key or str(checkpoint_data_key).startswith(f"{data_key}:")
 
     saved_parameters = (
         checkpoint.get("parameters")
@@ -4314,6 +4394,22 @@ def main() -> None:
         format="%d",
         help="Split candidates are scored feature-by-feature in parallel. Thread workers avoid copying the full DataFrame.",
     )
+    split_variable_limit_input = st.sidebar.number_input(
+        "Split ranking variable limit",
+        value=min(
+            max(1, len(features)),
+            safe_int(saved_parameters.get("split_variable_limit"), default=min(50, max(1, len(features))), minimum=1),
+        ),
+        min_value=1,
+        max_value=max(1, len(features)),
+        step=1,
+        format="%d",
+        disabled=not features,
+        help=(
+            "Compute split ranking and optimal tree only on the first N active split variables. "
+            "Use Available split variables order to control which variables are included."
+        ),
+    )
 
     min_leaf = safe_int(min_leaf_input, default=20, minimum=1)
     max_thresholds = safe_int(max_thresholds_input, default=40, minimum=1)
@@ -4321,6 +4417,11 @@ def main() -> None:
     max_categories = safe_int(max_categories_input, default=20, minimum=1)
     max_category_groups = safe_int(max_category_groups_input, default=5, minimum=2)
     parallel_workers = safe_int(parallel_workers_input, default=DEFAULT_PARALLEL_WORKERS, minimum=1)
+    split_variable_limit = min(
+        len(features),
+        safe_int(split_variable_limit_input, default=min(50, max(1, len(features))), minimum=1),
+    ) if features else 0
+    ranking_features = features[:split_variable_limit]
 
     state_key = (data_key, target, TREE_SCHEMA_VERSION)
     if "state_key" not in st.session_state or st.session_state.state_key != state_key:
@@ -4335,6 +4436,7 @@ def main() -> None:
         "max_categories": max_categories,
         "max_category_groups": max_category_groups,
         "parallel_workers": parallel_workers,
+        "split_variable_limit": split_variable_limit,
     }
     saved_auto_parameters = (
         checkpoint.get("auto_parameters")
@@ -4424,13 +4526,13 @@ def main() -> None:
         build_from_root_requested = st.button(
             "Build from root",
             width="stretch",
-            disabled=not features,
+            disabled=not ranking_features,
             help="Clears the current tree and builds the optimal tree from the root node.",
         )
         continue_requested = st.button(
             "Continue from current tree",
             width="stretch",
-            disabled=not features or not has_existing_splits,
+            disabled=not ranking_features or not has_existing_splits,
             help="Keeps the current manual tree and adds optimal splits only to remaining eligible leaves.",
         )
 
@@ -4438,7 +4540,7 @@ def main() -> None:
             split_count = build_optimal_tree(
                 df=df,
                 target=target,
-                features=features,
+                features=ranking_features,
                 test_df=test_df,
                 min_leaf=min_leaf,
                 max_thresholds=max_thresholds,
@@ -4554,12 +4656,13 @@ def main() -> None:
     current = tree[st.session_state.current_node_id]
     summary = node_summary(df, target, current["row_idx"])
     current_row_count = len(current["row_idx"])
-    candidate_features = features
+    candidate_features = ranking_features
     compute_candidates = False
     if current["split"] is None and features:
         train_panel.markdown("**Split ranking**")
         train_panel.caption(
-            f"Split search will rank all {len(candidate_features):,} selected variable(s) on "
+            f"Split search will rank the first {len(candidate_features):,} of {len(features):,} "
+            f"active split variable(s) on "
             f"all {current_row_count:,} row(s) in the selected leaf. Use Data source > Sample "
             "to reduce the working data before building the tree."
         )
@@ -4568,6 +4671,7 @@ def main() -> None:
             key=f"compute_split_ranking::{data_key}::{target}::{current['id']}",
             type="primary",
             width="stretch",
+            disabled=not candidate_features,
             help=(
                 "Scores candidate splits for the selected leaf. Results are cached until scope, parameters, "
                 "target, data, or tree state changes."
@@ -4628,6 +4732,8 @@ def main() -> None:
                 st.success("Pure leaf: target has one class here.")
             elif not features:
                 st.warning("Select at least one feature.")
+            elif not candidate_features:
+                st.warning("Increase Split ranking variable limit to at least 1.")
             else:
                 large_leaf = current_row_count > AUTO_COMPUTE_CANDIDATE_ROWS
                 if not candidate_features:
@@ -4682,32 +4788,6 @@ def main() -> None:
                         full_rows=current_row_count,
                     )
                     st.rerun()
-
-                if not all_candidates and not large_leaf and not has_candidate_cache:
-                    sampled_row_idx = analysis_row_idx(current["row_idx"], candidate_max_rows, df=df, target=target)
-                    with st.spinner(compute_caption):
-                        all_candidates = candidate_splits(
-                            df=df,
-                            target=target,
-                            features=candidate_features,
-                            row_idx=sampled_row_idx,
-                            min_leaf=int(min_leaf),
-                            max_thresholds=int(max_thresholds),
-                            max_categories=int(max_categories),
-                            max_numeric_bins=int(max_numeric_bins),
-                            max_category_groups=int(max_category_groups),
-                            parallel_workers=parallel_workers,
-                        )
-                    store_cached_candidates(
-                        data_key,
-                        target,
-                        current["id"],
-                        candidate_key,
-                        all_candidates,
-                        analyzed_rows=len(sampled_row_idx),
-                        full_rows=current_row_count,
-                    )
-                    has_candidate_cache = True
 
                 if not all_candidates:
                     if has_candidate_cache:

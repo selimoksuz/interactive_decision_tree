@@ -26,6 +26,23 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert at.session_state.filtered_state["state_key"][0].startswith(f"session:{data_id}:")
+    initial_state_key = at.session_state.filtered_state["state_key"]
+    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) == len(df)
+    assert not any(str(key).startswith("candidate_cache::") for key in at.session_state.filtered_state)
+
+    next(radio for radio in at.radio if radio.label == "Test / validation source").set_value("Split train data")
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert at.session_state.filtered_state["state_key"] == initial_state_key
+    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) == len(df)
+
+    next(button for button in at.button if button.label == "Apply data setup").click()
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert at.session_state.filtered_state["state_key"] != initial_state_key
+    assert ":train_split:" in at.session_state.filtered_state["state_key"][0]
+    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) < len(df)
+    assert any(number_input.label == "Split ranking variable limit" for number_input in at.number_input)
 
     next(button for button in at.button if button.label == "Build from root").click()
     at.run(timeout=35)
