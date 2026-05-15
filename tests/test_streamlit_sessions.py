@@ -38,6 +38,13 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     assert at.session_state.filtered_state["state_key"] == initial_state_key
     assert at.session_state.filtered_state[applied_context_key]["features"] == ["age", "income"]
 
+    next(checkbox for checkbox in at.checkbox if checkbox.label == "Use sampled working data").set_value(True)
+    next(number_input for number_input in at.number_input if number_input.label == "Sample rows").set_value(55)
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert at.session_state.filtered_state["state_key"] == initial_state_key
+    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) == len(df)
+
     next(radio for radio in at.radio if radio.label == "Test / validation source").set_value("Split train data")
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
@@ -48,6 +55,7 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert at.session_state.filtered_state["state_key"] != initial_state_key
+    assert ":sample:" in at.session_state.filtered_state["state_key"][0]
     assert ":train_split:" in at.session_state.filtered_state["state_key"][0]
     assert at.session_state.filtered_state[applied_context_key]["features"] == ["age"]
     assert at.session_state.filtered_state[applied_context_key]["split_variable_limit"] == 1
