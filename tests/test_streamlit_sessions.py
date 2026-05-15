@@ -25,6 +25,7 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     at.query_params["work_id"] = work_id
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert not any("Missing Submit Button" in str(warning.value) for warning in at.warning)
     assert at.session_state.filtered_state["state_key"][0].startswith(f"session:{data_id}:")
     initial_state_key = at.session_state.filtered_state["state_key"]
     applied_context_key = "_interactive_tree_applied_data_context"
