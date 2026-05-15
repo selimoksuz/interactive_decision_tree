@@ -64,6 +64,43 @@ def test_analysis_row_idx_stratifies_by_target_when_sampling():
     assert counts == {"bad": 16, "good": 4}
 
 
+def test_analysis_row_idx_stratifies_by_selected_categorical_columns():
+    df = pd.DataFrame(
+        {
+            "segment": ["A"] * 80 + ["B"] * 20,
+            "target": ["bad", "good"] * 50,
+        }
+    )
+
+    sampled = analysis_row_idx(
+        df.index.tolist(),
+        max_rows=20,
+        random_state=7,
+        df=df,
+        stratify_columns=["segment"],
+    )
+    counts = df.loc[sampled, "segment"].value_counts().to_dict()
+
+    assert counts == {"A": 16, "B": 4}
+
+
+def test_analysis_row_idx_bins_numeric_stratify_columns():
+    df = pd.DataFrame({"score": range(100)})
+
+    sampled = analysis_row_idx(
+        df.index.tolist(),
+        max_rows=20,
+        random_state=7,
+        df=df,
+        stratify_columns=["score"],
+        stratify_numeric_bins=4,
+    )
+    bins = pd.qcut(df["score"], q=4, duplicates="drop")
+    sampled_counts = bins.loc[sampled].value_counts().sort_index().tolist()
+
+    assert sampled_counts == [5, 5, 5, 5]
+
+
 def test_train_test_split_indices_stratifies_target():
     df = pd.DataFrame(
         {
@@ -83,6 +120,28 @@ def test_train_test_split_indices_stratifies_target():
     assert len(train_idx) == 80
     assert len(test_idx) == 20
     assert df.loc[test_idx, "risk_flag"].value_counts().to_dict() == {"low": 14, "high": 6}
+
+
+def test_train_test_split_indices_uses_selected_stratify_columns():
+    df = pd.DataFrame(
+        {
+            "segment": ["A"] * 80 + ["B"] * 20,
+            "risk_flag": ["high", "low"] * 50,
+        }
+    )
+
+    train_idx, test_idx = train_test_split_indices(
+        df,
+        target="risk_flag",
+        test_fraction=0.2,
+        random_state=11,
+        stratify=True,
+        stratify_columns=["segment"],
+    )
+
+    assert len(train_idx) == 80
+    assert len(test_idx) == 20
+    assert df.loc[test_idx, "segment"].value_counts().to_dict() == {"A": 16, "B": 4}
 
 
 def test_validate_test_dataframe_requires_target_and_features():

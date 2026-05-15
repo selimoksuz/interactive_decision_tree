@@ -34,8 +34,9 @@ CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
-DEFAULT_CANDIDATE_SAMPLE_ROWS = 50_000
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
+DEFAULT_DATA_SAMPLE_ROWS = 100_000
+DEFAULT_STRATIFY_NUMERIC_BINS = 10
 CANDIDATE_RANDOM_STATE = 20260514
 CHECKPOINT_EMBED_MAX_ROWS = 50_000
 CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -1020,17 +1021,76 @@ def candidate_splits(
     return sorted(candidates, key=lambda x: (-x.information_gain, feature_rank.get(x.feature, 9999), x.label))
 
 
-def analysis_row_idx(
+def normalize_stratify_columns(df: pd.DataFrame, columns: list[str] | None) -> list[str]:
+    if not columns:
+        return []
+    seen: set[str] = set()
+    valid_columns: list[str] = []
+    for column in columns:
+        column_name = str(column)
+        if column_name in df.columns and column_name not in seen:
+            valid_columns.append(column_name)
+            seen.add(column_name)
+    return valid_columns
+
+
+def stratify_label_series(
+    df: pd.DataFrame,
+    row_idx: list[int],
+    columns: list[str],
+    numeric_bins: int = DEFAULT_STRATIFY_NUMERIC_BINS,
+) -> pd.Series | None:
+    stratify_columns = normalize_stratify_columns(df, columns)
+    if not stratify_columns:
+        return None
+
+    labels: list[pd.Series] = []
+    frame = df.loc[row_idx, stratify_columns]
+    bin_count = max(2, int(numeric_bins))
+    for column in stratify_columns:
+        series = frame[column]
+        if pd.api.types.is_numeric_dtype(series):
+            numeric = pd.to_numeric(series, errors="coerce")
+            unique_count = int(numeric.dropna().nunique())
+            if unique_count > 1:
+                try:
+                    binned = pd.qcut(
+                        numeric,
+                        q=min(bin_count, unique_count),
+                        duplicates="drop",
+                    )
+                    label = binned.astype("object").where(binned.notna(), "__MISSING__").astype(str)
+                except ValueError:
+                    label = numeric.astype("object").where(numeric.notna(), "__MISSING__").astype(str)
+            else:
+                label = numeric.astype("object").where(numeric.notna(), "__MISSING__").astype(str)
+        else:
+            label = series.astype("object").where(series.notna(), "__MISSING__").astype(str)
+        labels.append(column + "=" + label)
+
+    combined = labels[0]
+    for label in labels[1:]:
+        combined = combined + "|" + label
+    return combined
+
+
+def stratified_sample_indices(
+    df: pd.DataFrame,
     row_idx: list[int],
     max_rows: int,
     random_state: int = CANDIDATE_RANDOM_STATE,
-    df: pd.DataFrame | None = None,
-    target: str | None = None,
+    stratify_columns: list[str] | None = None,
+    stratify_numeric_bins: int = DEFAULT_STRATIFY_NUMERIC_BINS,
 ) -> list[int]:
     if max_rows <= 0 or len(row_idx) <= max_rows:
         return row_idx
-    if df is not None and target is not None and target in df.columns:
-        labels = df.loc[row_idx, target].astype("object").where(df.loc[row_idx, target].notna(), "__MISSING__")
+    labels = stratify_label_series(
+        df,
+        row_idx,
+        normalize_stratify_columns(df, stratify_columns),
+        numeric_bins=stratify_numeric_bins,
+    )
+    if labels is not None:
         counts = labels.value_counts(dropna=False)
         raw_take = counts / counts.sum() * max_rows
         take = np.floor(raw_take).astype(int)
@@ -1069,25 +1129,61 @@ def analysis_row_idx(
     return sampled.tolist()
 
 
+def analysis_row_idx(
+    row_idx: list[int],
+    max_rows: int,
+    random_state: int = CANDIDATE_RANDOM_STATE,
+    df: pd.DataFrame | None = None,
+    target: str | None = None,
+    stratify_columns: list[str] | None = None,
+    stratify_numeric_bins: int = DEFAULT_STRATIFY_NUMERIC_BINS,
+) -> list[int]:
+    if df is not None:
+        columns = normalize_stratify_columns(df, stratify_columns)
+        if not columns and target is not None:
+            columns = normalize_stratify_columns(df, [target])
+        if columns:
+            return stratified_sample_indices(
+                df=df,
+                row_idx=row_idx,
+                max_rows=max_rows,
+                random_state=random_state,
+                stratify_columns=columns,
+                stratify_numeric_bins=stratify_numeric_bins,
+            )
+
+    if max_rows <= 0 or len(row_idx) <= max_rows:
+        return row_idx
+    index = pd.Index(row_idx)
+    sampled = index.to_series(index=index).sample(n=max_rows, random_state=random_state).sort_index()
+    return sampled.tolist()
+
+
 def train_test_split_indices(
     df: pd.DataFrame,
     target: str,
     test_fraction: float,
     random_state: int = CANDIDATE_RANDOM_STATE,
     stratify: bool = True,
+    stratify_columns: list[str] | None = None,
+    stratify_numeric_bins: int = DEFAULT_STRATIFY_NUMERIC_BINS,
 ) -> tuple[list[int], list[int]]:
     if len(df) < 2:
         return df.index.tolist(), []
     bounded_fraction = min(max(float(test_fraction), 0.01), 0.9)
     test_rows = int(round(len(df) * bounded_fraction))
     test_rows = max(1, min(len(df) - 1, test_rows))
-    if stratify and target in df.columns and infer_target_kind(df[target]) != "regression":
+    columns = normalize_stratify_columns(df, stratify_columns)
+    if stratify and not columns and target in df.columns and infer_target_kind(df[target]) != "regression":
+        columns = [target]
+    if stratify and columns:
         test_idx = analysis_row_idx(
             df.index.tolist(),
             max_rows=test_rows,
             random_state=random_state,
             df=df,
-            target=target,
+            stratify_columns=columns,
+            stratify_numeric_bins=stratify_numeric_bins,
         )
     else:
         index = pd.Index(df.index)
@@ -2160,7 +2256,13 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "validation_source_mode",
         "validation_test_share",
         "validation_split_seed",
-        "validation_stratify_target",
+        "validation_stratify_columns",
+        "validation_stratify_numeric_bins",
+        "data_sample_enabled",
+        "data_sample_rows",
+        "data_sample_seed",
+        "data_sample_stratify_columns",
+        "data_sample_stratify_numeric_bins",
         "test_data_source_choice",
         "train_session_data_id",
         "test_session_data_id",
@@ -3934,14 +4036,120 @@ def main() -> None:
     )
     features = selected_features
     test_df: pd.DataFrame | None = None
-    validation_mode = train_panel.radio(
+    working_df = source_df
+    working_data_key = source_data_key
+    data_sample_tab, validation_tab = train_panel.tabs(["Sample", "Test / validation"])
+
+    default_stratify_columns = [target] if target_kind != "regression" else []
+    if "data_sample_rows" in st.session_state:
+        st.session_state["data_sample_rows"] = min(
+            len(source_df),
+            safe_int(st.session_state["data_sample_rows"], default=len(source_df), minimum=1),
+        )
+    if "data_sample_stratify_columns" in st.session_state:
+        st.session_state["data_sample_stratify_columns"] = normalize_stratify_columns(
+            source_df,
+            st.session_state["data_sample_stratify_columns"],
+        )
+    with data_sample_tab:
+        sample_enabled = st.checkbox(
+            "Use sampled working data",
+            value=False,
+            key="data_sample_enabled",
+            help="Samples the loaded train source before tree building or train/test splitting.",
+        )
+        sample_col1, sample_col2 = st.columns(2)
+        sample_rows_input = sample_col1.number_input(
+            "Sample rows",
+            min_value=1,
+            max_value=max(1, len(source_df)),
+            value=min(len(source_df), DEFAULT_DATA_SAMPLE_ROWS),
+            step=10_000,
+            format="%d",
+            key="data_sample_rows",
+            disabled=not sample_enabled,
+        )
+        sample_seed_input = sample_col2.number_input(
+            "Sample seed",
+            value=CANDIDATE_RANDOM_STATE,
+            step=1,
+            key="data_sample_seed",
+            disabled=not sample_enabled,
+        )
+        sample_stratify_columns = st.multiselect(
+            "Sample stratify columns",
+            options=source_df.columns.tolist(),
+            default=default_stratify_columns,
+            key="data_sample_stratify_columns",
+            disabled=not sample_enabled,
+            help=(
+                "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
+                "before the stratified sample is drawn."
+            ),
+        )
+        sample_numeric_bins_input = st.number_input(
+            "Numeric stratify bins",
+            min_value=2,
+            max_value=50,
+            value=DEFAULT_STRATIFY_NUMERIC_BINS,
+            step=1,
+            format="%d",
+            key="data_sample_stratify_numeric_bins",
+            disabled=not sample_enabled or not sample_stratify_columns,
+        )
+        sample_rows = min(len(source_df), safe_int(sample_rows_input, default=len(source_df), minimum=1))
+        sample_seed = int(sample_seed_input)
+        sample_numeric_bins = safe_int(
+            sample_numeric_bins_input,
+            default=DEFAULT_STRATIFY_NUMERIC_BINS,
+            minimum=2,
+        )
+        sample_stratify_columns = normalize_stratify_columns(source_df, sample_stratify_columns)
+        if sample_enabled and sample_rows < len(source_df):
+            sample_idx = analysis_row_idx(
+                source_df.index.tolist(),
+                max_rows=sample_rows,
+                random_state=sample_seed,
+                df=source_df,
+                stratify_columns=sample_stratify_columns,
+                stratify_numeric_bins=sample_numeric_bins,
+            )
+            working_df = source_df.loc[sample_idx].copy()
+            working_data_key = (
+                f"{source_data_key}:sample:{sample_rows}:{sample_seed}:"
+                f"{','.join(sample_stratify_columns) or 'random'}:{sample_numeric_bins}:"
+                f"{dataframe_fingerprint(working_df)}"
+            )
+            source_metadata = {
+                **source_metadata,
+                "sample": {
+                    "enabled": True,
+                    "source_rows": int(len(source_df)),
+                    "sample_rows": int(len(working_df)),
+                    "random_state": sample_seed,
+                    "stratify_columns": list(sample_stratify_columns),
+                    "numeric_bins": sample_numeric_bins,
+                },
+            }
+            st.caption(
+                f"Sampled working data: {len(working_df):,} / {len(source_df):,} rows "
+                f"using {', '.join(sample_stratify_columns) if sample_stratify_columns else 'random'} strata."
+            )
+        elif sample_enabled:
+            st.caption("Sample rows is greater than or equal to source rows; the full source is used.")
+        else:
+            st.caption("Sampling is off; the full train source is used.")
+
+    df = working_df
+    data_key = working_data_key
+    validation_mode = validation_tab.radio(
         "Test / validation source",
         ["No test data", "Split train data", "Separate data source"],
         key="validation_source_mode",
         help="Train datasini kullan, ayni tabloyu train/test bol veya ayri bir test kaynagi yukle.",
     )
     if validation_mode == "Split train data":
-        split_col1, split_col2 = train_panel.columns(2)
+        split_col1, split_col2 = validation_tab.columns(2)
         test_fraction = split_col1.slider(
             "Test share",
             min_value=0.05,
@@ -3956,24 +4164,52 @@ def main() -> None:
             step=1,
             key="validation_split_seed",
         )
-        stratify_split = train_panel.checkbox(
-            "Stratify by target",
-            value=target_kind != "regression",
-            disabled=target_kind == "regression",
-            key="validation_stratify_target",
+        if "validation_stratify_columns" in st.session_state:
+            st.session_state["validation_stratify_columns"] = normalize_stratify_columns(
+                working_df,
+                st.session_state["validation_stratify_columns"],
+            )
+        split_stratify_columns = validation_tab.multiselect(
+            "Split stratify columns",
+            options=working_df.columns.tolist(),
+            default=default_stratify_columns,
+            key="validation_stratify_columns",
+            help=(
+                "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
+                "before the train/test split is drawn."
+            ),
+        )
+        split_numeric_bins_input = validation_tab.number_input(
+            "Split numeric stratify bins",
+            min_value=2,
+            max_value=50,
+            value=DEFAULT_STRATIFY_NUMERIC_BINS,
+            step=1,
+            format="%d",
+            key="validation_stratify_numeric_bins",
+            disabled=not split_stratify_columns,
+        )
+        split_stratify_columns = normalize_stratify_columns(working_df, split_stratify_columns)
+        split_numeric_bins = safe_int(
+            split_numeric_bins_input,
+            default=DEFAULT_STRATIFY_NUMERIC_BINS,
+            minimum=2,
         )
         train_idx, test_idx = train_test_split_indices(
-            source_df,
+            working_df,
             target,
             test_fraction=float(test_fraction),
             random_state=int(split_seed),
-            stratify=bool(stratify_split),
+            stratify=bool(split_stratify_columns),
+            stratify_columns=split_stratify_columns,
+            stratify_numeric_bins=split_numeric_bins,
         )
-        df = source_df.loc[train_idx].copy()
-        test_df = source_df.loc[test_idx].copy()
+        df = working_df.loc[train_idx].copy()
+        test_df = working_df.loc[test_idx].copy()
         data_key = (
-            f"{source_data_key}:train_split:{float(test_fraction):.4f}:"
-            f"{int(split_seed)}:{dataframe_fingerprint(df)}"
+            f"{working_data_key}:train_split:{float(test_fraction):.4f}:"
+            f"{int(split_seed)}:{','.join(split_stratify_columns) or 'random'}:"
+            f"{split_numeric_bins}:{dataframe_fingerprint(df)}"
         )
         source_metadata = {
             **source_metadata,
@@ -3981,22 +4217,23 @@ def main() -> None:
                 "mode": "split_train_data",
                 "test_fraction": float(test_fraction),
                 "random_state": int(split_seed),
-                "stratify": bool(stratify_split),
-                "source_rows": int(len(source_df)),
+                "stratify_columns": list(split_stratify_columns),
+                "numeric_bins": split_numeric_bins,
+                "source_rows": int(len(working_df)),
                 "train_rows": int(len(df)),
                 "test_rows": int(len(test_df)),
             },
         }
-        train_panel.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
+        validation_tab.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
     elif validation_mode == "Separate data source":
-        test_source_choice = train_panel.radio(
+        test_source_choice = validation_tab.radio(
             "Test data source",
             source_options,
             index=source_options.index("CSV / Excel Upload"),
             key="test_data_source_choice",
         )
         test_source = render_dataframe_source_loader(
-            train_panel,
+            validation_tab,
             role="test",
             source_choice=test_source_choice,
             query_session=None,
@@ -4007,7 +4244,7 @@ def main() -> None:
         if test_source is not None:
             missing_test_columns = validate_test_dataframe(test_source.df, target, features)
             if missing_test_columns:
-                train_panel.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
+                validation_tab.error(f"Test data is missing column(s): {', '.join(missing_test_columns)}")
             else:
                 test_df = test_source.df
                 source_metadata = {
@@ -4020,9 +4257,9 @@ def main() -> None:
                         "rows": int(len(test_df)),
                     },
                 }
-                train_panel.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
+                validation_tab.caption(f"Active train rows: {len(df):,} | Test rows: {len(test_df):,}")
     else:
-        train_panel.caption(f"Active train rows: {len(df):,}")
+        validation_tab.caption(f"Active train rows: {len(df):,}")
 
     if test_df is not None:
         missing_test_columns = validate_test_dataframe(test_df, target, features)
@@ -4151,21 +4388,6 @@ def main() -> None:
                 "Manual split preview and selected-leaf ranking are not filtered by this value."
             ),
         )
-        auto_candidate_rows_input = st.number_input(
-            "Auto tree rows per node search",
-            value=min(
-                len(df),
-                safe_int(saved_auto_parameters.get("candidate_rows"), default=len(df), minimum=1),
-            ),
-            min_value=1,
-            max_value=max(1, len(df)),
-            step=10_000,
-            format="%d",
-            help=(
-                "Only affects Build optimal tree. Default is full data. If you lower it, each leaf search "
-                "uses a target-stratified row sample. Manual selected-leaf ranking uses Advanced split search scope."
-            ),
-        )
         if validation_guard_enabled:
             max_validation_gini_gap_input = st.number_input(
                 "Max Gini gap",
@@ -4186,7 +4408,7 @@ def main() -> None:
         auto_max_depth = safe_int(auto_max_depth_input, default=3, minimum=1)
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
-        auto_candidate_rows = min(len(df), safe_int(auto_candidate_rows_input, default=len(df), minimum=1))
+        auto_candidate_rows = len(df)
         max_validation_gini_gap = safe_float(
             max_validation_gini_gap_input,
             default=DEFAULT_MAX_VALIDATION_GINI_GAP,
@@ -4195,7 +4417,6 @@ def main() -> None:
             "max_depth": auto_max_depth,
             "max_leaves": auto_max_leaves,
             "min_information_gain": auto_min_gain,
-            "candidate_rows": auto_candidate_rows,
             "parallel_workers": parallel_workers,
             "max_validation_gini_gap": max_validation_gini_gap,
         }
@@ -4333,77 +4554,14 @@ def main() -> None:
     current = tree[st.session_state.current_node_id]
     summary = node_summary(df, target, current["row_idx"])
     current_row_count = len(current["row_idx"])
-    candidate_sample_rows = current_row_count
     candidate_features = features
     compute_candidates = False
     if current["split"] is None and features:
-        candidate_sample_key = f"candidate_sample_rows::{data_key}::{target}::{current['id']}"
-        if candidate_sample_key not in st.session_state:
-            st.session_state[candidate_sample_key] = current_row_count
-        candidate_features_key = f"candidate_features::{data_key}::{target}::{current['id']}"
-        if candidate_features_key not in st.session_state:
-            st.session_state[candidate_features_key] = features.copy()
-        st.session_state[candidate_features_key] = [
-            feature for feature in st.session_state[candidate_features_key] if feature in features
-        ]
-        if not st.session_state[candidate_features_key]:
-            st.session_state[candidate_features_key] = features.copy()
-
-        use_all_rows_key = f"candidate_use_all_rows::{data_key}::{target}::{current['id']}"
-        use_all_features_key = f"candidate_use_all_features::{data_key}::{target}::{current['id']}"
-        if use_all_rows_key not in st.session_state:
-            st.session_state[use_all_rows_key] = True
-        if use_all_features_key not in st.session_state:
-            st.session_state[use_all_features_key] = True
-
-        train_panel.markdown("**Advanced split search scope**")
-        use_all_rows = train_panel.checkbox(
-            "Use all rows in selected leaf",
-            key=use_all_rows_key,
-            help=(
-                "Keep this on for full-data ranking. Turn it off only when a selected leaf is too large "
-                "and you need a target-stratified row limit."
-            ),
-        )
-        if use_all_rows:
-            candidate_sample_rows = current_row_count
-            train_panel.caption(f"Row scope: all {current_row_count:,} rows in selected leaf.")
-        else:
-            candidate_sample_rows = train_panel.number_input(
-                "Row limit for split ranking",
-                min_value=1,
-                max_value=max(1, current_row_count),
-                step=10_000,
-                format="%d",
-                key=candidate_sample_key,
-                help=(
-                    "Ranking uses a target-stratified sample at this limit. "
-                    "The chosen split is still applied to the full leaf."
-                ),
-            )
-
-        use_all_features = train_panel.checkbox(
-            "Use all available split variables",
-            key=use_all_features_key,
-            help=(
-                "Keep this on to rank every variable selected above. "
-                "Turn it off only to test a smaller variable subset."
-            ),
-        )
-        if use_all_features:
-            candidate_features = features
-            train_panel.caption(f"Variable scope: all {len(features):,} available split variable(s).")
-        else:
-            candidate_features = train_panel.multiselect(
-                "Variable subset for split ranking",
-                options=features,
-                key=candidate_features_key,
-                help="Only these variables will be scored for the selected leaf.",
-            )
+        train_panel.markdown("**Split ranking**")
         train_panel.caption(
-            f"Split search will rank {len(candidate_features):,} variable(s) on "
-            f"{min(current_row_count, safe_int(candidate_sample_rows, current_row_count)):,} "
-            f"of {current_row_count:,} row(s)."
+            f"Split search will rank all {len(candidate_features):,} selected variable(s) on "
+            f"all {current_row_count:,} row(s) in the selected leaf. Use Data source > Sample "
+            "to reduce the working data before building the tree."
         )
         compute_candidates = train_panel.button(
             "Compute split ranking",
@@ -4416,8 +4574,8 @@ def main() -> None:
             ),
         )
     elif features:
-        train_panel.markdown("**Advanced split search scope**")
-        train_panel.caption("Select a leaf node to adjust split search scope.")
+        train_panel.markdown("**Split ranking**")
+        train_panel.caption("Select a leaf node to compute split ranking.")
 
     with st.expander("Model performance", expanded=True):
         train_metrics = model_metrics(df, target)
@@ -4475,7 +4633,7 @@ def main() -> None:
                 if not candidate_features:
                     st.warning("Select at least one variable for split ranking.")
                     st.stop()
-                candidate_max_rows = min(current_row_count, safe_int(candidate_sample_rows, DEFAULT_CANDIDATE_SAMPLE_ROWS))
+                candidate_max_rows = current_row_count
 
                 candidate_key = candidate_cache_key(
                     data_key=data_key,
@@ -4491,7 +4649,7 @@ def main() -> None:
                 has_candidate_cache = cached_candidates is not None
                 all_candidates = cached_candidates if cached_candidates is not None else []
                 compute_caption = (
-                    f"Compute split ranking on {candidate_max_rows:,} of {current_row_count:,} rows "
+                    f"Compute split ranking on all {current_row_count:,} rows "
                     f"across {len(candidate_features):,} variable(s)."
                 )
                 if large_leaf and not cached_meta:
@@ -4562,7 +4720,7 @@ def main() -> None:
                 analyzed_rows = int(meta.get("analyzed_rows", current_row_count) or current_row_count)
                 if analyzed_rows < current_row_count:
                     st.caption(
-                        f"Split ranking used a target-stratified sample of {analyzed_rows:,} / {current_row_count:,} rows. "
+                        f"Split ranking used {analyzed_rows:,} / {current_row_count:,} rows. "
                         "Applied splits still use the full leaf."
                     )
 
