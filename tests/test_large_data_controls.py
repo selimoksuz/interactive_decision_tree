@@ -389,6 +389,101 @@ def test_build_optimal_tree_skips_validation_unsafe_split():
     assert st.session_state.tree[0]["split"] is None
 
 
+def test_build_optimal_tree_can_continue_from_existing_tree():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "gate": [0, 0, 0, 0, 1, 1, 1, 1],
+            "x": [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high", "low", "low", "high", "high"],
+        }
+    )
+    init_tree(train)
+    manual_candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="gate",
+        split_type="numeric_le",
+        value=0.5,
+        min_leaf=1,
+    )
+    assert manual_candidate is not None
+    split_node(train, 0, manual_candidate, select_first_child=False)
+
+    split_count = build_optimal_tree(
+        df=train,
+        target="risk_flag",
+        features=["x"],
+        test_df=None,
+        min_leaf=1,
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=2,
+        max_category_groups=2,
+        max_depth=2,
+        max_leaves=4,
+        min_information_gain=0.0,
+        candidate_rows=len(train),
+        parallel_workers=1,
+        max_validation_gini_gap=0.1,
+        reset_tree=False,
+    )
+
+    assert split_count == 2
+    assert st.session_state.tree[0]["split"]["feature"] == "gate"
+    assert {
+        node["split"]["feature"]
+        for node in st.session_state.tree.values()
+        if node["id"] != 0 and node.get("split") is not None
+    } == {"x"}
+
+
+def test_build_optimal_tree_reset_true_rebuilds_from_root():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "gate": [0, 0, 0, 0, 1, 1, 1, 1],
+            "x": [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high", "low", "low", "high", "high"],
+        }
+    )
+    init_tree(train)
+    manual_candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="gate",
+        split_type="numeric_le",
+        value=0.5,
+        min_leaf=1,
+    )
+    assert manual_candidate is not None
+    split_node(train, 0, manual_candidate, select_first_child=False)
+
+    split_count = build_optimal_tree(
+        df=train,
+        target="risk_flag",
+        features=["x"],
+        test_df=None,
+        min_leaf=1,
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=2,
+        max_category_groups=2,
+        max_depth=1,
+        max_leaves=2,
+        min_information_gain=0.0,
+        candidate_rows=len(train),
+        parallel_workers=1,
+        max_validation_gini_gap=0.1,
+    )
+
+    assert split_count == 1
+    assert st.session_state.tree[0]["split"]["feature"] == "x"
+    assert len(st.session_state.tree) == 3
+
+
 def test_restore_checkpoint_dataframe_uses_session_snapshot_without_embedded_frame(tmp_path, monkeypatch):
     monkeypatch.setenv("INTERACTIVE_TREE_SESSION_DIR", str(tmp_path))
     df = pd.DataFrame({"age": [30, 40], "risk_flag": [0, 1]})

@@ -1446,8 +1446,12 @@ def build_optimal_tree(
     candidate_rows: int,
     parallel_workers: int,
     max_validation_gini_gap: float,
+    reset_tree: bool = True,
 ) -> int:
-    init_tree(df)
+    if reset_tree or not st.session_state.get("tree"):
+        init_tree(df)
+    else:
+        st.session_state.auto_tree_message = ""
     split_count = 0
     validation_enabled = test_df is not None and infer_target_kind(df[target]) == "binary"
 
@@ -4077,6 +4081,19 @@ def main() -> None:
 
     with st.sidebar.expander("Optimal tree", expanded=True):
         st.caption("These settings are used only when you press Build optimal tree.")
+        has_existing_splits = any(
+            node.get("split") is not None for node in st.session_state.get("tree", {}).values()
+        )
+        continue_existing_tree_input = st.checkbox(
+            "Continue from current tree",
+            value=has_existing_splits
+            and bool(saved_auto_parameters.get("continue_from_current_tree", has_existing_splits)),
+            disabled=not has_existing_splits,
+            help=(
+                "Keeps manual splits already on the canvas and lets Build optimal tree split only the "
+                "remaining eligible leaves. Turn it off to rebuild from root."
+            ),
+        )
         auto_max_depth_input = st.number_input(
             "Max depth",
             value=safe_int(saved_auto_parameters.get("max_depth"), default=3, minimum=1),
@@ -4135,6 +4152,7 @@ def main() -> None:
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
         auto_candidate_rows = min(len(df), safe_int(auto_candidate_rows_input, default=len(df), minimum=1))
+        continue_existing_tree = bool(continue_existing_tree_input) and has_existing_splits
         max_validation_gini_gap = safe_float(
             max_validation_gini_gap_input,
             default=DEFAULT_MAX_VALIDATION_GINI_GAP,
@@ -4146,6 +4164,7 @@ def main() -> None:
             "candidate_rows": auto_candidate_rows,
             "parallel_workers": parallel_workers,
             "max_validation_gini_gap": max_validation_gini_gap,
+            "continue_from_current_tree": continue_existing_tree,
         }
 
         if st.button("Build optimal tree", width="stretch", disabled=not features):
@@ -4165,8 +4184,14 @@ def main() -> None:
                 candidate_rows=auto_candidate_rows,
                 parallel_workers=parallel_workers,
                 max_validation_gini_gap=max_validation_gini_gap,
+                reset_tree=not continue_existing_tree,
             )
-            st.session_state.auto_tree_message = f"Optimal tree built with {split_count} split(s)."
+            if continue_existing_tree:
+                st.session_state.auto_tree_message = (
+                    f"Optimal tree continued from current tree with {split_count} added split(s)."
+                )
+            else:
+                st.session_state.auto_tree_message = f"Optimal tree rebuilt from root with {split_count} split(s)."
             save_and_rerun()
         if st.session_state.get("auto_tree_message"):
             st.caption(st.session_state.auto_tree_message)
