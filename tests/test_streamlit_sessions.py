@@ -27,7 +27,7 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert at.session_state.filtered_state["state_key"][0].startswith(f"session:{data_id}:")
 
-    next(button for button in at.button if button.label == "Build optimal tree").click()
+    next(button for button in at.button if button.label == "Build from root").click()
     at.run(timeout=35)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
     split_count = sum(

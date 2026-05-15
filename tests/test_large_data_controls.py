@@ -23,6 +23,7 @@ from interactive_decision_tree_app import (
     score_split,
     split_node,
     train_test_split_indices,
+    undo_last_split,
     validate_test_dataframe,
 )
 
@@ -438,6 +439,11 @@ def test_build_optimal_tree_can_continue_from_existing_tree():
         if node["id"] != 0 and node.get("split") is not None
     } == {"x"}
 
+    assert undo_last_split() is True
+    assert st.session_state.tree[0]["split"]["feature"] == "gate"
+    assert all(node.get("split") is None for node in st.session_state.tree.values() if node["id"] != 0)
+    assert st.session_state.split_history == [0]
+
 
 def test_build_optimal_tree_reset_true_rebuilds_from_root():
     st.session_state.clear()
@@ -482,6 +488,10 @@ def test_build_optimal_tree_reset_true_rebuilds_from_root():
     assert split_count == 1
     assert st.session_state.tree[0]["split"]["feature"] == "x"
     assert len(st.session_state.tree) == 3
+
+    assert undo_last_split() is True
+    assert st.session_state.tree[0]["split"] is None
+    assert st.session_state.split_history == []
 
 
 def test_restore_checkpoint_dataframe_uses_session_snapshot_without_embedded_frame(tmp_path, monkeypatch):

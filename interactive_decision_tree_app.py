@@ -1225,6 +1225,7 @@ def init_tree(df: pd.DataFrame) -> None:
     st.session_state.next_node_id = 1
     st.session_state.current_node_id = 0
     st.session_state.split_history = []
+    st.session_state.split_action_history = []
     st.session_state.auto_tree_message = ""
 
 
@@ -1309,7 +1310,13 @@ def split_branch_indices(
         raise ValueError(f"Unknown split_type: {candidate.split_type}")
 
 
-def split_node(df: pd.DataFrame, node_id: int, candidate: SplitCandidate, select_first_child: bool = True) -> None:
+def split_node(
+    df: pd.DataFrame,
+    node_id: int,
+    candidate: SplitCandidate,
+    select_first_child: bool = True,
+    record_action: bool = True,
+) -> None:
     node = st.session_state.tree[node_id]
     if node["split"] is not None:
         prune_node(node_id)
@@ -1350,7 +1357,9 @@ def split_node(df: pd.DataFrame, node_id: int, candidate: SplitCandidate, select
             "left": None,
             "right": None,
         }
-    st.session_state.split_history.append(node_id)
+    st.session_state.setdefault("split_history", []).append(node_id)
+    if record_action:
+        st.session_state.setdefault("split_action_history", []).append([node_id])
     st.session_state.current_node_id = child_ids[0] if select_first_child else node_id
 
 
@@ -1387,10 +1396,29 @@ def prune_node(node_id: int) -> None:
         for split_node_id in st.session_state.get("split_history", [])
         if split_node_id not in removed
     ]
+    st.session_state.split_action_history = [
+        kept_action
+        for action in st.session_state.get("split_action_history", [])
+        if (kept_action := [split_node_id for split_node_id in action if split_node_id not in removed])
+    ]
     st.session_state.current_node_id = node_id
 
 
 def undo_last_split() -> bool:
+    while st.session_state.get("split_action_history"):
+        action_history = st.session_state.get("split_action_history", [])
+        node_ids = action_history.pop()
+        st.session_state.split_action_history = action_history
+        undone_node_id: int | None = None
+        for node_id in reversed(node_ids):
+            node = st.session_state.tree.get(node_id)
+            if node is not None and node["split"] is not None:
+                prune_node(node_id)
+                undone_node_id = node_id
+        if undone_node_id is not None:
+            st.session_state.current_node_id = undone_node_id
+            return True
+
     history = st.session_state.get("split_history", [])
     while history:
         node_id = history.pop()
@@ -1453,6 +1481,7 @@ def build_optimal_tree(
     else:
         st.session_state.auto_tree_message = ""
     split_count = 0
+    action_node_ids: list[int] = []
     validation_enabled = test_df is not None and infer_target_kind(df[target]) == "binary"
 
     while True:
@@ -1545,9 +1574,12 @@ def build_optimal_tree(
         if best_node_id is None or best_candidate is None:
             break
 
-        split_node(df, best_node_id, best_candidate, select_first_child=False)
+        split_node(df, best_node_id, best_candidate, select_first_child=False, record_action=False)
+        action_node_ids.append(best_node_id)
         split_count += 1
 
+    if action_node_ids:
+        st.session_state.setdefault("split_action_history", []).append(action_node_ids)
     st.session_state.current_node_id = 0
     st.session_state.tree_zoom = recommended_tree_zoom()
     return split_count
@@ -2086,6 +2118,18 @@ def restore_tree_state_from_checkpoint(
         for node_id in tree_state.get("split_history", [])
         if int(node_id) in tree
     ]
+    raw_action_history = tree_state.get("split_action_history")
+    split_action_history: list[list[int]] = []
+    if isinstance(raw_action_history, list):
+        for action in raw_action_history:
+            if not isinstance(action, list):
+                continue
+            node_ids = [int(node_id) for node_id in action if int(node_id) in tree]
+            if node_ids:
+                split_action_history.append(node_ids)
+    if not split_action_history:
+        split_action_history = [[node_id] for node_id in st.session_state.split_history]
+    st.session_state.split_action_history = split_action_history
     st.session_state.auto_tree_message = str(tree_state.get("auto_tree_message", ""))
     st.session_state.tree_zoom = safe_float(tree_state.get("tree_zoom"), default=recommended_tree_zoom())
     return True
@@ -2190,6 +2234,7 @@ def save_work_checkpoint(
             "next_node_id": json_safe(st.session_state.get("next_node_id", 1)),
             "current_node_id": json_safe(st.session_state.get("current_node_id", 0)),
             "split_history": json_safe(st.session_state.get("split_history", [])),
+            "split_action_history": json_safe(st.session_state.get("split_action_history", [])),
             "auto_tree_message": json_safe(st.session_state.get("auto_tree_message", "")),
             "tree_zoom": json_safe(st.session_state.get("tree_zoom")),
         },
@@ -4084,16 +4129,6 @@ def main() -> None:
         has_existing_splits = any(
             node.get("split") is not None for node in st.session_state.get("tree", {}).values()
         )
-        continue_existing_tree_input = st.checkbox(
-            "Continue from current tree",
-            value=has_existing_splits
-            and bool(saved_auto_parameters.get("continue_from_current_tree", has_existing_splits)),
-            disabled=not has_existing_splits,
-            help=(
-                "Keeps manual splits already on the canvas and lets Build optimal tree split only the "
-                "remaining eligible leaves. Turn it off to rebuild from root."
-            ),
-        )
         auto_max_depth_input = st.number_input(
             "Max depth",
             value=safe_int(saved_auto_parameters.get("max_depth"), default=3, minimum=1),
@@ -4152,7 +4187,6 @@ def main() -> None:
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
         auto_candidate_rows = min(len(df), safe_int(auto_candidate_rows_input, default=len(df), minimum=1))
-        continue_existing_tree = bool(continue_existing_tree_input) and has_existing_splits
         max_validation_gini_gap = safe_float(
             max_validation_gini_gap_input,
             default=DEFAULT_MAX_VALIDATION_GINI_GAP,
@@ -4164,10 +4198,22 @@ def main() -> None:
             "candidate_rows": auto_candidate_rows,
             "parallel_workers": parallel_workers,
             "max_validation_gini_gap": max_validation_gini_gap,
-            "continue_from_current_tree": continue_existing_tree,
         }
 
-        if st.button("Build optimal tree", width="stretch", disabled=not features):
+        build_from_root_requested = st.button(
+            "Build from root",
+            width="stretch",
+            disabled=not features,
+            help="Clears the current tree and builds the optimal tree from the root node.",
+        )
+        continue_requested = st.button(
+            "Continue from current tree",
+            width="stretch",
+            disabled=not features or not has_existing_splits,
+            help="Keeps the current manual tree and adds optimal splits only to remaining eligible leaves.",
+        )
+
+        if build_from_root_requested or continue_requested:
             split_count = build_optimal_tree(
                 df=df,
                 target=target,
@@ -4184,9 +4230,9 @@ def main() -> None:
                 candidate_rows=auto_candidate_rows,
                 parallel_workers=parallel_workers,
                 max_validation_gini_gap=max_validation_gini_gap,
-                reset_tree=not continue_existing_tree,
+                reset_tree=build_from_root_requested,
             )
-            if continue_existing_tree:
+            if continue_requested:
                 st.session_state.auto_tree_message = (
                     f"Optimal tree continued from current tree with {split_count} added split(s)."
                 )
@@ -4221,6 +4267,7 @@ def main() -> None:
                 st.session_state.tree = imported_tree
                 st.session_state.next_node_id = next_node_id
                 st.session_state.split_history = split_history
+                st.session_state.split_action_history = [[node_id] for node_id in split_history]
                 st.session_state.current_node_id = 0
                 st.session_state.tree_zoom = recommended_tree_zoom()
                 st.session_state["_tree_import_message"] = (
@@ -4235,7 +4282,13 @@ def main() -> None:
         clear_candidate_cache(data_key, target)
         save_and_rerun()
 
-    if st.sidebar.button("Undo last split", width="stretch", disabled=not st.session_state.get("split_history")):
+    undo_available = bool(st.session_state.get("split_action_history") or st.session_state.get("split_history"))
+    if st.sidebar.button(
+        "Undo last action",
+        width="stretch",
+        disabled=not undo_available,
+        help="Reverts the last manual split, or all splits added by the last optimal-tree run.",
+    ):
         undo_last_split()
         clear_candidate_cache(data_key, target)
         save_and_rerun()
