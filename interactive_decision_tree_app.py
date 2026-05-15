@@ -1781,6 +1781,7 @@ def data_context_signature(context: dict[str, Any] | None) -> tuple[Any, ...] | 
         str(context.get("target") or ""),
         tuple(str(feature) for feature in context.get("features", []) or []),
         str(context.get("positive_class") or ""),
+        int(context.get("split_variable_limit") or 0),
     )
 
 
@@ -1985,6 +1986,7 @@ def render_sql_source_loader(
     *,
     role: str = "train",
     update_query_params: bool = True,
+    use_form: bool = True,
 ) -> LoadedDataSource | None:
     loaded_key = f"{role}_sql_loaded_source"
     loaded_payload = st.session_state.get(loaded_key)
@@ -2004,24 +2006,36 @@ def render_sql_source_loader(
     if connections:
         connection_mode_options.insert(0, "Saved secret connection")
 
-    with container.form(f"{role}_sql_source_form"):
-        connection_mode = st.selectbox("SQL connection", connection_mode_options, key=f"{role}_sql_connection_mode")
+    def render_sql_controls(control_container: Any) -> tuple[str, str, str, str, bool, int, int]:
+        connection_mode = control_container.selectbox(
+            "SQL connection",
+            connection_mode_options,
+            key=f"{role}_sql_connection_mode",
+        )
         if connection_mode == "Saved secret connection":
-            selected_connection = st.selectbox("Saved connection", sorted(connections), key=f"{role}_sql_saved_connection")
+            selected_connection = control_container.selectbox(
+                "Saved connection",
+                sorted(connections),
+                key=f"{role}_sql_saved_connection",
+            )
             connection_url = connections[selected_connection]
         else:
-            connection_url = st.text_input("SQLAlchemy connection URL", type="password", key=f"{role}_sql_connection_url")
+            connection_url = control_container.text_input(
+                "SQLAlchemy connection URL",
+                type="password",
+                key=f"{role}_sql_connection_url",
+            )
 
-        sql_mode = st.radio("SQL mode", ["Table", "Query"], horizontal=True, key=f"{role}_sql_mode")
+        sql_mode = control_container.radio("SQL mode", ["Table", "Query"], horizontal=True, key=f"{role}_sql_mode")
         table_name = ""
         query_text = ""
         if sql_mode == "Table":
-            table_name = st.text_input("Table name", key=f"{role}_sql_table")
+            table_name = control_container.text_input("Table name", key=f"{role}_sql_table")
         else:
-            query_text = st.text_area("SQL query", height=120, key=f"{role}_sql_query")
+            query_text = control_container.text_area("SQL query", height=120, key=f"{role}_sql_query")
 
-        full_table = st.checkbox("Load full result", value=False, key=f"{role}_sql_full_table")
-        limit_value = st.number_input(
+        full_table = control_container.checkbox("Load full result", value=False, key=f"{role}_sql_full_table")
+        limit_value = control_container.number_input(
             "Row limit",
             value=DEFAULT_SQL_LIMIT,
             min_value=1,
@@ -2030,7 +2044,7 @@ def render_sql_source_loader(
             format="%d",
             key=f"{role}_sql_limit",
         )
-        sample_n_value = st.number_input(
+        sample_n_value = control_container.number_input(
             "Optional sample rows",
             value=0,
             min_value=0,
@@ -2038,7 +2052,15 @@ def render_sql_source_loader(
             format="%d",
             key=f"{role}_sql_sample_n",
         )
-        submitted = st.form_submit_button(f"Load {role} SQL data", width="stretch")
+        return connection_url, sql_mode, table_name, query_text, full_table, int(limit_value), int(sample_n_value)
+
+    if use_form:
+        with container.form(f"{role}_sql_source_form"):
+            connection_url, sql_mode, table_name, query_text, full_table, limit_value, sample_n_value = render_sql_controls(st)
+            submitted = st.form_submit_button(f"Load {role} SQL data", width="stretch")
+    else:
+        connection_url, sql_mode, table_name, query_text, full_table, limit_value, sample_n_value = render_sql_controls(container)
+        submitted = bool(connection_url and (table_name.strip() or query_text.strip()))
 
     if not submitted:
         container.info("Choose a SQL source in the sidebar and load data.")
@@ -2053,16 +2075,16 @@ def render_sql_source_loader(
             connection_url,
             table=table_name.strip() or None,
             query=query_text.strip() or None,
-            limit=None if full_table else int(limit_value),
-            sample_n=int(sample_n_value) or None,
+            limit=None if full_table else limit_value,
+            sample_n=sample_n_value or None,
             full_table=bool(full_table),
         )
         metadata = {
             "sql": {
                 "mode": sql_mode.lower(),
                 "table": table_name.strip() or None,
-                "limit": None if full_table else int(limit_value),
-                "sample_n": int(sample_n_value) or None,
+                "limit": None if full_table else limit_value,
+                "sample_n": sample_n_value or None,
                 "full_table": bool(full_table),
             }
         }
@@ -2099,6 +2121,7 @@ def render_dataframe_source_loader(
     checkpoint: dict[str, Any] | None = None,
     allow_checkpoint_restore: bool = False,
     update_query_params: bool = False,
+    use_sql_form: bool = True,
 ) -> LoadedDataSource | None:
     if source_choice == "Session DataFrame":
         return render_session_source_loader(container, role=role, query_session=query_session)
@@ -2111,7 +2134,12 @@ def render_dataframe_source_loader(
             update_query_params=update_query_params,
         )
     if source_choice == "SQL":
-        return render_sql_source_loader(container, role=role, update_query_params=update_query_params)
+        return render_sql_source_loader(
+            container,
+            role=role,
+            update_query_params=update_query_params,
+            use_form=use_sql_form,
+        )
 
     df = make_demo_data()
     metadata = {"source": "demo", "name": "Demo"}
@@ -3966,6 +3994,7 @@ def main() -> None:
         st.sidebar.warning(f"Autosave failed: {st.session_state['_checkpoint_error']}")
 
     draft_context: dict[str, Any] | None = None
+    apply_clicked = False
     if train_source is None:
         train_panel.info("Configure a draft train source, then click Apply data setup.")
     else:
@@ -3976,14 +4005,15 @@ def main() -> None:
         draft_source_data_key = train_source.data_key
         draft_data_source = train_source.source
         restored_upload = train_source.restored_upload
+        data_setup_form = train_panel.form("data_setup_form", clear_on_submit=False)
 
-        train_panel.caption(
+        data_setup_form.caption(
             f"Draft train source rows: {len(draft_source_df):,} | Columns: {len(draft_source_df.columns):,}"
         )
         if restored_upload and draft_uploaded_name is not None:
-            train_panel.caption(f"Restored uploaded data: {draft_uploaded_name}")
+            data_setup_form.caption(f"Restored uploaded data: {draft_uploaded_name}")
         if draft_source_data_id:
-            train_panel.caption(f"Draft data id: {draft_source_data_id}")
+            data_setup_form.caption(f"Draft data id: {draft_source_data_id}")
 
         checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
         checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
@@ -3991,6 +4021,13 @@ def main() -> None:
             checkpoint_data_key
         ).startswith(f"{draft_source_data_key}:")
         saved_target = checkpoint.get("target") if isinstance(checkpoint, dict) and draft_checkpoint_source_match else None
+        draft_saved_parameters = (
+            checkpoint.get("parameters")
+            if isinstance(checkpoint, dict) and draft_checkpoint_source_match
+            else {}
+        )
+        if not isinstance(draft_saved_parameters, dict):
+            draft_saved_parameters = {}
         source_target = source_metadata_value(draft_source_metadata, "target")
         target_options = draft_source_df.columns.tolist()
         default_target_index = (
@@ -4000,7 +4037,7 @@ def main() -> None:
             default_target_index = target_options.index(saved_target)
         elif source_target in target_options:
             default_target_index = target_options.index(source_target)
-        draft_target = train_panel.selectbox(
+        draft_target = data_setup_form.selectbox(
             "Target",
             options=target_options,
             index=default_target_index,
@@ -4021,7 +4058,7 @@ def main() -> None:
                 preferred=remembered_positive_class,
                 use_session_default=False,
             )
-            draft_positive_class = train_panel.selectbox(
+            draft_positive_class = data_setup_form.selectbox(
                 "Positive class",
                 options=positive_class_options,
                 index=class_option_index(positive_class_options, default_positive_class),
@@ -4044,16 +4081,45 @@ def main() -> None:
             default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
         else:
             default_selected_features = default_features
-        draft_features = train_panel.multiselect(
+        draft_features = data_setup_form.multiselect(
             "Available split variables",
             default_features,
             default=default_selected_features,
         )
+        draft_split_variable_limit_default = min(
+            max(1, len(draft_features)),
+            safe_int(
+                draft_saved_parameters.get("split_variable_limit", min(50, max(1, len(draft_features)))),
+                default=min(50, max(1, len(draft_features))),
+                minimum=1,
+            ),
+        ) if draft_features else 1
+        draft_split_variable_limit_input = data_setup_form.number_input(
+            "Split ranking variable limit",
+            value=draft_split_variable_limit_default,
+            min_value=1,
+            max_value=max(1, len(draft_features)),
+            step=1,
+            format="%d",
+            disabled=not draft_features,
+            help=(
+                "Only the first N active split variables are evaluated for split ranking and optimal tree. "
+                "Set this here, then apply data setup before computing rankings."
+            ),
+        )
+        draft_split_variable_limit = min(
+            len(draft_features),
+            safe_int(
+                draft_split_variable_limit_input,
+                default=min(50, max(1, len(draft_features))),
+                minimum=1,
+            ),
+        ) if draft_features else 0
 
         draft_test_df: pd.DataFrame | None = None
         draft_working_df = draft_source_df
         draft_working_data_key = draft_source_data_key
-        data_sample_tab, validation_tab = train_panel.tabs(["Sample", "Test / validation"])
+        data_sample_tab, validation_tab = data_setup_form.tabs(["Sample", "Test / validation"])
 
         default_stratify_columns = [draft_target] if draft_target_kind != "regression" else []
         with data_sample_tab:
@@ -4244,6 +4310,7 @@ def main() -> None:
                 checkpoint=None,
                 allow_checkpoint_restore=False,
                 update_query_params=False,
+                use_sql_form=False,
             )
             if test_source is not None:
                 missing_test_columns = validate_test_dataframe(test_source.df, draft_target, draft_features)
@@ -4285,15 +4352,16 @@ def main() -> None:
                 "target_kind": draft_target_kind,
                 "features": list(draft_features),
                 "positive_class": draft_positive_class,
+                "split_variable_limit": draft_split_variable_limit,
             }
 
-    apply_clicked = train_panel.button(
-        "Apply data setup",
-        width="stretch",
-        type="primary",
-        disabled=draft_context is None,
-        help="Only after this click does the configured source/sample/test setup become active for the tree.",
-    )
+        apply_clicked = data_setup_form.form_submit_button(
+            "Apply data setup",
+            width="stretch",
+            type="primary",
+            disabled=draft_context is None,
+            help="Only after this click does the configured source/sample/test setup become active for the tree.",
+        )
     if apply_clicked and draft_context is not None:
         st.session_state[APPLIED_DATA_CONTEXT_KEY] = draft_context
         st.session_state["_data_setup_message"] = (
@@ -4394,22 +4462,6 @@ def main() -> None:
         format="%d",
         help="Split candidates are scored feature-by-feature in parallel. Thread workers avoid copying the full DataFrame.",
     )
-    split_variable_limit_input = st.sidebar.number_input(
-        "Split ranking variable limit",
-        value=min(
-            max(1, len(features)),
-            safe_int(saved_parameters.get("split_variable_limit"), default=min(50, max(1, len(features))), minimum=1),
-        ),
-        min_value=1,
-        max_value=max(1, len(features)),
-        step=1,
-        format="%d",
-        disabled=not features,
-        help=(
-            "Compute split ranking and optimal tree only on the first N active split variables. "
-            "Use Available split variables order to control which variables are included."
-        ),
-    )
 
     min_leaf = safe_int(min_leaf_input, default=20, minimum=1)
     max_thresholds = safe_int(max_thresholds_input, default=40, minimum=1)
@@ -4419,7 +4471,7 @@ def main() -> None:
     parallel_workers = safe_int(parallel_workers_input, default=DEFAULT_PARALLEL_WORKERS, minimum=1)
     split_variable_limit = min(
         len(features),
-        safe_int(split_variable_limit_input, default=min(50, max(1, len(features))), minimum=1),
+        safe_int(applied_context.get("split_variable_limit"), default=min(50, max(1, len(features))), minimum=1),
     ) if features else 0
     ranking_features = features[:split_variable_limit]
 
