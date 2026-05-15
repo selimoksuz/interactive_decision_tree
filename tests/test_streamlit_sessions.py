@@ -26,42 +26,41 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert not any("Missing Submit Button" in str(warning.value) for warning in at.warning)
-    assert at.session_state.filtered_state["state_key"][0].startswith(f"session:{data_id}:")
-    initial_state_key = at.session_state.filtered_state["state_key"]
     applied_context_key = "_interactive_tree_applied_data_context"
     assert at.session_state.filtered_state[applied_context_key]["features"] == ["age", "income"]
-    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) == len(df)
+    assert at.session_state.filtered_state.get("state_key") is None
     assert not any(str(key).startswith("candidate_cache::") for key in at.session_state.filtered_state)
 
-    next(multiselect for multiselect in at.multiselect if multiselect.label == "Available split variables").set_value(["age"])
-    at.run(timeout=25)
-    assert len(at.exception) == 0, [exc.value for exc in at.exception]
-    assert at.session_state.filtered_state["state_key"] == initial_state_key
-    assert at.session_state.filtered_state[applied_context_key]["features"] == ["age", "income"]
+    assert any(str(dataframe.key).startswith("feature_manager::") for dataframe in at.dataframe)
+    assert any(number_input.label == "Split ranking variable limit" for number_input in at.number_input)
 
     next(checkbox for checkbox in at.checkbox if checkbox.label == "Use sampled working data").set_value(True)
     next(number_input for number_input in at.number_input if number_input.label == "Sample rows").set_value(55)
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
-    assert at.session_state.filtered_state["state_key"] == initial_state_key
-    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) == len(df)
+    assert at.session_state.filtered_state.get("state_key") is None
 
     next(radio for radio in at.radio if radio.label == "Test / validation source").set_value("Split train data")
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
-    assert at.session_state.filtered_state["state_key"] == initial_state_key
-    assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) == len(df)
+    assert at.session_state.filtered_state.get("state_key") is None
 
     next(button for button in at.button if button.label == "Apply data setup").click()
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
-    assert at.session_state.filtered_state["state_key"] != initial_state_key
+    assert ":sample:" in at.session_state.filtered_state[applied_context_key]["data_key"]
+    assert ":train_split:" in at.session_state.filtered_state[applied_context_key]["data_key"]
+    assert at.session_state.filtered_state[applied_context_key]["features"] == ["age", "income"]
+    assert at.session_state.filtered_state[applied_context_key]["split_variable_limit"] == 2
+    assert at.session_state.filtered_state.get("state_key") is None
+
+    next(radio for radio in at.radio if radio.label == "Workspace").set_value("Tree Builder")
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert at.session_state.filtered_state["state_key"][0].startswith(f"session:{data_id}:")
     assert ":sample:" in at.session_state.filtered_state["state_key"][0]
     assert ":train_split:" in at.session_state.filtered_state["state_key"][0]
-    assert at.session_state.filtered_state[applied_context_key]["features"] == ["age"]
-    assert at.session_state.filtered_state[applied_context_key]["split_variable_limit"] == 1
     assert len(at.session_state.filtered_state["tree"][0]["row_idx"]) < len(df)
-    assert any(number_input.label == "Split ranking variable limit" for number_input in at.number_input)
 
     next(button for button in at.button if button.label == "Build from root").click()
     at.run(timeout=35)

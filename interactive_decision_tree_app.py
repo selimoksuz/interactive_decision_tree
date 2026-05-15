@@ -38,6 +38,7 @@ GRAPH_TOOLTIP_LIMIT = 900
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
 DEFAULT_DATA_SAMPLE_ROWS = 100_000
 DEFAULT_STRATIFY_NUMERIC_BINS = 10
+FEATURE_PROFILE_SAMPLE_ROWS = 10_000
 CANDIDATE_RANDOM_STATE = 20260514
 CHECKPOINT_EMBED_MAX_ROWS = 50_000
 CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -1785,6 +1786,48 @@ def data_context_signature(context: dict[str, Any] | None) -> tuple[Any, ...] | 
     )
 
 
+def feature_kind(series: pd.Series) -> str:
+    if pd.api.types.is_numeric_dtype(series):
+        return "numeric"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "datetime"
+    if pd.api.types.is_bool_dtype(series):
+        return "categorical"
+    if isinstance(series.dtype, pd.CategoricalDtype) or pd.api.types.is_object_dtype(series):
+        return "categorical"
+    return "other"
+
+
+def feature_manager_frame(
+    df: pd.DataFrame,
+    features: list[str],
+    selected_features: list[str],
+    *,
+    sample_rows: int = FEATURE_PROFILE_SAMPLE_ROWS,
+) -> pd.DataFrame:
+    selected = set(map(str, selected_features))
+    profile_n = min(len(df), max(0, sample_rows))
+    sample = df[features].head(profile_n) if features and profile_n else pd.DataFrame(index=[])
+    rows: list[dict[str, Any]] = []
+    for feature in features:
+        series = df[feature]
+        sample_series = sample[feature] if feature in sample.columns else series.head(0)
+        missing_rate = float(sample_series.isna().mean()) if len(sample_series) else 0.0
+        unique_count = int(sample_series.nunique(dropna=True)) if len(sample_series) else 0
+        rows.append(
+            {
+                "include": feature in selected,
+                "variable": str(feature),
+                "kind": feature_kind(series),
+                "dtype": str(series.dtype),
+                "missing_rate_sample": missing_rate,
+                "unique_count_sample": unique_count,
+                "profile_rows": int(profile_n),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def secret_sql_connections() -> dict[str, str]:
     connections: dict[str, str] = {}
 
@@ -2180,6 +2223,149 @@ def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.
     return df, uploaded_name, data_key
 
 
+def loaded_source_from_query_session(
+    query_session: tuple[pd.DataFrame, dict[str, Any], str, str] | None,
+) -> LoadedDataSource | None:
+    if query_session is None:
+        return None
+    df, metadata, source_data_id, data_key = query_session
+    return LoadedDataSource(
+        df=df,
+        name=str(metadata.get("name") or "Session DataFrame"),
+        data_key=data_key,
+        source=str(metadata.get("source") or "session"),
+        data_id=source_data_id,
+        metadata=metadata,
+    )
+
+
+def restore_applied_context_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    query_session: tuple[pd.DataFrame, dict[str, Any], str, str] | None,
+) -> dict[str, Any] | None:
+    if not checkpoint:
+        return None
+    checkpoint_data = checkpoint.get("data")
+    if not isinstance(checkpoint_data, dict):
+        return None
+    checkpoint_data_key = checkpoint_data.get("data_key")
+    if not checkpoint_data_key:
+        return None
+
+    source = loaded_source_from_query_session(query_session)
+    if source is None and checkpoint_data.get("source") == "uploaded":
+        restored_upload = restore_checkpoint_dataframe(checkpoint)
+        if restored_upload is not None:
+            source_df, source_name, source_data_key = restored_upload
+            source = LoadedDataSource(
+                df=source_df,
+                name=source_name,
+                data_key=source_data_key,
+                source="uploaded",
+                data_id=None,
+                metadata=dict(checkpoint_data.get("metadata") or {}),
+                restored_upload=True,
+            )
+    if source is None:
+        return None
+    checkpoint_data_id = normalize_data_id(checkpoint_data.get("data_id"))
+    if checkpoint_data_id is not None and source.data_id is not None and checkpoint_data_id != source.data_id:
+        return None
+
+    target = str(checkpoint.get("target") or source_metadata_value(source.metadata, "target") or "")
+    if not target or target not in source.df.columns:
+        return None
+
+    selected_features = checkpoint.get("selected_features")
+    if isinstance(selected_features, list):
+        features = [
+            str(feature)
+            for feature in selected_features
+            if str(feature) in source.df.columns and str(feature) != target
+        ]
+    else:
+        metadata_features = source_metadata_value(source.metadata, "features")
+        if isinstance(metadata_features, list):
+            features = [
+                str(feature)
+                for feature in metadata_features
+                if str(feature) in source.df.columns and str(feature) != target
+            ]
+        else:
+            features = [str(column) for column in source.df.columns if str(column) != target]
+
+    metadata = dict(source.metadata)
+    checkpoint_metadata = checkpoint_data.get("metadata")
+    if isinstance(checkpoint_metadata, dict):
+        metadata.update(checkpoint_metadata)
+
+    working_df = source.df
+    sample_metadata = metadata.get("sample") if isinstance(metadata, dict) else None
+    if isinstance(sample_metadata, dict) and sample_metadata.get("enabled"):
+        sample_rows = safe_int(sample_metadata.get("sample_rows"), default=len(source.df), minimum=1)
+        sample_rows = min(len(source.df), sample_rows)
+        if sample_rows < len(source.df):
+            sample_idx = analysis_row_idx(
+                source.df.index.tolist(),
+                max_rows=sample_rows,
+                random_state=safe_int(sample_metadata.get("random_state"), default=CANDIDATE_RANDOM_STATE),
+                df=source.df,
+                stratify_columns=normalize_stratify_columns(
+                    source.df,
+                    sample_metadata.get("stratify_columns") or [],
+                ),
+                stratify_numeric_bins=safe_int(
+                    sample_metadata.get("numeric_bins"),
+                    default=DEFAULT_STRATIFY_NUMERIC_BINS,
+                    minimum=2,
+                ),
+            )
+            working_df = source.df.loc[sample_idx].copy()
+
+    active_df = working_df
+    test_df: pd.DataFrame | None = None
+    validation_metadata = metadata.get("validation") if isinstance(metadata, dict) else None
+    if isinstance(validation_metadata, dict) and validation_metadata.get("mode") == "split_train_data":
+        train_idx, test_idx = train_test_split_indices(
+            working_df,
+            target,
+            test_fraction=float(validation_metadata.get("test_fraction", 0.2)),
+            random_state=safe_int(validation_metadata.get("random_state"), default=CANDIDATE_RANDOM_STATE),
+            stratify=bool(validation_metadata.get("stratify_columns")),
+            stratify_columns=normalize_stratify_columns(
+                working_df,
+                validation_metadata.get("stratify_columns") or [],
+            ),
+            stratify_numeric_bins=safe_int(
+                validation_metadata.get("numeric_bins"),
+                default=DEFAULT_STRATIFY_NUMERIC_BINS,
+                minimum=2,
+            ),
+        )
+        active_df = working_df.loc[train_idx].copy()
+        test_df = working_df.loc[test_idx].copy()
+
+    parameters = checkpoint.get("parameters") if isinstance(checkpoint.get("parameters"), dict) else {}
+    return {
+        "df": active_df,
+        "test_df": test_df,
+        "uploaded_name": source.name,
+        "source_metadata": metadata,
+        "source_data_id": source.data_id,
+        "data_key": str(checkpoint_data_key),
+        "data_source": source.source,
+        "target": target,
+        "target_kind": infer_target_kind(active_df[target]),
+        "features": features,
+        "positive_class": checkpoint.get("positive_class"),
+        "split_variable_limit": safe_int(
+            parameters.get("split_variable_limit"),
+            default=max(1, len(features)),
+            minimum=1,
+        ),
+    }
+
+
 def int_or_none(value: Any) -> int | None:
     if value is None:
         return None
@@ -2306,6 +2492,8 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "test_data_source_choice",
         "train_session_data_id",
         "test_session_data_id",
+        "workspace_mode",
+        "feature_include_mode",
     }
     return key.startswith(prefixes) or key in exact_keys
 
@@ -3972,32 +4160,57 @@ def main() -> None:
     elif remembered_source not in source_options:
         st.session_state.pop("data_source_choice", None)
         remembered_source = default_source
-    train_panel = st.sidebar.expander("Data source", expanded=True)
-    source_choice = train_panel.radio(
-        "Train data source",
-        source_options,
-        index=source_options.index(str(remembered_source)),
-        key="data_source_choice",
+    checkpoint_ui_state = checkpoint.get("ui_state") if isinstance(checkpoint, dict) else {}
+    if (
+        st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is None
+        and isinstance(checkpoint_ui_state, dict)
+        and checkpoint_ui_state.get("workspace_mode") == "Tree Builder"
+    ):
+        restored_context = restore_applied_context_from_checkpoint(checkpoint, query_session)
+        if restored_context is not None:
+            st.session_state[APPLIED_DATA_CONTEXT_KEY] = restored_context
+    workspace_options = ["Data Setup", "Tree Builder"]
+    workspace_default = "Tree Builder" if st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is not None else "Data Setup"
+    workspace_mode = st.sidebar.radio(
+        "Workspace",
+        workspace_options,
+        index=workspace_options.index(st.session_state.get("workspace_mode", workspace_default))
+        if st.session_state.get("workspace_mode", workspace_default) in workspace_options
+        else workspace_options.index(workspace_default),
+        key="workspace_mode",
     )
+    show_data_setup = workspace_mode == "Data Setup" or st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is None
 
-    train_source = render_dataframe_source_loader(
-        train_panel,
-        role="train",
-        source_choice=source_choice,
-        query_session=query_session,
-        checkpoint=checkpoint,
-        allow_checkpoint_restore=True,
-        update_query_params=True,
-    )
+    train_source = None
+    if show_data_setup:
+        train_panel = st.sidebar.expander("Data source", expanded=True)
+        source_choice = train_panel.radio(
+            "Train data source",
+            source_options,
+            index=source_options.index(str(remembered_source)),
+            key="data_source_choice",
+        )
+
+        train_source = render_dataframe_source_loader(
+            train_panel,
+            role="train",
+            source_choice=source_choice,
+            query_session=query_session,
+            checkpoint=checkpoint,
+            allow_checkpoint_restore=True,
+            update_query_params=True,
+        )
+    else:
+        train_panel = st.sidebar.expander("Active dataset", expanded=True)
     st.sidebar.caption(f"Autosave work id: {work_id}")
     if st.session_state.get("_checkpoint_error"):
         st.sidebar.warning(f"Autosave failed: {st.session_state['_checkpoint_error']}")
 
     draft_context: dict[str, Any] | None = None
     apply_clicked = False
-    if train_source is None:
+    if show_data_setup and train_source is None:
         train_panel.info("Configure a draft train source, then click Apply data setup.")
-    else:
+    elif show_data_setup:
         draft_source_df = train_source.df
         draft_uploaded_name = train_source.name
         draft_source_metadata = dict(train_source.metadata)
@@ -4005,7 +4218,9 @@ def main() -> None:
         draft_source_data_key = train_source.data_key
         draft_data_source = train_source.source
         restored_upload = train_source.restored_upload
-        data_setup_form = train_panel.form("data_setup_form", clear_on_submit=False)
+        st.subheader("Data setup")
+        st.caption("Configure the active dataset here. Tree rendering and split ranking stay idle on this page.")
+        data_setup_form = st.form("data_setup_form", clear_on_submit=False)
         with data_setup_form:
 
             data_setup_form.caption(
@@ -4082,11 +4297,61 @@ def main() -> None:
                 default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
             else:
                 default_selected_features = default_features
-            draft_features = data_setup_form.multiselect(
-                "Available split variables",
-                default_features,
-                default=default_selected_features,
+            data_setup_form.markdown("**Feature manager**")
+            data_setup_form.caption(
+                f"Profile columns are estimated on the first {min(len(draft_source_df), FEATURE_PROFILE_SAMPLE_ROWS):,} row(s). "
+                "Only included variables are available in Tree Builder."
             )
+            feature_include_mode = data_setup_form.radio(
+                "Feature include mode",
+                ["Use table selection", "Include all", "Numeric only", "Categorical only"],
+                horizontal=True,
+                key="feature_include_mode",
+            )
+            feature_manager = data_setup_form.data_editor(
+                feature_manager_frame(draft_source_df, default_features, default_selected_features),
+                hide_index=True,
+                width="stretch",
+                key=f"feature_manager::{draft_source_data_key}::{draft_target}",
+                disabled=[
+                    "variable",
+                    "kind",
+                    "dtype",
+                    "missing_rate_sample",
+                    "unique_count_sample",
+                    "profile_rows",
+                ],
+                column_config={
+                    "include": st.column_config.CheckboxColumn("include"),
+                    "variable": st.column_config.TextColumn("variable"),
+                    "kind": st.column_config.TextColumn("kind"),
+                    "dtype": st.column_config.TextColumn("dtype"),
+                    "missing_rate_sample": st.column_config.NumberColumn("missing_rate_sample", format="%.4f"),
+                    "unique_count_sample": st.column_config.NumberColumn("unique_count_sample", format="%d"),
+                    "profile_rows": st.column_config.NumberColumn("profile_rows", format="%d"),
+                },
+            )
+            if feature_include_mode == "Include all":
+                draft_features = default_features
+            elif feature_include_mode == "Numeric only":
+                draft_features = [
+                    row["variable"]
+                    for row in feature_manager.to_dict("records")
+                    if row.get("kind") == "numeric"
+                ]
+            elif feature_include_mode == "Categorical only":
+                draft_features = [
+                    row["variable"]
+                    for row in feature_manager.to_dict("records")
+                    if row.get("kind") == "categorical"
+                ]
+            else:
+                draft_features = [
+                    row["variable"]
+                    for row in feature_manager.to_dict("records")
+                    if bool(row.get("include"))
+                ]
+            data_setup_form.caption(f"Staged split variables: {len(draft_features):,} / {len(default_features):,}")
             draft_split_variable_limit_default = min(
                 max(1, len(draft_features)),
                 safe_int(
@@ -4404,6 +4669,31 @@ def main() -> None:
     train_panel.caption(active_caption)
     validation_guard_enabled = test_df is not None and target_kind == "binary"
 
+    if workspace_mode == "Data Setup":
+        st.subheader("Active dataset")
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Train rows", f"{len(df):,}")
+        metric_cols[1].metric("Test rows", f"{len(test_df):,}" if test_df is not None else "0")
+        metric_cols[2].metric("Split variables", f"{len(features):,}")
+        metric_cols[3].metric("Target", target)
+        summary_rows = [
+            {"setting": "data_source", "value": str(data_source)},
+            {"setting": "data_key", "value": str(data_key)},
+            {"setting": "positive_class", "value": str(st.session_state.get(POSITIVE_CLASS_SESSION_KEY))},
+            {"setting": "split_variable_limit", "value": str(applied_context.get("split_variable_limit"))},
+        ]
+        sample_metadata = source_metadata.get("sample") if isinstance(source_metadata, dict) else None
+        validation_metadata = source_metadata.get("validation") if isinstance(source_metadata, dict) else None
+        if sample_metadata:
+            summary_rows.append({"setting": "sample", "value": json.dumps(sample_metadata, default=str)})
+        if validation_metadata:
+            summary_rows.append({"setting": "validation", "value": json.dumps(validation_metadata, default=str)})
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width="stretch")
+        with st.expander("Active split variables", expanded=False):
+            st.dataframe(pd.DataFrame({"variable": features}), hide_index=True, width="stretch")
+        st.info("Switch to Tree Builder when this active dataset is ready for split ranking or tree edits.")
+        st.stop()
+
     checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
     checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
     checkpoint_source_match = checkpoint_data_key == data_key or str(checkpoint_data_key).startswith(f"{data_key}:")
@@ -4710,8 +5000,32 @@ def main() -> None:
             f"all {current_row_count:,} row(s) in the selected leaf. Use Data source > Sample "
             "to reduce the working data before building the tree."
         )
+        sidebar_candidate_key = candidate_cache_key(
+            data_key=data_key,
+            target=target,
+            node_id=current["id"],
+            features=candidate_features,
+            row_count=current_row_count,
+            parameters=parameters,
+            max_rows=current_row_count,
+        )
+        sidebar_cached_meta = cached_candidate_meta(data_key, target, current["id"])
+        sidebar_cached_candidates = get_cached_candidates(
+            data_key,
+            target,
+            current["id"],
+            sidebar_candidate_key,
+        )
+        if sidebar_cached_candidates is not None:
+            analyzed_rows = int(sidebar_cached_meta.get("analyzed_rows", current_row_count) or current_row_count)
+            train_panel.success(
+                f"Cached ranking ready: {len(sidebar_cached_candidates):,} candidate(s), "
+                f"{analyzed_rows:,} row(s)."
+            )
+        elif sidebar_cached_meta:
+            train_panel.caption("Cached ranking exists for another scope; recompute to use current settings.")
         compute_candidates = train_panel.button(
-            "Compute split ranking",
+            "Recompute split ranking" if sidebar_cached_candidates is not None else "Compute split ranking",
             key=f"compute_split_ranking::{data_key}::{target}::{current['id']}",
             type="primary",
             width="stretch",
