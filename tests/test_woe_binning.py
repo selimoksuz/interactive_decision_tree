@@ -11,6 +11,7 @@ from interactive_decision_tree.woe_binning import (
     build_initial_spec,
     evaluate_spec,
     merge_selected_bins,
+    numeric_bin_label,
     parse_special_values,
     set_assigned_woe_from_table,
 )
@@ -55,6 +56,10 @@ def test_apply_numeric_cutpoints_rebuilds_normal_bins():
     normal_labels = [bin_spec["label"] for bin_spec in updated["bins"] if bin_spec["kind"] == "normal"]
 
     assert normal_labels == ["(-inf, 30]", "(30, 50]", "(50, inf)"]
+
+
+def test_numeric_bin_label_avoids_scientific_notation():
+    assert numeric_bin_label(33280.0, 43650.0) == "(33280, 43650]"
 
 
 def test_numeric_table_edits_can_change_shared_boundary_from_lower_or_upper():

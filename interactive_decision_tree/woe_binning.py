@@ -112,9 +112,8 @@ def make_bin_id(index: int) -> str:
 def format_bound(value: float | None, fallback: str) -> str:
     if value is None:
         return fallback
-    if abs(value) >= 1000:
-        return f"{value:,.4g}"
-    return f"{value:.6g}"
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
 
 
 def numeric_bin_label(lower: float | None, upper: float | None) -> str:

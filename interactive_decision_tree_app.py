@@ -2441,7 +2441,8 @@ def restore_tree_state_from_checkpoint(
     tree_state = checkpoint.get("tree_state")
     if not isinstance(tree_state, dict):
         return False
-    if tuple(tree_state.get("state_key", [])) != state_key:
+    checkpoint_state_key = tree_state.get("state_key")
+    if not isinstance(checkpoint_state_key, (list, tuple)) or tuple(checkpoint_state_key) != state_key:
         return False
 
     tree = deserialize_tree(tree_state.get("tree"))

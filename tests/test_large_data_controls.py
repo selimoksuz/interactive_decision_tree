@@ -20,6 +20,7 @@ from interactive_decision_tree_app import (
     model_performance_wide_table,
     restore_checkpoint_dataframe,
     restore_checkpoint_ui_state,
+    restore_tree_state_from_checkpoint,
     score_split,
     split_node,
     train_test_split_indices,
@@ -601,3 +602,20 @@ def test_restore_checkpoint_dataframe_uses_session_snapshot_without_embedded_fra
     pd.testing.assert_frame_equal(restored_df, df)
     assert restored_name == "upload.csv"
     assert restored_key == "uploaded-key"
+
+
+def test_restore_tree_state_ignores_checkpoint_without_tree_state_key():
+    st.session_state.clear()
+    df = pd.DataFrame({"x": [1.0, 2.0], "risk_flag": ["low", "high"]})
+    checkpoint = {
+        "tree_schema_version": 4,
+        "tree_state": {
+            "state_key": None,
+            "tree": {},
+        },
+    }
+
+    restored = restore_tree_state_from_checkpoint(checkpoint, ("data", "risk_flag", 4), df)
+
+    assert restored is False
+    assert "tree" not in st.session_state
