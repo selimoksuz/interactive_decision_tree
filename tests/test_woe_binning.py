@@ -142,5 +142,40 @@ def test_project_export_contains_integrated_mapping():
     assert {variable["name"] for variable in decoded["variables"]} == {"age", "segment"}
 
 
+def test_project_export_filters_by_export_decision_not_manual_status():
+    df = woe_df()
+    age_spec = build_initial_spec(df, "target", "age", 1, WoeBuildConfig(engine="fallback"))
+    segment_spec = build_initial_spec(df, "target", "segment", 1, WoeBuildConfig(engine="fallback"))
+    project = {
+        "data_key": "unit-test",
+        "variables": {
+            "age": {
+                "name": "age",
+                "status": "edited",
+                "export_decision": "include",
+                "original_spec": age_spec,
+                "current_spec": age_spec,
+            },
+            "segment": {
+                "name": "segment",
+                "status": "edited",
+                "export_decision": "exclude",
+                "original_spec": segment_spec,
+                "current_spec": segment_spec,
+            },
+        },
+    }
+
+    included = build_project_export(project, df, None, "target", 1, included_only=True)
+    excluded = build_project_export(project, df, None, "target", 1, excluded_only=True)
+    all_variables = build_project_export(project, df, None, "target", 1)
+
+    assert [variable["name"] for variable in included["variables"]] == ["age"]
+    assert [variable["name"] for variable in excluded["variables"]] == ["segment"]
+    assert {variable["name"] for variable in all_variables["variables"]} == {"age", "segment"}
+    assert included["variables"][0]["mapping_state"] == "auto"
+    assert included["variables"][0]["export_decision"] == "include"
+
+
 def test_parse_special_values_accepts_commas_and_newlines():
     assert parse_special_values("-999, -1\nUNKNOWN") == ["-999", "-1", "UNKNOWN"]

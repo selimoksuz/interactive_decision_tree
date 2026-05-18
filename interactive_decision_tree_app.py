@@ -62,6 +62,7 @@ class SplitCandidate:
     branch_ns: tuple[int, ...]
     branch_entropies: tuple[float, ...]
     label: str
+    missing_policy: str = "right"
 
 
 @dataclass(frozen=True)
@@ -371,6 +372,65 @@ def score_branch_split(
     )
 
 
+def numeric_missing_policies(numeric: pd.Series) -> list[str]:
+    return ["right", "left", "separate"] if numeric.isna().any() else ["right"]
+
+
+def numeric_masks_and_labels(
+    numeric: pd.Series,
+    thresholds: list[float],
+    missing_policy: str = "right",
+) -> list[tuple[pd.Series, str]]:
+    thresholds = sorted({float(threshold) for threshold in thresholds})
+    if not thresholds:
+        return []
+
+    masks_and_labels: list[tuple[pd.Series, str]] = []
+    previous_threshold: float | None = None
+    for threshold in thresholds:
+        if previous_threshold is None:
+            mask = numeric <= threshold
+            branch_label = f"<= {threshold:.6g}"
+        else:
+            mask = (numeric > previous_threshold) & (numeric <= threshold)
+            branch_label = f"> {previous_threshold:.6g} and <= {threshold:.6g}"
+        masks_and_labels.append((mask, branch_label))
+        previous_threshold = threshold
+
+    masks_and_labels.append((numeric > thresholds[-1], f"> {thresholds[-1]:.6g}"))
+    missing = numeric.isna()
+    if missing.any():
+        if missing_policy == "left":
+            mask, label = masks_and_labels[0]
+            masks_and_labels[0] = (mask | missing, f"{label} or missing")
+        elif missing_policy == "separate":
+            masks_and_labels.append((missing, "missing"))
+        else:
+            mask, label = masks_and_labels[-1]
+            masks_and_labels[-1] = (mask | missing, f"{label} or missing")
+    return masks_and_labels
+
+
+def numeric_split_label(
+    feature: str,
+    thresholds: list[float],
+    missing_policy: str = "right",
+    has_missing: bool = False,
+) -> str:
+    thresholds = sorted({float(threshold) for threshold in thresholds})
+    if len(thresholds) == 1:
+        base = f"{feature} <= {thresholds[0]:.6g}"
+    else:
+        base = f"{feature} manual bins: {', '.join(f'{x:.6g}' for x in thresholds)}"
+    if not has_missing:
+        return base
+    if missing_policy == "left":
+        return f"{base} (missing -> first/lower branch)"
+    if missing_policy == "separate":
+        return f"{base} (missing separate)"
+    return f"{base} (missing -> last/upper branch)"
+
+
 def score_split(
     df: pd.DataFrame,
     target: str,
@@ -380,17 +440,14 @@ def score_split(
     value: Any,
     min_leaf: int,
     target_kind: str | None = None,
+    missing_policy: str = "right",
 ) -> SplitCandidate | None:
     frame = df.loc[row_idx, [feature, target]]
 
     if split_type == "numeric_le":
         numeric = pd.to_numeric(frame[feature], errors="coerce")
-        greater_label = f"> {float(value):.6g}" + (" or missing" if numeric.isna().any() else "")
-        masks_and_labels = [
-            (numeric <= float(value), f"<= {float(value):.6g}"),
-            (~(numeric <= float(value)), greater_label),
-        ]
-        label = f"{feature} <= {float(value):.6g}"
+        masks_and_labels = numeric_masks_and_labels(numeric, [float(value)], missing_policy)
+        label = numeric_split_label(feature, [float(value)], missing_policy, has_missing=bool(numeric.isna().any()))
     elif split_type == "category_eq":
         values = frame[feature].astype("object").where(frame[feature].notna(), "__MISSING__")
         masks_and_labels = [
@@ -418,6 +475,7 @@ def score_split(
         branch_ns=branch_ns,
         branch_entropies=branch_entropies,
         label=label,
+        missing_policy=missing_policy if split_type == "numeric_le" else "category_level",
     )
 
 
@@ -429,6 +487,7 @@ def score_numeric_multiway_split(
     bin_count: int,
     min_leaf: int,
     target_kind: str | None = None,
+    missing_policy: str = "right",
 ) -> SplitCandidate | None:
     frame = df.loc[row_idx, [feature, target]]
     numeric = pd.to_numeric(frame[feature], errors="coerce")
@@ -436,29 +495,7 @@ def score_numeric_multiway_split(
     if len(thresholds) != bin_count - 1:
         return None
 
-    masks_and_labels: list[tuple[pd.Series, str]] = []
-    previous_threshold: float | None = None
-    for threshold in thresholds:
-        if previous_threshold is None:
-            mask = numeric <= threshold
-            branch_label = f"<= {threshold:.6g}"
-        else:
-            mask = (numeric > previous_threshold) & (numeric <= threshold)
-            branch_label = f"> {previous_threshold:.6g} and <= {threshold:.6g}"
-        masks_and_labels.append((mask, branch_label))
-        previous_threshold = threshold
-
-    last_threshold = thresholds[-1]
-    masks_and_labels.append((numeric > last_threshold, f"> {last_threshold:.6g}"))
-
-    if numeric.isna().any():
-        non_missing_union = pd.Series(False, index=frame.index)
-        for mask, _ in masks_and_labels:
-            non_missing_union = non_missing_union | mask
-        masks_and_labels[-1] = (
-            masks_and_labels[-1][0] | ~non_missing_union,
-            f"{masks_and_labels[-1][1]} or missing",
-        )
+    masks_and_labels = numeric_masks_and_labels(numeric, thresholds, missing_policy)
 
     scored = score_branch_split(frame, target, masks_and_labels, min_leaf, target_kind or infer_target_kind(df[target]))
     if scored is None:
@@ -476,7 +513,8 @@ def score_numeric_multiway_split(
         branch_labels=branch_labels,
         branch_ns=branch_ns,
         branch_entropies=branch_entropies,
-        label=f"{feature} into {bin_count} bins",
+        label=numeric_split_label(feature, thresholds, missing_policy, has_missing=bool(numeric.isna().any())),
+        missing_policy=missing_policy,
     )
 
 
@@ -639,6 +677,7 @@ def score_numeric_manual_bins(
     feature: str,
     thresholds: list[float],
     min_leaf: int,
+    missing_policy: str = "right",
 ) -> SplitCandidate | None:
     thresholds = sorted({float(x) for x in thresholds})
     if not thresholds:
@@ -646,37 +685,14 @@ def score_numeric_manual_bins(
 
     frame = df.loc[row_idx, [feature, target]]
     numeric = pd.to_numeric(frame[feature], errors="coerce")
-    masks_and_labels: list[tuple[pd.Series, str]] = []
-    previous_threshold: float | None = None
-    covered = pd.Series(False, index=frame.index)
-
-    for threshold in thresholds:
-        if previous_threshold is None:
-            mask = numeric <= threshold
-            branch_label = f"<= {threshold:.6g}"
-        else:
-            mask = (numeric > previous_threshold) & (numeric <= threshold)
-            branch_label = f"> {previous_threshold:.6g} and <= {threshold:.6g}"
-        covered = covered | mask
-        masks_and_labels.append((mask, branch_label))
-        previous_threshold = threshold
-
-    last_mask = numeric > thresholds[-1]
-    if numeric.isna().any():
-        last_mask = last_mask | ~covered
-    last_label = f"> {thresholds[-1]:.6g}" + (" or missing" if numeric.isna().any() else "")
-    masks_and_labels.append((last_mask, last_label))
+    masks_and_labels = numeric_masks_and_labels(numeric, thresholds, missing_policy)
 
     scored = score_branch_split(frame, target, masks_and_labels, min_leaf, infer_target_kind(df[target]))
     if scored is None:
         return None
     parent_impurity, weighted_impurity, branch_labels, branch_ns, branch_entropies = scored
     split_type = "numeric_le" if len(thresholds) == 1 else "numeric_manual_bins"
-    label = (
-        f"{feature} <= {thresholds[0]:.6g}"
-        if len(thresholds) == 1
-        else f"{feature} manual bins: {', '.join(f'{x:.6g}' for x in thresholds)}"
-    )
+    label = numeric_split_label(feature, thresholds, missing_policy, has_missing=bool(numeric.isna().any()))
 
     return SplitCandidate(
         feature=feature,
@@ -690,6 +706,7 @@ def score_numeric_manual_bins(
         branch_ns=branch_ns,
         branch_entropies=branch_entropies,
         label=label,
+        missing_policy=missing_policy,
     )
 
 
@@ -937,31 +954,36 @@ def candidate_splits_for_feature(
     s = df.loc[row_idx, feature]
 
     if pd.api.types.is_numeric_dtype(s):
+        policies = numeric_missing_policies(pd.to_numeric(s, errors="coerce"))
         for threshold in numeric_thresholds(s, max_thresholds):
-            candidate = score_split(
-                df=df,
-                target=target,
-                row_idx=row_idx,
-                feature=feature,
-                split_type="numeric_le",
-                value=threshold,
-                min_leaf=min_leaf,
-                target_kind=target_kind,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
+            for missing_policy in policies:
+                candidate = score_split(
+                    df=df,
+                    target=target,
+                    row_idx=row_idx,
+                    feature=feature,
+                    split_type="numeric_le",
+                    value=threshold,
+                    min_leaf=min_leaf,
+                    target_kind=target_kind,
+                    missing_policy=missing_policy,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
         for bin_count in range(3, max_numeric_bins + 1):
-            candidate = score_numeric_multiway_split(
-                df=df,
-                target=target,
-                row_idx=row_idx,
-                feature=feature,
-                bin_count=bin_count,
-                min_leaf=min_leaf,
-                target_kind=target_kind,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
+            for missing_policy in policies:
+                candidate = score_numeric_multiway_split(
+                    df=df,
+                    target=target,
+                    row_idx=row_idx,
+                    feature=feature,
+                    bin_count=bin_count,
+                    min_leaf=min_leaf,
+                    target_kind=target_kind,
+                    missing_policy=missing_policy,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
     else:
         values = (
             s.astype("object")
@@ -1298,6 +1320,37 @@ def cached_candidate_meta(data_key: str, target: str, node_id: int) -> dict[str,
     return payload if isinstance(payload, dict) else {}
 
 
+def split_ranking_scope_caption(
+    candidate_feature_count: int,
+    total_feature_count: int,
+    selected_node_rows: int,
+    active_train_rows: int,
+) -> str:
+    if selected_node_rows == active_train_rows:
+        row_scope = f"all {active_train_rows:,} active train row(s) in the selected node"
+    else:
+        row_scope = (
+            f"{selected_node_rows:,} row(s) in the selected leaf "
+            f"out of {active_train_rows:,} active train row(s)"
+        )
+    return (
+        f"Split search will rank the first {candidate_feature_count:,} of {total_feature_count:,} "
+        f"active split variable(s) on {row_scope}. Select or reset the root node to rank on the "
+        "full active train data. Use Data Setup > Sample to reduce the active train data before building the tree."
+    )
+
+
+def cached_ranking_ready_message(candidate_count: int, analyzed_rows: int, selected_node_rows: int, active_train_rows: int) -> str:
+    if selected_node_rows == active_train_rows:
+        row_scope = f"{analyzed_rows:,} active train row(s)"
+    else:
+        row_scope = (
+            f"{analyzed_rows:,} selected-leaf row(s) "
+            f"out of {active_train_rows:,} active train row(s)"
+        )
+    return f"Cached ranking ready: {candidate_count:,} candidate(s), {row_scope}."
+
+
 def sync_feature_order(selected_features: list[str], data_key: str, target: str) -> list[str]:
     order_key = (data_key, target)
     if st.session_state.get("feature_order_key") != order_key:
@@ -1363,9 +1416,10 @@ def split_branch_indices(
 
     if candidate.split_type == "numeric_le":
         numeric = pd.to_numeric(frame[candidate.feature], errors="coerce")
+        masks_and_labels = numeric_masks_and_labels(numeric, [float(candidate.value)], candidate.missing_policy)
         return [
-            (candidate.branch_labels[0], frame[numeric <= float(candidate.value)].index.tolist()),
-            (candidate.branch_labels[1], frame[~(numeric <= float(candidate.value))].index.tolist()),
+            (label, frame[mask].index.tolist())
+            for label, (mask, _) in zip(candidate.branch_labels, masks_and_labels)
         ]
     elif candidate.split_type == "category_eq":
         values = frame[candidate.feature].astype("object").where(
@@ -1378,23 +1432,11 @@ def split_branch_indices(
     elif candidate.split_type in ("numeric_bins", "numeric_manual_bins"):
         numeric = pd.to_numeric(frame[candidate.feature], errors="coerce")
         thresholds = list(candidate.value)
-        branches: list[tuple[str, list[int]]] = []
-        previous_threshold: float | None = None
-        covered = pd.Series(False, index=frame.index)
-        for i, threshold in enumerate(thresholds):
-            if previous_threshold is None:
-                mask = numeric <= threshold
-            else:
-                mask = (numeric > previous_threshold) & (numeric <= threshold)
-            covered = covered | mask
-            branches.append((candidate.branch_labels[i], frame[mask].index.tolist()))
-            previous_threshold = threshold
-
-        last_mask = numeric > thresholds[-1]
-        if numeric.isna().any():
-            last_mask = last_mask | ~covered
-        branches.append((candidate.branch_labels[-1], frame[last_mask].index.tolist()))
-        return branches
+        masks_and_labels = numeric_masks_and_labels(numeric, thresholds, candidate.missing_policy)
+        return [
+            (label, frame[mask].index.tolist())
+            for label, (mask, _) in zip(candidate.branch_labels, masks_and_labels)
+        ]
     elif candidate.split_type == "category_multi":
         values = frame[candidate.feature].astype("object").where(
             frame[candidate.feature].notna(), "__MISSING__"
@@ -1463,6 +1505,7 @@ def split_node(
         "branch_labels": list(candidate.branch_labels),
         "information_gain": candidate.information_gain,
         "weighted_entropy": candidate.weighted_entropy,
+        "missing_policy": candidate.missing_policy,
     }
     node["children"] = [
         {"id": child_id, "label": branch_label}
@@ -1764,6 +1807,10 @@ def dataframe_fingerprint(df: pd.DataFrame) -> str:
     except TypeError:
         row_hashes = df.astype(str).to_csv(index=True).encode("utf-8", errors="replace")
     return hashlib.sha256(columns + row_hashes).hexdigest()[:16]
+
+
+def demo_data_key(df: pd.DataFrame) -> str:
+    return f"demo:{len(df)}:{len(df.columns)}:{dataframe_fingerprint(df)}"
 
 
 def uploaded_data_key(uploaded_name: str, df: pd.DataFrame) -> str:
@@ -2216,7 +2263,7 @@ def render_dataframe_source_loader(
     return LoadedDataSource(
         df=df,
         name="Demo",
-        data_key="demo",
+        data_key=demo_data_key(df),
         source="demo",
         data_id=None,
         metadata=metadata,
@@ -2424,6 +2471,7 @@ def deserialize_tree(tree_payload: Any) -> dict[int, dict[str, Any]]:
         if isinstance(split, dict):
             split = dict(split)
             split["branch_labels"] = list(split.get("branch_labels", []))
+            split["missing_policy"] = str(split.get("missing_policy") or "right")
             node["split"] = split
         else:
             node["split"] = None
@@ -2501,6 +2549,7 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "category_groups::",
         "node_features_v2::",
         "manual_thresholds_",
+        "manual_missing_policy_",
         "group_source_",
         "group_values_",
         "group_merge_",
@@ -2623,10 +2672,14 @@ def split_branch_conditions(split: dict[str, Any]) -> list[dict[str, Any]]:
 
     if split_type == "numeric_le":
         threshold = json_safe(value)
-        return [
-            {"feature": feature, "operator": "<=", "threshold": threshold},
-            {"feature": feature, "operator": ">", "threshold": threshold, "includes_missing": True},
+        missing_policy = str(split.get("missing_policy") or "right")
+        conditions = [
+            {"feature": feature, "operator": "<=", "threshold": threshold, "includes_missing": missing_policy == "left"},
+            {"feature": feature, "operator": ">", "threshold": threshold, "includes_missing": missing_policy == "right"},
         ]
+        if missing_policy == "separate":
+            conditions.append({"feature": feature, "operator": "is_missing"})
+        return conditions
 
     if split_type == "category_eq":
         category_value = json_safe(value)
@@ -2637,11 +2690,19 @@ def split_branch_conditions(split: dict[str, Any]) -> list[dict[str, Any]]:
 
     if split_type in ("numeric_bins", "numeric_manual_bins"):
         thresholds = [json_safe(x) for x in value]
+        missing_policy = str(split.get("missing_policy") or "right")
         conditions: list[dict[str, Any]] = []
         previous_threshold: Any | None = None
-        for threshold in thresholds:
+        for index, threshold in enumerate(thresholds):
             if previous_threshold is None:
-                conditions.append({"feature": feature, "operator": "<=", "threshold": threshold})
+                conditions.append(
+                    {
+                        "feature": feature,
+                        "operator": "<=",
+                        "threshold": threshold,
+                        "includes_missing": missing_policy == "left",
+                    }
+                )
             else:
                 conditions.append(
                     {
@@ -2659,9 +2720,11 @@ def split_branch_conditions(split: dict[str, Any]) -> list[dict[str, Any]]:
                 "feature": feature,
                 "operator": ">",
                 "threshold": thresholds[-1],
-                "includes_missing": True,
+                "includes_missing": missing_policy == "right",
             }
         )
+        if missing_policy == "separate":
+            conditions.append({"feature": feature, "operator": "is_missing"})
         return conditions
 
     if split_type == "category_multi":
@@ -2767,6 +2830,7 @@ def export_node(
         "information_gain": json_safe(split["information_gain"]),
         "weighted_impurity": json_safe(split["weighted_entropy"]),
         "branch_count": split["branch_count"],
+        "missing_policy": split.get("missing_policy", "right"),
     }
     out["branches"] = [
         {
@@ -2823,7 +2887,7 @@ def tree_export(
         "runner_contract": {
             "root_node_id": 0,
             "traversal": "Start at root_node_id. If node.is_leaf is true, return node.leaf.prediction. Otherwise evaluate node.branches in order and move to the matching child_node_id.",
-            "missing_values": "Numeric missing values are routed to the final greater-than branch when exported with includes_missing=true. Categorical missing values are represented as __MISSING__.",
+            "missing_values": "Numeric missing routing is stored per split with includes_missing=true or an is_missing branch. Categorical missing values are represented as __MISSING__.",
         },
         "target": target,
         "task": target_kind,
@@ -2893,6 +2957,9 @@ def export_condition_mask(df: pd.DataFrame, row_idx: list[int], condition: dict[
             mask = mask | numeric.isna()
         return mask
 
+    if operator == "is_missing":
+        return series.isna()
+
     values = category_values_for_condition(series)
     if operator == "==":
         return values == condition.get("value")
@@ -2940,6 +3007,20 @@ def split_value_from_export(split: dict[str, Any], branches: list[dict[str, Any]
         return tuple(deduped)
 
     return None
+
+
+def missing_policy_from_export(split_type: str, split: dict[str, Any], branches: list[dict[str, Any]]) -> str:
+    explicit = split.get("missing_policy")
+    if explicit in {"left", "right", "separate"}:
+        return str(explicit)
+    if split_type not in {"numeric_le", "numeric_bins", "numeric_manual_bins"}:
+        return "category_level"
+    conditions = [branch.get("condition") or {} for branch in branches if isinstance(branch, dict)]
+    if any(condition.get("operator") == "is_missing" for condition in conditions):
+        return "separate"
+    if conditions and conditions[0].get("includes_missing"):
+        return "left"
+    return "right"
 
 
 def branch_indices_from_export(
@@ -3064,6 +3145,7 @@ def rebuild_editable_tree_from_export(
             "branch_labels": branch_labels,
             "information_gain": float(split.get("information_gain", 0.0) or 0.0),
             "weighted_entropy": float(split.get("weighted_impurity", split.get("weighted_entropy", 0.0)) or 0.0),
+            "missing_policy": missing_policy_from_export(split_type, split, branches),
         }
         split_history.append(node_id)
 
@@ -3633,6 +3715,7 @@ def manual_numeric_branch_rows(
     row_idx: list[int],
     feature: str,
     thresholds: list[float],
+    missing_policy: str = "right",
 ) -> list[dict[str, Any]]:
     thresholds = sorted({float(x) for x in thresholds})
     if not thresholds:
@@ -3640,26 +3723,10 @@ def manual_numeric_branch_rows(
 
     frame = df.loc[row_idx, [feature]]
     numeric = pd.to_numeric(frame[feature], errors="coerce")
-    rows: list[dict[str, Any]] = []
-    previous_threshold: float | None = None
-    covered = pd.Series(False, index=frame.index)
-
-    for threshold in thresholds:
-        if previous_threshold is None:
-            mask = numeric <= threshold
-            label = f"<= {threshold:.6g}"
-        else:
-            mask = (numeric > previous_threshold) & (numeric <= threshold)
-            label = f"> {previous_threshold:.6g} and <= {threshold:.6g}"
-        covered = covered | mask
-        rows.append({"branch": label, "rows": int(mask.sum())})
-        previous_threshold = threshold
-
-    last_mask = numeric > thresholds[-1]
-    if numeric.isna().any():
-        last_mask = last_mask | ~covered
-    rows.append({"branch": f"> {thresholds[-1]:.6g}", "rows": int(last_mask.sum())})
-    return rows
+    return [
+        {"branch": label, "rows": int(mask.sum())}
+        for mask, label in numeric_masks_and_labels(numeric, thresholds, missing_policy)
+    ]
 
 
 def safe_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -5063,10 +5130,12 @@ def main() -> None:
     if current["split"] is None and features:
         train_panel.markdown("**Split ranking**")
         train_panel.caption(
-            f"Split search will rank the first {len(candidate_features):,} of {len(features):,} "
-            f"active split variable(s) on "
-            f"all {current_row_count:,} row(s) in the selected leaf. Use Data source > Sample "
-            "to reduce the working data before building the tree."
+            split_ranking_scope_caption(
+                candidate_feature_count=len(candidate_features),
+                total_feature_count=len(features),
+                selected_node_rows=current_row_count,
+                active_train_rows=len(df),
+            )
         )
         sidebar_candidate_key = candidate_cache_key(
             data_key=data_key,
@@ -5087,8 +5156,12 @@ def main() -> None:
         if sidebar_cached_candidates is not None:
             analyzed_rows = int(sidebar_cached_meta.get("analyzed_rows", current_row_count) or current_row_count)
             train_panel.success(
-                f"Cached ranking ready: {len(sidebar_cached_candidates):,} candidate(s), "
-                f"{analyzed_rows:,} row(s)."
+                cached_ranking_ready_message(
+                    candidate_count=len(sidebar_cached_candidates),
+                    analyzed_rows=analyzed_rows,
+                    selected_node_rows=current_row_count,
+                    active_train_rows=len(df),
+                )
             )
         elif sidebar_cached_meta:
             train_panel.caption("Cached ranking exists for another scope; recompute to use current settings.")
@@ -5413,22 +5486,64 @@ def main() -> None:
                         placeholder="Example: 42000 or 30000, 60000",
                         key=f"manual_thresholds_{current['id']}_{selected_feature}",
                     )
+                    selected_numeric = pd.to_numeric(selected_series, errors="coerce")
+                    missing_policy_choice = "right"
+                    if selected_numeric.isna().any():
+                        missing_policy_choice = st.selectbox(
+                            "Manual numeric missing routing",
+                            options=["auto", "right", "left", "separate"],
+                            index=0,
+                            key=f"manual_missing_policy_{current['id']}_{selected_feature}",
+                            format_func=lambda value: {
+                                "auto": "Auto best",
+                                "right": "Send missing to upper/right branch",
+                                "left": "Send missing to lower/left branch",
+                                "separate": "Keep missing as separate branch",
+                            }[str(value)],
+                        )
                     if manual_text.strip():
                         try:
                             thresholds = parse_threshold_text(manual_text)
+                            if missing_policy_choice == "auto":
+                                manual_candidates = [
+                                    candidate
+                                    for policy in numeric_missing_policies(selected_numeric)
+                                    for candidate in [
+                                        score_numeric_manual_bins(
+                                            df=df,
+                                            target=target,
+                                            row_idx=current["row_idx"],
+                                            feature=selected_feature,
+                                            thresholds=thresholds,
+                                            min_leaf=int(min_leaf),
+                                            missing_policy=policy,
+                                        )
+                                    ]
+                                    if candidate is not None
+                                ]
+                                manual_candidate = max(
+                                    manual_candidates,
+                                    key=lambda candidate: candidate.information_gain,
+                                    default=None,
+                                )
+                            else:
+                                manual_candidate = score_numeric_manual_bins(
+                                    df=df,
+                                    target=target,
+                                    row_idx=current["row_idx"],
+                                    feature=selected_feature,
+                                    thresholds=thresholds,
+                                    min_leaf=int(min_leaf),
+                                    missing_policy=str(missing_policy_choice),
+                                )
                             branch_rows = manual_numeric_branch_rows(
                                 df,
                                 current["row_idx"],
                                 selected_feature,
                                 thresholds,
-                            )
-                            manual_candidate = score_numeric_manual_bins(
-                                df=df,
-                                target=target,
-                                row_idx=current["row_idx"],
-                                feature=selected_feature,
-                                thresholds=thresholds,
-                                min_leaf=int(min_leaf),
+                                missing_policy=manual_candidate.missing_policy if manual_candidate else str(
+                                    "right" if missing_policy_choice == "auto" else missing_policy_choice
+                                ),
                             )
                             if manual_candidate is None:
                                 low_branches = [

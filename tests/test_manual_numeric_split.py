@@ -24,7 +24,7 @@ def test_manual_numeric_branch_rows_shows_each_manual_bin_count():
         {"branch": "<= 20", "rows": 2},
         {"branch": "> 20 and <= 30", "rows": 1},
         {"branch": "> 30 and <= 40", "rows": 1},
-        {"branch": "> 40", "rows": 2},
+        {"branch": "> 40 or missing", "rows": 2},
     ]
 
 

@@ -87,6 +87,10 @@ def _not_in_matches(condition: dict[str, Any], value: Any) -> bool:
     return not _in_matches(condition, value)
 
 
+def _is_missing_matches(condition: dict[str, Any], value: Any) -> bool:
+    return _is_missing(value)
+
+
 _CONDITION_HANDLERS: dict[str, Callable[[dict[str, Any], Any], bool]] = {
     "<=": _threshold_matches,
     ">": _threshold_matches,
@@ -95,6 +99,7 @@ _CONDITION_HANDLERS: dict[str, Callable[[dict[str, Any], Any], bool]] = {
     "!=": _not_equals_matches,
     "in": _in_matches,
     "not_in": _not_in_matches,
+    "is_missing": _is_missing_matches,
 }
 
 

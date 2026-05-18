@@ -32,6 +32,8 @@ from .woe_export import (
     project_json_bytes,
     project_python_transformer_text,
     project_sql_text,
+    state_export_decision,
+    state_mapping_state,
     variable_state_rows,
 )
 
@@ -77,8 +79,25 @@ def add_edit(state: dict[str, Any], action: str, detail: dict[str, Any] | None =
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
 
-def status_options() -> list[str]:
-    return ["auto", "edited", "approved", "rejected", "needs_review"]
+MAPPING_STATE_LABELS = {
+    "auto": "Auto binning",
+    "edited": "Manual revision",
+}
+
+EXPORT_DECISION_LABELS = {
+    "include": "Included",
+    "exclude": "Excluded",
+}
+
+
+def mark_mapping_edited(state: dict[str, Any], action: str, detail: dict[str, Any] | None = None) -> None:
+    state["status"] = "edited"
+    add_edit(state, action, detail)
+
+
+def set_export_decision(state: dict[str, Any], decision: str) -> None:
+    state["export_decision"] = decision
+    add_edit(state, "set_export_decision", {"export_decision": decision})
 
 
 def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
@@ -172,6 +191,7 @@ def run_initial_binning(
         project.setdefault("variables", {})[variable] = {
             "name": variable,
             "status": "auto",
+            "export_decision": "include",
             "original_spec": copy_spec(spec),
             "current_spec": copy_spec(spec),
             "edits": [
@@ -220,7 +240,12 @@ def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildC
     engine = st.sidebar.selectbox("Binning engine", ["auto", "fallback", "optbinning"], index=0, key="woe_engine")
     missing_separate = st.sidebar.checkbox("Missing as separate bin", value=True, key="woe_missing_separate")
     blank_as_missing = st.sidebar.checkbox("Blank string as missing", value=True, key="woe_blank_as_missing")
-    replace_existing = st.sidebar.checkbox("Replace existing variable specs", value=False, key="woe_replace_existing")
+    replace_existing = st.sidebar.checkbox(
+        "Overwrite existing mappings on rerun",
+        value=False,
+        key="woe_replace_existing",
+        help="When enabled, running initial WOE binning again replaces the stored auto and current mapping for selected variables.",
+    )
     config = WoeBuildConfig(
         max_bins=int(max_bins),
         min_bin_size=float(min_bin_size),
@@ -271,8 +296,42 @@ def render_project_exports(
 ) -> None:
     if not project.get("variables"):
         return
-    export_payload = build_project_export(project, df, test_df, target, positive_class)
-    approved_payload = build_project_export(project, df, test_df, target, positive_class, approved_only=True)
+    scope_options = {
+        "included": {
+            "label": "Included variables",
+            "included_only": True,
+            "excluded_only": False,
+        },
+        "excluded": {
+            "label": "Excluded variables",
+            "included_only": False,
+            "excluded_only": True,
+        },
+        "all": {
+            "label": "All variables",
+            "included_only": False,
+            "excluded_only": False,
+        },
+    }
+    scope_key = st.selectbox(
+        "WOE export scope",
+        options=list(scope_options),
+        index=0,
+        format_func=lambda key: scope_options[str(key)]["label"],
+        help="Applies to JSON, Python transformer and SQL CASE exports. Excel report keeps all variables for audit.",
+    )
+    scope = scope_options[str(scope_key)]
+    export_payload = build_project_export(
+        project,
+        df,
+        test_df,
+        target,
+        positive_class,
+        included_only=bool(scope["included_only"]),
+        excluded_only=bool(scope["excluded_only"]),
+    )
+    if not export_payload.get("variables"):
+        st.warning("Selected export scope contains no variables.")
     export_cols = st.columns(4)
     export_cols[0].download_button(
         "Download WOE JSON",
@@ -297,7 +356,7 @@ def render_project_exports(
     )
     export_cols[3].download_button(
         "Download SQL CASE",
-        data=project_sql_text(approved_payload if approved_payload.get("variables") else export_payload),
+        data=project_sql_text(export_payload),
         file_name="woe_transform.sql",
         mime="text/plain",
         width="stretch",
@@ -372,8 +431,7 @@ def render_special_missing_editor(
             engine=str(config.get("engine", "auto")),
         )
         state["current_spec"] = build_initial_spec(df, target, state["name"], positive_class, new_config)
-        state["status"] = "edited"
-        add_edit(
+        mark_mapping_edited(
             state,
             "apply_special_missing_policy",
             {
@@ -414,8 +472,7 @@ def render_manual_structure_editor(state: dict[str, Any]) -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                state["status"] = "edited"
-                add_edit(state, "merge_selected_bins", {"bin_ids": selected_bins})
+                mark_mapping_edited(state, "merge_selected_bins", {"bin_ids": selected_bins})
                 st.rerun()
 
     if current_spec.get("feature_kind") == "numeric":
@@ -430,8 +487,7 @@ def render_manual_structure_editor(state: dict[str, Any]) -> None:
         col1, _ = st.columns(2)
         if col1.button("Apply cutpoints", width="stretch", key=f"woe_apply_cutpoints::{state['name']}"):
             state["current_spec"] = apply_numeric_cutpoints(current_spec, parse_cutpoints(cutpoint_text))
-            state["status"] = "edited"
-            add_edit(state, "apply_cutpoints", {"cutpoints": parse_cutpoints(cutpoint_text)})
+            mark_mapping_edited(state, "apply_cutpoints", {"cutpoints": parse_cutpoints(cutpoint_text)})
             st.rerun()
     else:
         st.markdown("**Categorical groups**")
@@ -444,8 +500,11 @@ def render_manual_structure_editor(state: dict[str, Any]) -> None:
         )
         if st.button("Apply categorical groups", width="stretch", key=f"woe_apply_groups::{state['name']}"):
             state["current_spec"] = apply_categorical_groups(current_spec, parse_category_groups(groups_text))
-            state["status"] = "edited"
-            add_edit(state, "apply_categorical_groups", {"group_count": len(parse_category_groups(groups_text))})
+            mark_mapping_edited(
+                state,
+                "apply_categorical_groups",
+                {"group_count": len(parse_category_groups(groups_text))},
+            )
             st.rerun()
 
 
@@ -464,17 +523,21 @@ def render_variable_editor(
     default_index = variables.index(remembered) if remembered in variables else 0
     variable = st.selectbox("Variable editor", variables, index=default_index, key=WOE_ACTIVE_VARIABLE_KEY)
     state = project["variables"][variable]
-    status = st.selectbox(
-        "Variable status",
-        status_options(),
-        index=status_options().index(state.get("status", "auto"))
-        if state.get("status", "auto") in status_options()
-        else 0,
-        key=f"woe_status::{variable}",
-    )
-    if status != state.get("status"):
-        state["status"] = status
-        add_edit(state, "status_change", {"status": status})
+    mapping_state = state_mapping_state(state)
+    export_decision = state_export_decision(state)
+    state_cols = st.columns(4)
+    state_cols[0].metric("Mapping state", MAPPING_STATE_LABELS[mapping_state])
+    state_cols[1].metric("Export", EXPORT_DECISION_LABELS[export_decision])
+    if state_cols[2].button("Reset to auto mapping", width="stretch", key=f"woe_reset_original::{variable}"):
+        state["current_spec"] = copy_spec(state["original_spec"])
+        state["status"] = "auto"
+        add_edit(state, "reset_current_to_original")
+        st.rerun()
+    export_button = "Exclude from export" if export_decision == "include" else "Include in export"
+    next_decision = "exclude" if export_decision == "include" else "include"
+    if state_cols[3].button(export_button, width="stretch", key=f"woe_export_decision::{variable}"):
+        set_export_decision(state, next_decision)
+        st.rerun()
 
     reports = evaluate_original_current(
         df,
@@ -541,8 +604,7 @@ def render_variable_editor(
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                state["status"] = "edited"
-                add_edit(state, "apply_table_edits")
+                mark_mapping_edited(state, "apply_table_edits")
                 st.rerun()
 
     with structure_tab:

@@ -8,10 +8,12 @@ from interactive_decision_tree_app import (
     DEFAULT_DEMO_ROWS,
     analysis_row_idx,
     build_optimal_tree,
+    cached_ranking_ready_message,
     candidate_cache_key,
     candidate_splits,
     candidate_validation_stats,
     checkpoint_ui_state,
+    demo_data_key,
     evaluation_model_metrics,
     init_tree,
     leaf_performance_rows,
@@ -22,6 +24,8 @@ from interactive_decision_tree_app import (
     restore_checkpoint_ui_state,
     restore_tree_state_from_checkpoint,
     score_split,
+    split_branch_indices,
+    split_ranking_scope_caption,
     split_node,
     train_test_split_indices,
     undo_last_split,
@@ -37,6 +41,31 @@ def test_demo_data_default_is_large_enough_for_train_test_validation():
     assert (demo["income"] == -999).any()
     assert (demo["region"] == "UNKNOWN").any()
     assert (demo["product"] == "NO_INFO").any()
+    assert demo_data_key(demo).startswith("demo:5000:8:")
+
+
+def test_split_ranking_scope_caption_distinguishes_leaf_from_active_train():
+    message = split_ranking_scope_caption(
+        candidate_feature_count=6,
+        total_feature_count=6,
+        selected_node_rows=500,
+        active_train_rows=5_000,
+    )
+
+    assert "500 row(s) in the selected leaf" in message
+    assert "5,000 active train row(s)" in message
+    assert "full active train data" in message
+
+
+def test_cached_ranking_message_distinguishes_leaf_from_active_train():
+    message = cached_ranking_ready_message(
+        candidate_count=164,
+        analyzed_rows=500,
+        selected_node_rows=500,
+        active_train_rows=5_000,
+    )
+
+    assert message == "Cached ranking ready: 164 candidate(s), 500 selected-leaf row(s) out of 5,000 active train row(s)."
 
 
 def test_analysis_row_idx_samples_stably():
@@ -265,6 +294,80 @@ def test_numeric_split_labels_missing_in_greater_branch():
 
     assert candidate is not None
     assert candidate.branch_labels == ("<= 2.5", "> 2.5 or missing")
+
+
+def test_numeric_split_missing_policy_can_route_left_right_or_separate():
+    df = pd.DataFrame(
+        {
+            "x": [1.0, None, 4.0, 5.0],
+            "risk_flag": ["low", "high", "high", "high"],
+        }
+    )
+
+    left = score_split(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+        missing_policy="left",
+    )
+    right = score_split(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+        missing_policy="right",
+    )
+    separate = score_split(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+        missing_policy="separate",
+    )
+
+    assert left is not None
+    assert right is not None
+    assert separate is not None
+    assert left.branch_labels == ("<= 2.5 or missing", "> 2.5")
+    assert right.branch_labels == ("<= 2.5", "> 2.5 or missing")
+    assert separate.branch_labels == ("<= 2.5", "> 2.5", "missing")
+    assert separate.missing_policy == "separate"
+    assert split_branch_indices(df, df.index.tolist(), separate)[-1] == ("missing", [1])
+
+
+def test_candidate_splits_scores_all_numeric_missing_policies():
+    df = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, None, 4.0, 5.0, None],
+            "risk_flag": ["low", "low", "high", "high", "high", "low"],
+        }
+    )
+
+    candidates = candidate_splits(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        features=["x"],
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=3,
+        max_category_groups=2,
+        min_leaf=1,
+        parallel_workers=1,
+    )
+    policies = {candidate.missing_policy for candidate in candidates if candidate.split_type == "numeric_le"}
+
+    assert {"left", "right", "separate"}.issubset(policies)
 
 
 def test_evaluation_model_metrics_scores_test_dataframe():

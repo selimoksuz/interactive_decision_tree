@@ -41,3 +41,7 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     assert len(projects) == 1
     project = next(iter(projects.values()))
     assert set(project["variables"]) == {"age", "income"}
+    assert all(selectbox.label != "Variable status" for selectbox in at.selectbox)
+    assert any(button.label == "Reset to auto mapping" for button in at.button)
+    assert any(button.label == "Exclude from export" for button in at.button)
+    assert not any(button.label == "Approve mapping" for button in at.button)

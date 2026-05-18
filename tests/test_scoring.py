@@ -129,6 +129,8 @@ def test_compile_tree_scorer_matches_public_scoring():
         ({"feature": "x", "operator": "in", "values": ["A", "B"]}, {"x": "B"}, True),
         ({"feature": "x", "operator": "not_in", "values": ["A", "B"]}, {"x": "C"}, True),
         ({"feature": "x", "operator": ">", "threshold": 10, "includes_missing": True}, {"x": None}, True),
+        ({"feature": "x", "operator": "is_missing"}, {"x": None}, True),
+        ({"feature": "x", "operator": "is_missing"}, {"x": 7}, False),
     ],
 )
 def test_condition_matches_operator_helpers(condition, row, expected):

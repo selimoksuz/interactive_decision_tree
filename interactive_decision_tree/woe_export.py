@@ -20,6 +20,23 @@ def safe_json(value: Any) -> Any:
     return json_safe_value(value)
 
 
+def state_mapping_state(state: dict[str, Any]) -> str:
+    current_spec = state.get("current_spec")
+    original_spec = state.get("original_spec")
+    if isinstance(current_spec, dict) and isinstance(original_spec, dict) and current_spec == original_spec:
+        return "auto"
+    return "edited"
+
+
+def state_export_decision(state: dict[str, Any]) -> str:
+    decision = str(state.get("export_decision", "")).lower()
+    if decision in {"include", "exclude"}:
+        return decision
+    if str(state.get("status", "")).lower() == "rejected":
+        return "exclude"
+    return "include"
+
+
 def variable_state_rows(
     project: dict[str, Any],
     train_df: pd.DataFrame,
@@ -38,7 +55,8 @@ def variable_state_rows(
         row = {
             "variable": variable,
             "type": current_spec.get("feature_kind"),
-            "status": state.get("status", "auto"),
+            "mapping_state": state_mapping_state(state),
+            "export_decision": state_export_decision(state),
             "engine": current_train.get("engine_used"),
             "original_iv": original_train.get("export_iv"),
             "current_iv": current_train.get("export_iv"),
@@ -134,6 +152,8 @@ def export_variable_payload(
     return {
         "name": state.get("name") or current_spec.get("feature"),
         "type": current_spec.get("feature_kind"),
+        "mapping_state": state_mapping_state(state),
+        "export_decision": state_export_decision(state),
         "status": state.get("status", "auto"),
         "metrics": safe_json(metrics),
         "config": safe_json(current_spec.get("config", {})),
@@ -148,10 +168,24 @@ def build_project_export(
     target: str,
     positive_class: Any,
     approved_only: bool = False,
+    include_statuses: set[str] | None = None,
+    exclude_statuses: set[str] | None = None,
+    included_only: bool = False,
+    excluded_only: bool = False,
 ) -> dict[str, Any]:
     variables: list[dict[str, Any]] = []
     for state in sorted(project.get("variables", {}).values(), key=lambda item: item.get("name", "")):
-        if approved_only and state.get("status") != "approved":
+        status = str(state.get("status", "auto"))
+        included = state_export_decision(state) == "include"
+        if approved_only and status != "approved":
+            continue
+        if include_statuses is not None and status not in include_statuses:
+            continue
+        if exclude_statuses is not None and status in exclude_statuses:
+            continue
+        if included_only and not included:
+            continue
+        if excluded_only and included:
             continue
         payload = export_variable_payload(state, train_df, target, positive_class)
         if payload is not None:
