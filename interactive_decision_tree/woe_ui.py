@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,6 +42,57 @@ from .woe_export import (
 
 WOE_PROJECTS_KEY = "_interactive_tree_woe_projects"
 WOE_ACTIVE_VARIABLE_KEY = "_interactive_tree_woe_active_variable"
+WOE_SUMMARY_CACHE_KEY = "_interactive_tree_woe_summary_cache"
+WOE_REPORT_CACHE_KEY = "_interactive_tree_woe_report_cache"
+
+
+def session_cache(key: str) -> dict[Any, Any]:
+    cache = st.session_state.setdefault(key, {})
+    if not isinstance(cache, dict):
+        st.session_state[key] = {}
+        cache = st.session_state[key]
+    return cache
+
+
+def bounded_cache_set(cache: dict[Any, Any], key: Any, value: Any, max_items: int = 32) -> None:
+    if len(cache) >= max_items and key not in cache:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
+
+
+def spec_signature(spec: dict[str, Any] | None) -> str:
+    if not isinstance(spec, dict):
+        return ""
+    raw = json.dumps(spec, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def project_signature(project: dict[str, Any]) -> str:
+    payload = []
+    for variable, state in sorted(project.get("variables", {}).items()):
+        payload.append(
+            {
+                "variable": str(variable),
+                "status": str(state.get("status", "")),
+                "export_decision": state_export_decision(state),
+                "updated_at": str(state.get("updated_at", "")),
+                "original": spec_signature(state.get("original_spec")),
+                "current": spec_signature(state.get("current_spec")),
+            }
+        )
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def data_signature(df: pd.DataFrame, test_df: pd.DataFrame | None, target: str, positive_class: Any) -> tuple[Any, ...]:
+    return (
+        id(df),
+        int(len(df)),
+        id(test_df) if test_df is not None else None,
+        int(len(test_df)) if test_df is not None else 0,
+        str(target),
+        str(positive_class),
+    )
 
 
 def woe_project_key(data_key: str, target: str, positive_class: Any) -> str:
@@ -258,6 +310,99 @@ def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildC
     return list(selected_variables), config, bool(replace_existing)
 
 
+def cached_variable_state_rows(
+    project: dict[str, Any],
+    df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    positive_class: Any,
+) -> pd.DataFrame:
+    cache = session_cache(WOE_SUMMARY_CACHE_KEY)
+    key = (
+        str(project.get("project_key")),
+        data_signature(df, test_df, target, positive_class),
+        project_signature(project),
+    )
+    if key not in cache:
+        bounded_cache_set(
+            cache,
+            key,
+            variable_state_rows(project, df, test_df, target, positive_class),
+            max_items=16,
+        )
+    return cache[key].copy()
+
+
+def cached_evaluate_original_current(
+    project: dict[str, Any],
+    state: dict[str, Any],
+    df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    positive_class: Any,
+) -> dict[str, Any]:
+    cache = session_cache(WOE_REPORT_CACHE_KEY)
+    key = (
+        str(project.get("project_key")),
+        str(state.get("name")),
+        data_signature(df, test_df, target, positive_class),
+        str(state.get("status", "")),
+        str(state.get("export_decision", "")),
+        str(state.get("updated_at", "")),
+        spec_signature(state.get("original_spec")),
+        spec_signature(state.get("current_spec")),
+    )
+    if key not in cache:
+        bounded_cache_set(
+            cache,
+            key,
+            evaluate_original_current(
+                df,
+                test_df,
+                target,
+                state["original_spec"],
+                state["current_spec"],
+                positive_class,
+            ),
+            max_items=32,
+        )
+    return cache[key]
+
+
+def cached_special_missing_preview(
+    state: dict[str, Any],
+    df: pd.DataFrame,
+    blank_as_missing: bool,
+    special_values: list[str],
+) -> pd.DataFrame:
+    cache = session_cache(WOE_REPORT_CACHE_KEY)
+    key = (
+        "special_missing_preview",
+        id(df),
+        int(len(df)),
+        str(state.get("name")),
+        bool(blank_as_missing),
+        tuple(str(value) for value in special_values),
+    )
+    if key not in cache:
+        feature_series = df[state["name"]]
+        missing_preview = missing_mask(feature_series, bool(blank_as_missing))
+        special_preview = special_mask(feature_series, special_values) & ~missing_preview
+        preview = pd.DataFrame(
+            [
+                {"bucket": "missing", "rows": int(missing_preview.sum()), "share": float(missing_preview.mean())},
+                {"bucket": "special", "rows": int(special_preview.sum()), "share": float(special_preview.mean())},
+                {
+                    "bucket": "normal",
+                    "rows": int((~missing_preview & ~special_preview).sum()),
+                    "share": float((~missing_preview & ~special_preview).mean()),
+                },
+            ]
+        )
+        bounded_cache_set(cache, key, preview, max_items=32)
+    return cache[key].copy()
+
+
 def render_catalog(
     project: dict[str, Any],
     df: pd.DataFrame,
@@ -265,7 +410,7 @@ def render_catalog(
     target: str,
     positive_class: Any,
 ) -> pd.DataFrame:
-    summary = variable_state_rows(project, df, test_df, target, positive_class)
+    summary = cached_variable_state_rows(project, df, test_df, target, positive_class)
     st.subheader("WOE variable catalog")
     if summary.empty:
         st.info("Run initial WOE binning to create variable mappings.")
@@ -297,53 +442,42 @@ def render_project_exports(
 ) -> None:
     if not project.get("variables"):
         return
-    scope_options = {
-        "included": {
-            "label": "Included variables",
-            "included_only": True,
-            "excluded_only": False,
-        },
-        "excluded": {
-            "label": "Excluded variables",
-            "included_only": False,
-            "excluded_only": True,
-        },
-        "all": {
-            "label": "All variables",
-            "included_only": False,
-            "excluded_only": False,
-        },
-    }
-    scope_key = st.selectbox(
-        "WOE export scope",
-        options=list(scope_options),
-        index=0,
-        format_func=lambda key: scope_options[str(key)]["label"],
-        help="Applies to every WOE export download shown below.",
-    )
-    scope = scope_options[str(scope_key)]
-    export_payload = build_project_export(
-        project,
-        df,
-        test_df,
-        target,
-        positive_class,
-        included_only=bool(scope["included_only"]),
-        excluded_only=bool(scope["excluded_only"]),
-    )
-    if not export_payload.get("variables"):
-        st.warning("Selected export scope contains no variables.")
-    export_cols = st.columns(4)
-    export_cols[0].download_button(
-        "Download WOE JSON",
-        data=project_json_bytes(export_payload),
-        file_name="interactive_woe_mapping.json",
-        mime="application/json",
-        width="stretch",
-    )
-    export_cols[1].download_button(
-        "Download WOE Excel",
-        data=project_excel_bytes(
+    with st.expander("Project exports", expanded=False):
+        scope_options = {
+            "included": {
+                "label": "Included variables",
+                "included_only": True,
+                "excluded_only": False,
+            },
+            "excluded": {
+                "label": "Excluded variables",
+                "included_only": False,
+                "excluded_only": True,
+            },
+            "all": {
+                "label": "All variables",
+                "included_only": False,
+                "excluded_only": False,
+            },
+        }
+        scope_key = st.selectbox(
+            "WOE export scope",
+            options=list(scope_options),
+            index=0,
+            format_func=lambda key: scope_options[str(key)]["label"],
+            help="Applies to every WOE export download shown below.",
+        )
+        prepare_exports = st.checkbox(
+            "Prepare export downloads",
+            value=False,
+            key=f"woe_prepare_exports::{project.get('project_key')}",
+            help="Large data exports recalculate bin metrics, so prepare them only when you are ready to download.",
+        )
+        if not prepare_exports:
+            st.caption("Downloads are not prepared on every UI rerun. Enable this only at export time.")
+            return
+        scope = scope_options[str(scope_key)]
+        export_payload = build_project_export(
             project,
             df,
             test_df,
@@ -351,25 +485,46 @@ def render_project_exports(
             positive_class,
             included_only=bool(scope["included_only"]),
             excluded_only=bool(scope["excluded_only"]),
-        ),
-        file_name="interactive_woe_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
-    )
-    export_cols[2].download_button(
-        "Download WOE cache PKL",
-        data=project_pickle_bytes(export_payload),
-        file_name="interactive_woe_cache.pkl",
-        mime="application/octet-stream",
-        width="stretch",
-    )
-    export_cols[3].download_button(
-        "Download SQL CASE",
-        data=project_sql_text(export_payload),
-        file_name="woe_transform.sql",
-        mime="text/plain",
-        width="stretch",
-    )
+        )
+        if not export_payload.get("variables"):
+            st.warning("Selected export scope contains no variables.")
+        export_cols = st.columns(4)
+        export_cols[0].download_button(
+            "Download WOE JSON",
+            data=project_json_bytes(export_payload),
+            file_name="interactive_woe_mapping.json",
+            mime="application/json",
+            width="stretch",
+        )
+        export_cols[1].download_button(
+            "Download WOE Excel",
+            data=project_excel_bytes(
+                project,
+                df,
+                test_df,
+                target,
+                positive_class,
+                included_only=bool(scope["included_only"]),
+                excluded_only=bool(scope["excluded_only"]),
+            ),
+            file_name="interactive_woe_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+        export_cols[2].download_button(
+            "Download WOE cache PKL",
+            data=project_pickle_bytes(export_payload),
+            file_name="interactive_woe_cache.pkl",
+            mime="application/octet-stream",
+            width="stretch",
+        )
+        export_cols[3].download_button(
+            "Download SQL CASE",
+            data=project_sql_text(export_payload),
+            file_name="woe_transform.sql",
+            mime="text/plain",
+            width="stretch",
+        )
 
 
 def _sort_metric(value: Any) -> float | None:
@@ -382,16 +537,19 @@ def _sort_metric(value: Any) -> float | None:
 
 def variable_editor_order(
     project: dict[str, Any],
-    df: pd.DataFrame,
-    test_df: pd.DataFrame | None,
-    target: str,
-    positive_class: Any,
+    summary: pd.DataFrame | None = None,
+    *legacy_args: Any,
 ) -> list[str]:
     variables = sorted(project.get("variables", {}))
     if not variables:
         return []
-    summary = variable_state_rows(project, df, test_df, target, positive_class)
-    if summary.empty or "variable" not in summary.columns:
+    if legacy_args:
+        df = summary
+        if isinstance(df, pd.DataFrame) and len(legacy_args) >= 3:
+            summary = variable_state_rows(project, df, legacy_args[0], legacy_args[1], legacy_args[2])
+        else:
+            summary = None
+    if summary is None or summary.empty or "variable" not in summary.columns:
         return variables
     metric_by_variable = {str(row["variable"]): row for row in summary.to_dict("records")}
 
@@ -444,20 +602,7 @@ def render_special_missing_editor(
         key=f"woe_protected_special::{state['name']}",
     )
     special_values = parse_special_values(special_values_text)
-    feature_series = df[state["name"]]
-    missing_preview = missing_mask(feature_series, bool(blank_as_missing))
-    special_preview = special_mask(feature_series, special_values) & ~missing_preview
-    preview = pd.DataFrame(
-        [
-            {"bucket": "missing", "rows": int(missing_preview.sum()), "share": float(missing_preview.mean())},
-            {"bucket": "special", "rows": int(special_preview.sum()), "share": float(special_preview.mean())},
-            {
-                "bucket": "normal",
-                "rows": int((~missing_preview & ~special_preview).sum()),
-                "share": float((~missing_preview & ~special_preview).mean()),
-            },
-        ]
-    )
+    preview = cached_special_missing_preview(state, df, bool(blank_as_missing), special_values)
     st.dataframe(
         preview,
         hide_index=True,
@@ -559,8 +704,9 @@ def render_variable_editor(
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
+    summary: pd.DataFrame | None = None,
 ) -> None:
-    variables = variable_editor_order(project, df, test_df, target, positive_class)
+    variables = variable_editor_order(project, summary)
     if not variables:
         return
 
@@ -584,14 +730,7 @@ def render_variable_editor(
         set_export_decision(state, next_decision)
         st.rerun()
 
-    reports = evaluate_original_current(
-        df,
-        test_df,
-        target,
-        state["original_spec"],
-        state["current_spec"],
-        positive_class,
-    )
+    reports = cached_evaluate_original_current(project, state, df, test_df, target, positive_class)
     current_train = reports["current_train"]
     original_train = reports["original_train"]
 
@@ -708,4 +847,4 @@ def render_woe_workspace(
     summary = render_catalog(project, df, test_df, target, positive_class)
     if not summary.empty:
         render_project_exports(project, df, test_df, target, positive_class)
-        render_variable_editor(project, df, test_df, target, positive_class)
+        render_variable_editor(project, df, test_df, target, positive_class, summary)

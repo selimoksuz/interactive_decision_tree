@@ -38,6 +38,7 @@ APPLIED_DATA_CONTEXT_KEY = "_interactive_tree_applied_data_context"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
+AUTO_APPLY_DATA_SETUP_MAX_ROWS = 100_000
 DEFAULT_DATA_SAMPLE_ROWS = 100_000
 DEFAULT_STRATIFY_NUMERIC_BINS = 10
 FEATURE_PROFILE_SAMPLE_ROWS = 10_000
@@ -48,6 +49,9 @@ DEFAULT_PARALLEL_WORKERS = max(1, min(8, CPU_COUNT))
 DEFAULT_DEMO_ROWS = 5_000
 DEFAULT_MAX_VALIDATION_GINI_GAP = 0.10
 VALIDATION_CANDIDATE_LIMIT = 100
+NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
+TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
+TARGET_META_CACHE_KEY = "_interactive_tree_target_meta_cache"
 
 
 @dataclass(frozen=True)
@@ -187,14 +191,52 @@ def entropy(y: pd.Series) -> float:
     return float(-(p * np.log2(p)).sum())
 
 
+def session_cache(key: str) -> dict[Any, Any]:
+    cache = st.session_state.setdefault(key, {})
+    if not isinstance(cache, dict):
+        st.session_state[key] = {}
+        cache = st.session_state[key]
+    return cache
+
+
+def bounded_cache_set(cache: dict[Any, Any], key: Any, value: Any, max_items: int = 64) -> None:
+    if len(cache) >= max_items and key not in cache:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
+
+
+def clear_ui_metric_cache() -> None:
+    for key in (NODE_SUMMARY_CACHE_KEY, TREE_UI_METRIC_CACHE_KEY):
+        st.session_state.pop(key, None)
+
+
+def target_meta_cache_key(y: pd.Series) -> tuple[Any, ...]:
+    return (id(y), str(y.name), int(len(y)), str(y.dtype))
+
+
+def target_unique_values(y: pd.Series) -> list[Any]:
+    cache = session_cache(TARGET_META_CACHE_KEY)
+    key = ("unique", target_meta_cache_key(y))
+    if key not in cache:
+        bounded_cache_set(cache, key, list(y.dropna().unique()), max_items=128)
+    return list(cache[key])
+
+
 def infer_target_kind(y: pd.Series) -> str:
+    cache = session_cache(TARGET_META_CACHE_KEY)
+    key = ("kind", target_meta_cache_key(y))
+    if key in cache:
+        return str(cache[key])
     non_missing = y.dropna()
     unique_count = non_missing.nunique()
     if pd.api.types.is_numeric_dtype(non_missing) and unique_count > 10:
-        return "regression"
-    if unique_count == 2:
-        return "binary"
-    return "classification"
+        kind = "regression"
+    elif unique_count == 2:
+        kind = "binary"
+    else:
+        kind = "classification"
+    bounded_cache_set(cache, key, kind, max_items=128)
+    return kind
 
 
 def class_values_equal(left: Any, right: Any) -> bool:
@@ -226,7 +268,7 @@ def session_positive_class() -> Any:
 
 
 def choose_positive_class(y: pd.Series, preferred: Any = None, use_session_default: bool = True) -> Any:
-    classes = list(y.dropna().unique())
+    classes = target_unique_values(y)
     if not classes:
         return None
 
@@ -264,9 +306,16 @@ def impurity_label(y: pd.Series, target_kind: str | None = None) -> str:
 
 
 def node_summary(df: pd.DataFrame, target: str, row_idx: list[int]) -> dict[str, Any]:
+    cache = session_cache(NODE_SUMMARY_CACHE_KEY)
+    cache_key = (id(df), str(target), id(row_idx), int(len(row_idx)))
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict):
+        return dict(cached)
     target_kind = infer_target_kind(df[target])
     positive_class = choose_positive_class(df[target]) if target_kind == "binary" else None
-    return target_series_summary(df.loc[row_idx, target], target_kind, positive_class)
+    summary = target_series_summary(df.loc[row_idx, target], target_kind, positive_class)
+    bounded_cache_set(cache, cache_key, summary, max_items=256)
+    return dict(summary)
 
 
 def target_series_summary(
@@ -1389,6 +1438,7 @@ def get_node_children(node: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def init_tree(df: pd.DataFrame) -> None:
+    clear_ui_metric_cache()
     st.session_state.tree = {
         0: {
             "id": 0,
@@ -1485,6 +1535,7 @@ def split_node(
     select_first_child: bool = True,
     record_action: bool = True,
 ) -> None:
+    clear_ui_metric_cache()
     node = st.session_state.tree[node_id]
     if node["split"] is not None:
         prune_node(node_id)
@@ -1537,6 +1588,7 @@ def apply_split(df: pd.DataFrame, candidate: SplitCandidate) -> None:
 
 
 def prune_node(node_id: int) -> None:
+    clear_ui_metric_cache()
     tree = st.session_state.tree
     node = tree[node_id]
     to_delete: list[int] = []
@@ -3797,6 +3849,46 @@ def current_leaves() -> list[dict[str, Any]]:
     ]
 
 
+def tree_ui_signature(data_key: str, target: str) -> str:
+    nodes: list[dict[str, Any]] = []
+    for node_id, node in sorted(st.session_state.get("tree", {}).items()):
+        split = node.get("split") or {}
+        nodes.append(
+            {
+                "id": int(node_id),
+                "depth": int(node.get("depth", 0)),
+                "rows": int(len(node.get("row_idx") or [])),
+                "path": str(node.get("path") or ""),
+                "split": {
+                    "feature": split.get("feature"),
+                    "split_type": split.get("split_type"),
+                    "value": json_safe(split.get("value")),
+                    "label": split.get("label"),
+                    "missing_policy": split.get("missing_policy"),
+                },
+                "children": [
+                    {"id": child.get("id"), "label": child.get("label")}
+                    for child in get_node_children(node)
+                ],
+            }
+        )
+    payload = {
+        "schema": TREE_SCHEMA_VERSION,
+        "data_key": str(data_key),
+        "target": str(target),
+        "nodes": nodes,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def cached_tree_total_gain(df: pd.DataFrame, target: str, data_key: str) -> tuple[float, float, float]:
+    cache = session_cache(TREE_UI_METRIC_CACHE_KEY)
+    key = ("tree_total_gain", id(df), int(len(df)), str(target), tree_ui_signature(data_key, target))
+    if key not in cache:
+        bounded_cache_set(cache, key, tree_total_gain(df, target), max_items=64)
+    return cache[key]
+
+
 def tree_total_gain(df: pd.DataFrame, target: str) -> tuple[float, float, float]:
     target_kind = infer_target_kind(df[target])
     root_impurity = target_impurity(df[target], target_kind)
@@ -3816,8 +3908,10 @@ def candidate_impact_rows(
     target: str,
     row_idx: list[int],
     candidate: SplitCandidate,
+    current_total_gain: float | None = None,
 ) -> list[dict[str, Any]]:
-    current_total_gain, _, _ = tree_total_gain(df, target)
+    if current_total_gain is None:
+        current_total_gain, _, _ = tree_total_gain(df, target)
     total_delta = candidate_total_gain_delta(df, candidate, row_idx)
     score_name = split_score_name(df[target])
     return [
@@ -4460,6 +4554,62 @@ def leaf_performance_rows(
     return rows
 
 
+def cached_leaf_performance_rows(
+    train_df: pd.DataFrame,
+    target: str,
+    data_key: str,
+    eval_df: pd.DataFrame | None = None,
+    dataset_name: str = "Train",
+) -> list[dict[str, Any]]:
+    measurement_df = eval_df if eval_df is not None else train_df
+    cache = session_cache(TREE_UI_METRIC_CACHE_KEY)
+    key = (
+        "leaf_performance_rows",
+        id(train_df),
+        int(len(train_df)),
+        id(measurement_df),
+        int(len(measurement_df)),
+        str(target),
+        str(dataset_name),
+        tree_ui_signature(data_key, target),
+    )
+    if key not in cache:
+        bounded_cache_set(
+            cache,
+            key,
+            leaf_performance_rows(train_df, target, data_key, eval_df=eval_df, dataset_name=dataset_name),
+            max_items=64,
+        )
+    return [dict(row) for row in cache[key]]
+
+
+def cached_model_performance_wide_table(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    data_key: str,
+) -> pd.DataFrame:
+    cache = session_cache(TREE_UI_METRIC_CACHE_KEY)
+    key = (
+        "model_performance_wide",
+        id(train_df),
+        int(len(train_df)),
+        id(test_df) if test_df is not None else None,
+        int(len(test_df)) if test_df is not None else 0,
+        str(target),
+        tree_ui_signature(data_key, target),
+    )
+    if key not in cache:
+        train_metrics = model_metrics(train_df, target)
+        train_metrics.insert(0, "dataset", "Train")
+        metric_frames = [train_metrics]
+        if test_df is not None:
+            metric_frames.append(evaluation_model_metrics(train_df, test_df, target, "Test"))
+        performance_metrics = pd.concat(metric_frames, ignore_index=True)
+        bounded_cache_set(cache, key, model_performance_wide_table(performance_metrics), max_items=32)
+    return cache[key].copy()
+
+
 def main() -> None:
     st.set_page_config(page_title="Interactive entropy tree", layout="wide")
     st.title("Interactive entropy decision tree")
@@ -4592,7 +4742,7 @@ def main() -> None:
             draft_target_kind = infer_target_kind(draft_source_df[draft_target])
             draft_positive_class = None
             if draft_target_kind == "binary":
-                positive_class_options = list(draft_source_df[draft_target].dropna().unique())
+                positive_class_options = target_unique_values(draft_source_df[draft_target])
                 positive_class_key = f"positive_class::{draft_source_data_key}::{draft_target}"
                 checkpoint_positive_class = (
                     checkpoint.get("positive_class")
@@ -5001,7 +5151,11 @@ def main() -> None:
         st.rerun()
 
     applied_context = st.session_state.get(APPLIED_DATA_CONTEXT_KEY)
-    if applied_context is None and draft_context is not None:
+    if (
+        applied_context is None
+        and draft_context is not None
+        and len(draft_context.get("df", [])) <= AUTO_APPLY_DATA_SETUP_MAX_ROWS
+    ):
         st.session_state[APPLIED_DATA_CONTEXT_KEY] = draft_context
         applied_context = draft_context
     if applied_context is None:
@@ -5351,7 +5505,7 @@ def main() -> None:
             st.session_state.current_node_id = selected_graph_node_id
         leaf_eval_df = test_df if test_df is not None else None
         leaf_dataset_name = "Test" if test_df is not None else "Train"
-        leaf_rows = leaf_performance_rows(
+        leaf_rows = cached_leaf_performance_rows(
             df,
             target,
             data_key,
@@ -5435,14 +5589,8 @@ def main() -> None:
         train_panel.caption("Select a leaf node to compute split ranking.")
 
     with st.expander("Model performance", expanded=True):
-        train_metrics = model_metrics(df, target)
-        train_metrics.insert(0, "dataset", "Train")
-        metric_frames = [train_metrics]
-        if test_df is not None:
-            metric_frames.append(evaluation_model_metrics(df, test_df, target, "Test"))
-        performance_metrics = pd.concat(metric_frames, ignore_index=True)
         st.dataframe(
-            arrow_safe_dataframe(model_performance_wide_table(performance_metrics)),
+            arrow_safe_dataframe(cached_model_performance_wide_table(df, test_df, target, data_key)),
             hide_index=True,
             width="stretch",
         )
@@ -5639,7 +5787,7 @@ def main() -> None:
                 )
 
                 selected_stats = feature_stats[selected_feature]
-                current_total_gain, _, _ = tree_total_gain(df, target)
+                current_total_gain, _, _ = cached_tree_total_gain(df, target, data_key)
                 score_name = split_score_name(df[target])
                 metric_col1, metric_col2, metric_col3 = st.columns(3)
                 metric_col1.metric(f"Tree total {score_name}", f"{current_total_gain:.6f}")
@@ -5714,7 +5862,17 @@ def main() -> None:
                     )
 
                     st.dataframe(
-                        arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], selected_candidate))),
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                candidate_impact_rows(
+                                    df,
+                                    target,
+                                    current["row_idx"],
+                                    selected_candidate,
+                                    current_total_gain=current_total_gain,
+                                )
+                            )
+                        ),
                         hide_index=True,
                         width="stretch",
                     )
@@ -6020,7 +6178,17 @@ def main() -> None:
                         column_config=branch_detail_column_config(score_name),
                     )
                     st.dataframe(
-                        arrow_safe_dataframe(pd.DataFrame(candidate_impact_rows(df, target, current["row_idx"], manual_candidate))),
+                        arrow_safe_dataframe(
+                            pd.DataFrame(
+                                candidate_impact_rows(
+                                    df,
+                                    target,
+                                    current["row_idx"],
+                                    manual_candidate,
+                                    current_total_gain=current_total_gain,
+                                )
+                            )
+                        ),
                         hide_index=True,
                         width="stretch",
                     )
