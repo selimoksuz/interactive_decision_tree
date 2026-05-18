@@ -27,6 +27,13 @@ cd C:\Users\Acer\interactive_decision_tree
 .\.venv\Scripts\python.exe -m ipykernel install --user --name interactive-decision-tree --display-name "Python (.venv interactive_decision_tree)"
 ```
 
+WOE workspace varsayilan olarak dahili fallback binning ile calisir. Gercek `optbinning` motorunu da kullanmak istersen:
+
+```powershell
+cd C:\Users\Acer\interactive_decision_tree
+.\.venv\Scripts\python.exe -m pip install -e ".[woe]"
+```
+
 Python / notebook:
 
 ```python
@@ -224,6 +231,50 @@ password = ...
 - Sayfa yenilense bile ayni `work_id` URL parametresiyle agaci otomatik geri yukleme
 - Ayni data yukluyken exported tree JSON/pickle dosyasini UI'a import edip agaci editable halde devam ettirme
 - Runnable nested tree JSON export
+- Ayni Data Setup uzerinden `WOE Binning` workspace'ine gecip degisken bazli WOE mapping uretme
+- Numeric/categorical initial binning, special/missing bin tanimi ve manuel WOE override
+- Bin bazinda event/non-event/count/concentration/WOE/IV, degisken bazinda IV/Gini/monotonicity karsilastirmasi
+- Butun degiskenler icin tek parca JSON, Excel, Python transformer ve SQL CASE export
+
+## WOE Binning workflow
+
+`Workspace = WOE Binning` secildiginde uygulama model kurmaz; degisken generation ekrani olarak calisir.
+
+Akis:
+
+1. `Data Setup` icinde train/test, target, positive class ve aktif degiskenleri uygula.
+2. `WOE Binning` workspace'ine gec.
+3. Sidebar'da WOE degiskenlerini ve global binning parametrelerini sec.
+4. `Run initial WOE binning` ile her degiskenin ilk mapping'ini olustur.
+5. Catalog ekraninda IV/Gini/monotonicity ile degiskenleri sirala.
+6. Variable editor'da binleri, cutpoint/category gruplarini, special/missing politikasini ve `assigned_woe` degerlerini revize et.
+7. Degisken status'unu `approved`, `rejected`, `needs_review` gibi isaretle.
+8. Finalde tek parca WOE artifact indir.
+
+WOE tarafinda her degisken icin `original_spec` ve `current_spec` ayri tutulur. Bu sayede ilk otomatik binning kaybolmaz; manuel revizyon sonrasi current IV/Gini, original IV/Gini ile karsilastirilir.
+
+Manuel WOE mantigi:
+
+```text
+calculated_woe = event/non-event dagilimindan hesaplanan dogal WOE
+assigned_woe   = kullanicinin elle verdigi override
+export_woe     = assigned_woe varsa assigned_woe, yoksa calculated_woe
+```
+
+Special/missing destekleri:
+
+- null/NaN missing
+- blank string'i missing sayma opsiyonu
+- `-999`, `-1`, `UNKNOWN`, `N/A` gibi degisken bazli special value listesi
+- missing ve special binlere manuel WOE atama
+- special bin'i protected tutma
+
+Export dosyalari:
+
+- `interactive_woe_mapping.json`: ana makine-okunur mapping contract
+- `interactive_woe_report.xlsx`: Summary, Variable Metrics, Bin Details, Manual Edits raporu
+- `woe_transformer.py`: pandas DataFrame'e `_WOE` kolonlari ekleyen transformer
+- `woe_transform.sql`: SQL `CASE WHEN` mapping kodu
 
 ## Lokal session ve secrets
 

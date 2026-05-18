@@ -30,6 +30,9 @@ notebook = [
 oracle = [
     "oracledb",
 ]
+woe = [
+    "optbinning>=0.20",
+]
 
 [tool.setuptools]
 py-modules = ["interactive_decision_tree_app"]

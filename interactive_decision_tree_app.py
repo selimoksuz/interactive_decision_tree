@@ -25,6 +25,7 @@ from interactive_decision_tree.session_store import (
     session_data_key,
 )
 from interactive_decision_tree.sql_source import DEFAULT_SQL_LIMIT, read_sql_dataframe
+from interactive_decision_tree.woe_ui import WOE_PROJECTS_KEY, render_woe_workspace
 
 
 TREE_SCHEMA_VERSION = 4
@@ -2494,6 +2495,15 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "test_session_data_id",
         "workspace_mode",
         "feature_include_mode",
+        "woe_selected_variables",
+        "woe_max_bins",
+        "woe_min_bin_size",
+        "woe_monotonic_trend",
+        "woe_engine",
+        "woe_missing_separate",
+        "woe_blank_as_missing",
+        "woe_replace_existing",
+        "_interactive_tree_woe_active_variable",
     }
     return key.startswith(prefixes) or key in exact_keys
 
@@ -2530,9 +2540,6 @@ def save_work_checkpoint(
     parameters: dict[str, Any],
     auto_parameters: dict[str, Any],
 ) -> None:
-    if "tree" not in st.session_state:
-        return
-
     data_payload: dict[str, Any] = {
         "source": data_source,
         "name": uploaded_name,
@@ -2568,6 +2575,7 @@ def save_work_checkpoint(
             "auto_tree_message": json_safe(st.session_state.get("auto_tree_message", "")),
             "tree_zoom": json_safe(st.session_state.get("tree_zoom")),
         },
+        "woe_projects": json_safe(st.session_state.get(WOE_PROJECTS_KEY, {})),
         "ui_state": checkpoint_ui_state(),
     }
 
@@ -4142,6 +4150,12 @@ def main() -> None:
     work_id = ensure_work_id()
     checkpoint = load_work_checkpoint(work_id)
     restore_checkpoint_ui_state(checkpoint)
+    if (
+        isinstance(checkpoint, dict)
+        and isinstance(checkpoint.get("woe_projects"), dict)
+        and WOE_PROJECTS_KEY not in st.session_state
+    ):
+        st.session_state[WOE_PROJECTS_KEY] = checkpoint["woe_projects"]
 
     query_session = load_session_dataframe_from_query()
     query_data_id = query_session[2] if query_session is not None else None
@@ -4164,12 +4178,12 @@ def main() -> None:
     if (
         st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is None
         and isinstance(checkpoint_ui_state, dict)
-        and checkpoint_ui_state.get("workspace_mode") == "Tree Builder"
+        and checkpoint_ui_state.get("workspace_mode") in {"Tree Builder", "WOE Binning"}
     ):
         restored_context = restore_applied_context_from_checkpoint(checkpoint, query_session)
         if restored_context is not None:
             st.session_state[APPLIED_DATA_CONTEXT_KEY] = restored_context
-    workspace_options = ["Data Setup", "Tree Builder"]
+    workspace_options = ["Data Setup", "Tree Builder", "WOE Binning"]
     workspace_default = "Tree Builder" if st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is not None else "Data Setup"
     workspace_mode = st.sidebar.radio(
         "Workspace",
@@ -4695,6 +4709,30 @@ def main() -> None:
         with st.expander("Active split variables", expanded=False):
             st.dataframe(pd.DataFrame({"variable": features}), hide_index=True, width="stretch")
         st.info("Switch to Tree Builder when this active dataset is ready for split ranking or tree edits.")
+        st.stop()
+
+    if workspace_mode == "WOE Binning":
+        render_woe_workspace(
+            df=df,
+            test_df=test_df,
+            target=target,
+            features=features,
+            positive_class=st.session_state.get(POSITIVE_CLASS_SESSION_KEY),
+            data_key=data_key,
+        )
+        save_work_checkpoint(
+            work_id=work_id,
+            df=df,
+            data_key=data_key,
+            data_source=data_source,
+            uploaded_name=uploaded_name,
+            data_id=source_data_id,
+            source_metadata=source_metadata,
+            target=target,
+            selected_features=features,
+            parameters={"workspace": "WOE Binning"},
+            auto_parameters={},
+        )
         st.stop()
 
     checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}

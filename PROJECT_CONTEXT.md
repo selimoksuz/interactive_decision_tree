@@ -6,6 +6,9 @@ Bu proje, Codex ile gelistirilen Streamlit tabanli interaktif decision tree uygu
 
 - `interactive_decision_tree_app.py`: Ana Streamlit uygulamasi.
 - `interactive_decision_tree/`: Notebook launcher, lokal session store ve SQL okuma yardimcilari.
+- `interactive_decision_tree/woe_binning.py`: WOE binning, IV/Gini, monotonicity ve manuel WOE hesap motoru.
+- `interactive_decision_tree/woe_ui.py`: `WOE Binning` workspace Streamlit ekrani.
+- `interactive_decision_tree/woe_export.py`: Butunlesik WOE JSON/Excel/Python/SQL export.
 - `pyproject.toml`: Paketi editable olarak kurup `from interactive_decision_tree import launch_tree` kullanmayi saglar.
 - `requirements.txt`: Python bagimliliklari.
 - `run_app.ps1`: PowerShell uzerinden uygulamayi baslatir.
@@ -36,6 +39,10 @@ Uygulama varsayilan olarak `http://localhost:8501` adresinde calisir.
 - UI dosya yukleme kaynagi CSV ve Excel dosyalarini (`.csv`, `.xlsx`, `.xls`) destekler.
 - `work_id` URL parametresi ve `.tree_checkpoints/` altindaki otomatik checkpoint ile refresh sonrasi kaldigin agaci geri yukleme.
 - Runnable nested tree JSON export.
+- Ayni Data Setup uzerinden `WOE Binning` workspace'i.
+- Degisken bazli WOE mapping uretimi, special/missing tanimi, manuel WOE override.
+- Bin bazinda event/non-event/count/concentration/WOE/IV; degisken bazinda IV/Gini/monotonicity.
+- Butun degiskenleri tek artifact olarak JSON, Excel, Python transformer ve SQL CASE export etme.
 
 ## Onemli Notlar
 
@@ -43,4 +50,7 @@ Uygulama varsayilan olarak `http://localhost:8501` adresinde calisir.
 - Entropy / information gain hesabi class dagiliminin safligina bakar; positive class sadece binary metriklerin ve target-rate yorumunun yonunu belirler.
 - SQL credential bilgisi checkpoint'e yazilmaz; SQL sonucunun DataFrame snapshot'i `.tree_sessions/` altinda saklanir.
 - URL'deki `data_id` raw path degildir; sadece uygulamanin kendi urettigi guvenli session id'ler okunmalidir.
+- WOE workspace model sonucu uretmez; variable generation ve mapping yonetim ekranidir.
+- WOE tarafinda `original_spec` ilk otomatik binning'i, `current_spec` manuel revize edilen mapping'i tutar.
+- `assigned_woe` doluysa export tarafinda o kullanilir; bos ise hesaplanan `calculated_woe` kullanilir.
 - Eski gecici Codex dizinindeki kaynak dosyalar bu proje klasorune tasindi. Bundan sonraki calisma kok dizini `C:\Users\Acer\interactive_decision_tree` olmalidir.

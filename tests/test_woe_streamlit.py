@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from uuid import uuid4
+
+import pandas as pd
+from streamlit.testing.v1 import AppTest
+
+from interactive_decision_tree.session_store import save_dataframe_session
+
+
+def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
+    monkeypatch.setenv("INTERACTIVE_TREE_SESSION_DIR", str(tmp_path))
+    df = pd.DataFrame(
+        {
+            "age": [20, 23, 25, 29, 31, 35, 41, 48, 55, 62] * 6,
+            "income": [25_000, 29_000, 31_000, 36_000, 42_000, 47_000, 52_000, 61_000, 72_000, 90_000] * 6,
+            "target": [1, 1, 1, 0, 1, 0, 0, 0, 0, 0] * 6,
+        }
+    )
+    data_id, _ = save_dataframe_session(df, target="target", features=["age", "income"])
+
+    at = AppTest.from_file("interactive_decision_tree_app.py")
+    at.query_params["data_id"] = data_id
+    at.query_params["work_id"] = f"woe_{uuid4().hex}"
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+
+    next(button for button in at.button if button.label == "Apply data setup").click()
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+
+    next(radio for radio in at.radio if radio.label == "Workspace").set_value("WOE Binning")
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert any(button.label == "Run initial WOE binning" for button in at.button)
+
+    next(button for button in at.button if button.label == "Run initial WOE binning").click()
+    at.run(timeout=30)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    projects = at.session_state.filtered_state["_interactive_tree_woe_projects"]
+    assert len(projects) == 1
+    project = next(iter(projects.values()))
+    assert set(project["variables"]) == {"age", "income"}
