@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 from datetime import datetime, timezone
 from typing import Any
@@ -41,6 +42,7 @@ from .woe_export import (
 
 WOE_PROJECTS_KEY = "_interactive_tree_woe_projects"
 WOE_ACTIVE_VARIABLE_KEY = "_interactive_tree_woe_active_variable"
+WOE_SELECTED_VARIABLES_KEY = "woe_selected_variables"
 
 
 def woe_project_key(data_key: str, target: str, positive_class: Any) -> str:
@@ -208,21 +210,166 @@ def run_initial_binning(
     progress.empty()
 
 
-def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildConfig, bool]:
-    default_variables = features[: min(20, len(features))]
-    remembered_variables = [
-        str(variable)
-        for variable in st.session_state.get("woe_selected_variables", default_variables)
-        if str(variable) in features
+def normalized_selected_variables(features: list[str], selected: Any) -> list[str]:
+    feature_set = set(features)
+    if selected is None:
+        return []
+    if isinstance(selected, str):
+        selected_iterable = [selected]
+    else:
+        try:
+            selected_iterable = list(selected)
+        except TypeError:
+            selected_iterable = []
+    return [str(variable) for variable in selected_iterable if str(variable) in feature_set]
+
+
+def filter_variable_options(features: list[str], query: str | None) -> list[str]:
+    text = str(query or "").strip().lower()
+    if not text:
+        return list(features)
+    tokens = [
+        token.strip().lower().replace("%", "*")
+        for chunk in text.replace("\n", ",").split(",")
+        for token in [chunk]
+        if token.strip()
     ]
-    if not remembered_variables:
-        remembered_variables = default_variables
-    selected_variables = st.sidebar.multiselect(
+    if not tokens:
+        return list(features)
+
+    def matches(feature: str) -> bool:
+        lowered = str(feature).lower()
+        return any(
+            fnmatch.fnmatch(lowered, token) if "*" in token or "?" in token else token in lowered
+            for token in tokens
+        )
+
+    return [feature for feature in features if matches(feature)]
+
+
+def apply_variable_selection_action(
+    features: list[str],
+    current_selection: list[str],
+    filtered_features: list[str],
+    action: str,
+) -> list[str]:
+    if action == "select_all":
+        return list(features)
+    if action == "clear_all":
+        return []
+    selected = set(normalized_selected_variables(features, current_selection))
+    filtered = set(filtered_features)
+    if action == "add_filtered":
+        selected.update(filtered)
+    elif action == "remove_filtered":
+        selected.difference_update(filtered)
+    return [feature for feature in features if feature in selected]
+
+
+def variable_selection_frame(filtered_features: list[str], selected_variables: list[str]) -> pd.DataFrame:
+    selected = set(selected_variables)
+    return pd.DataFrame(
+        {
+            "selected": [feature in selected for feature in filtered_features],
+            "variable": filtered_features,
+        }
+    )
+
+
+def apply_variable_table_selection(
+    features: list[str],
+    current_selection: list[str],
+    edited_table: pd.DataFrame,
+) -> list[str]:
+    selected = set(normalized_selected_variables(features, current_selection))
+    if edited_table.empty or not {"selected", "variable"}.issubset(edited_table.columns):
+        return [feature for feature in features if feature in selected]
+
+    table_variables = [str(variable) for variable in edited_table["variable"].tolist()]
+    selected.difference_update(table_variables)
+    chosen = edited_table.loc[edited_table["selected"].fillna(False).astype(bool), "variable"].astype(str)
+    selected.update(chosen.tolist())
+    return [feature for feature in features if feature in selected]
+
+
+def current_selected_variables(features: list[str], default_variables: list[str]) -> list[str]:
+    selected = normalized_selected_variables(
+        features,
+        st.session_state.get(WOE_SELECTED_VARIABLES_KEY, default_variables),
+    )
+    st.session_state[WOE_SELECTED_VARIABLES_KEY] = selected
+    return selected
+
+
+def render_variable_selection_controls(features: list[str], default_variables: list[str]) -> list[str]:
+    selected = current_selected_variables(features, default_variables)
+
+    st.markdown("**WOE variable selection**")
+    query = st.text_input(
+        "Search variables",
+        key="woe_variable_search",
+        help="Case-insensitive contains search. Use comma/newline for multiple terms; * or % works as wildcard.",
+    )
+    filtered = filter_variable_options(features, query)
+    st.caption(f"{len(selected):,} selected | {len(filtered):,} matching | {len(features):,} total")
+
+    top_cols = st.columns(2)
+    if top_cols[0].button("Select all", key="woe_select_all_variables", width="stretch", disabled=not features):
+        st.session_state[WOE_SELECTED_VARIABLES_KEY] = apply_variable_selection_action(
+            features, selected, filtered, "select_all"
+        )
+        st.rerun()
+    if top_cols[1].button("Clear all", key="woe_clear_all_variables", width="stretch", disabled=not selected):
+        st.session_state[WOE_SELECTED_VARIABLES_KEY] = apply_variable_selection_action(
+            features, selected, filtered, "clear_all"
+        )
+        st.rerun()
+
+    filter_cols = st.columns(2)
+    if filter_cols[0].button("Add filtered", key="woe_add_filtered_variables", width="stretch", disabled=not filtered):
+        st.session_state[WOE_SELECTED_VARIABLES_KEY] = apply_variable_selection_action(
+            features, selected, filtered, "add_filtered"
+        )
+        st.rerun()
+    if filter_cols[1].button(
+        "Remove filtered",
+        key="woe_remove_filtered_variables",
+        width="stretch",
+        disabled=not filtered or not selected,
+    ):
+        st.session_state[WOE_SELECTED_VARIABLES_KEY] = apply_variable_selection_action(
+            features, selected, filtered, "remove_filtered"
+        )
+        st.rerun()
+
+    edited = st.data_editor(
+        variable_selection_frame(filtered, selected),
+        hide_index=True,
+        width="stretch",
+        height=360,
+        disabled=["variable"],
+        column_config={
+            "selected": st.column_config.CheckboxColumn("Selected"),
+            "variable": st.column_config.TextColumn("Variable"),
+        },
+        key="woe_variable_selection_table",
+    )
+    if st.button("Apply table selection", key="woe_apply_variable_selection_table", width="stretch"):
+        st.session_state[WOE_SELECTED_VARIABLES_KEY] = apply_variable_table_selection(features, selected, edited)
+        st.rerun()
+
+    return st.multiselect(
         "WOE variables",
         options=features,
-        default=remembered_variables,
-        key="woe_selected_variables",
+        key=WOE_SELECTED_VARIABLES_KEY,
+        help="Manual fine-tuning after bulk selection. Streamlit search works inside this field too.",
     )
+
+
+def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildConfig, bool]:
+    default_variables = features[: min(20, len(features))]
+    selected_variables = current_selected_variables(features, default_variables)
+    st.sidebar.caption(f"{len(selected_variables):,} WOE variable(s) selected.")
     max_bins = st.sidebar.number_input("Max bins", min_value=2, max_value=20, value=6, step=1, key="woe_max_bins")
     min_bin_size = st.sidebar.slider(
         "Min bin size",
@@ -693,6 +840,7 @@ def render_woe_workspace(
         st.info("No active variables are selected in Data Setup.")
         return
 
+    default_variables = features[: min(20, len(features))]
     project = get_project(data_key, target, positive_class)
     selected_variables, config, replace_existing = build_config_from_sidebar(features)
     run_clicked = st.sidebar.button(
@@ -705,7 +853,17 @@ def render_woe_workspace(
         run_initial_binning(project, df, target, selected_variables, positive_class, config, replace_existing)
         st.rerun()
 
-    summary = render_catalog(project, df, test_df, target, positive_class)
-    if not summary.empty:
-        render_project_exports(project, df, test_df, target, positive_class)
-        render_variable_editor(project, df, test_df, target, positive_class)
+    selection_tab, catalog_tab, editor_tab = st.tabs(["Variable selection", "Variable catalog", "Variable editor"])
+    with selection_tab:
+        render_variable_selection_controls(features, default_variables)
+
+    with catalog_tab:
+        summary = render_catalog(project, df, test_df, target, positive_class)
+        if not summary.empty:
+            render_project_exports(project, df, test_df, target, positive_class)
+
+    with editor_tab:
+        if project["variables"]:
+            render_variable_editor(project, df, test_df, target, positive_class)
+        else:
+            st.info("Run initial WOE binning to create variable mappings.")
