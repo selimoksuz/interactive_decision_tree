@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pandas as pd
 
 from interactive_decision_tree import launch_tree_sql
 from interactive_decision_tree.session_store import load_dataframe_session
-from interactive_decision_tree.sql_source import read_sql_dataframe
+from interactive_decision_tree.sql_source import normalize_sql_dataframe, read_sql_dataframe
 
 
 def sqlite_url(tmp_path) -> str:
@@ -45,6 +47,31 @@ def test_sql_query_mode(tmp_path):
     df = read_sql_dataframe(url, query="select * from sample where id >= 3 order by id")
 
     assert df["id"].tolist() == [3, 4, 5]
+
+
+def test_sql_query_limit_is_applied_in_sql(tmp_path):
+    url = sqlite_url(tmp_path)
+    seed_table(url)
+
+    df = read_sql_dataframe(url, query="select * from sample where id >= 2 order by id;", limit=2)
+
+    assert df["id"].tolist() == [2, 3]
+
+
+def test_normalize_sql_dataframe_converts_decimal_objects_and_low_cardinality_strings():
+    df = pd.DataFrame(
+        {
+            "amount": [Decimal("10.5"), Decimal("20.0"), None] * 10,
+            "segment": ["A", "B", "A"] * 10,
+            "free_text": [f"text_{idx}" for idx in range(30)],
+        }
+    )
+
+    normalized = normalize_sql_dataframe(df)
+
+    assert pd.api.types.is_float_dtype(normalized["amount"])
+    assert str(normalized["segment"].dtype) == "category"
+    assert str(normalized["free_text"].dtype) != "category"
 
 
 def test_sql_sample_n(tmp_path):

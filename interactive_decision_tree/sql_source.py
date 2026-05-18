@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+from numbers import Number
 from typing import Any
 
 import pandas as pd
@@ -30,6 +32,46 @@ def _split_schema_table(table: str) -> tuple[str | None, str]:
     if len(parts) == 2:
         return parts[0], parts[1]
     return None, table.strip()
+
+
+def _strip_query_terminator(query: str) -> str:
+    return query.strip().rstrip(";").strip()
+
+
+def _limited_query_for_dialect(query: str, dialect_name: str, limit: int) -> tuple[str, dict[str, int]]:
+    clean_query = _strip_query_terminator(query)
+    if not clean_query:
+        raise ValueError("Query cannot be empty.")
+    if dialect_name.lower().startswith("oracle"):
+        return f"select * from ({clean_query}) idt_query_limit where rownum <= :idt_limit", {"idt_limit": int(limit)}
+    return f"select * from ({clean_query}) as idt_query_limit limit :idt_limit", {"idt_limit": int(limit)}
+
+
+def _object_series_is_numeric(series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    sample = non_null.head(1000)
+    return all(isinstance(value, (Number, Decimal)) and not isinstance(value, bool) for value in sample)
+
+
+def normalize_sql_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    for column in normalized.columns:
+        series = normalized[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+        if _object_series_is_numeric(series):
+            normalized[column] = pd.to_numeric(series, errors="coerce")
+            continue
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+        unique_count = int(non_null.nunique(dropna=True))
+        unique_ratio = unique_count / max(1, len(non_null))
+        if unique_count <= 5_000 and unique_ratio <= 0.2:
+            normalized[column] = series.astype("category")
+    return normalized
 
 
 def read_sql_dataframe(
@@ -66,16 +108,22 @@ def read_sql_dataframe(
                     statement = statement.limit(int(effective_limit))
                 df = pd.read_sql(statement, conn)
             else:
-                query_text = str(query or "").strip()
+                query_text = _strip_query_terminator(str(query or ""))
                 if not query_text:
                     raise ValueError("Query cannot be empty.")
-                df = pd.read_sql_query(sa.text(query_text), conn)
-                if not full_table and limit is not None and int(limit) > 0:
-                    df = df.head(int(limit))
+                if effective_limit is not None:
+                    limited_query, params = _limited_query_for_dialect(
+                        query_text,
+                        str(getattr(conn.dialect, "name", "")),
+                        int(effective_limit),
+                    )
+                    df = pd.read_sql_query(sa.text(limited_query), conn, params=params)
+                else:
+                    df = pd.read_sql_query(sa.text(query_text), conn)
     finally:
         if should_dispose:
             engine.dispose()
 
     if sample_n is not None and int(sample_n) < len(df):
         df = df.sample(n=int(sample_n), random_state=random_state).sort_index()
-    return df
+    return normalize_sql_dataframe(df)

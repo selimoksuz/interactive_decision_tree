@@ -2062,6 +2062,69 @@ def feature_manager_frame(
     )
 
 
+def feature_profile_cache_key(data_key: str, target: str, features: list[str], sample_rows: int) -> str:
+    payload = {
+        "data_key": str(data_key),
+        "target": str(target),
+        "features": list(map(str, features)),
+        "sample_rows": int(sample_rows),
+    }
+    return hashlib.sha256(json.dumps(payload, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def feature_profile_cache() -> dict[str, pd.DataFrame]:
+    key = "_interactive_tree_feature_profile_cache"
+    cache = st.session_state.setdefault(key, {})
+    if not isinstance(cache, dict):
+        st.session_state[key] = {}
+        cache = st.session_state[key]
+    return cache
+
+
+def cached_feature_profile_frame(
+    df: pd.DataFrame,
+    features: list[str],
+    *,
+    data_key: str,
+    target: str,
+    sample_rows: int = FEATURE_PROFILE_SAMPLE_ROWS,
+) -> pd.DataFrame:
+    cache = feature_profile_cache()
+    cache_key = feature_profile_cache_key(data_key, target, features, sample_rows)
+    if cache_key not in cache:
+        profile = feature_manager_frame(df, features, features, sample_rows=sample_rows).drop(columns=["include"])
+        if len(cache) >= 8:
+            cache.pop(next(iter(cache)))
+        cache[cache_key] = profile
+    return cache[cache_key].copy()
+
+
+def feature_manager_frame_from_profile(
+    profile: pd.DataFrame,
+    visible_features: list[str],
+    selected_features: list[str],
+) -> pd.DataFrame:
+    selected = set(map(str, selected_features))
+    rows_by_feature = {str(row["variable"]): dict(row) for row in profile.to_dict("records")}
+    rows = []
+    for feature in visible_features:
+        row = dict(rows_by_feature.get(str(feature), {"variable": str(feature)}))
+        row["include"] = str(feature) in selected
+        rows.append(row)
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "include",
+            "variable",
+            "kind",
+            "dtype",
+            "missing_rate_sample",
+            "unique_count_sample",
+            "profile_rows",
+        ],
+    )
+
+
 def secret_sql_connections() -> dict[str, str]:
     connections: dict[str, str] = {}
 
@@ -4596,12 +4659,18 @@ def main() -> None:
             selection_signature = hashlib.sha256(
                 json.dumps(current_feature_selection, default=str).encode("utf-8")
             ).hexdigest()[:10]
+            feature_profile = cached_feature_profile_frame(
+                draft_source_df,
+                default_features,
+                data_key=draft_source_data_key,
+                target=draft_target,
+            )
             data_setup_form.markdown("**Data Table Search & Filter Component**")
             data_setup_form.caption(
                 "The table shows matching variables only; selections outside the filter are preserved."
             )
             feature_manager = data_setup_form.data_editor(
-                feature_manager_frame(draft_source_df, filtered_features, current_feature_selection),
+                feature_manager_frame_from_profile(feature_profile, filtered_features, current_feature_selection),
                 hide_index=True,
                 width="stretch",
                 key=(
