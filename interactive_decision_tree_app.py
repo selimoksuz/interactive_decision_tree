@@ -4220,7 +4220,7 @@ def main() -> None:
         restored_upload = train_source.restored_upload
         st.subheader("Data setup")
         st.caption("Configure the active dataset here. Tree rendering and split ranking stay idle on this page.")
-        data_setup_form = st.form("data_setup_form", clear_on_submit=False)
+        data_setup_form = st.container()
         with data_setup_form:
 
             data_setup_form.caption(
@@ -4477,49 +4477,49 @@ def main() -> None:
                 key="validation_source_mode",
                 help="Train datasini kullan, ayni tabloyu train/test bol veya ayri bir test kaynagi yukle.",
             )
-            validation_tab.caption("Split settings below are used only when Test / validation source is Split train data.")
-            split_col1, split_col2 = validation_tab.columns(2)
-            test_fraction = split_col1.slider(
-                "Test share",
-                min_value=0.05,
-                max_value=0.5,
-                value=0.2,
-                step=0.05,
-                key="validation_test_share",
-            )
-            split_seed = split_col2.number_input(
-                "Split seed",
-                value=CANDIDATE_RANDOM_STATE,
-                step=1,
-                key="validation_split_seed",
-            )
-            split_stratify_columns = validation_tab.multiselect(
-                "Split stratify columns",
-                options=draft_working_df.columns.tolist(),
-                default=default_stratify_columns,
-                key="validation_stratify_columns",
-                help=(
-                    "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
-                    "before the train/test split is drawn."
-                ),
-            )
-            split_numeric_bins_input = validation_tab.number_input(
-                "Split numeric stratify bins",
-                min_value=2,
-                max_value=50,
-                value=DEFAULT_STRATIFY_NUMERIC_BINS,
-                step=1,
-                format="%d",
-                key="validation_stratify_numeric_bins",
-            )
-            split_stratify_columns = normalize_stratify_columns(draft_working_df, split_stratify_columns)
-            split_numeric_bins = safe_int(
-                split_numeric_bins_input,
-                default=DEFAULT_STRATIFY_NUMERIC_BINS,
-                minimum=2,
-            )
             draft_error: str | None = None
             if validation_mode == "Split train data":
+                validation_tab.caption("Split settings below are used only when Test / validation source is Split train data.")
+                split_col1, split_col2 = validation_tab.columns(2)
+                test_fraction = split_col1.slider(
+                    "Test share",
+                    min_value=0.05,
+                    max_value=0.5,
+                    value=0.2,
+                    step=0.05,
+                    key="validation_test_share",
+                )
+                split_seed = split_col2.number_input(
+                    "Split seed",
+                    value=CANDIDATE_RANDOM_STATE,
+                    step=1,
+                    key="validation_split_seed",
+                )
+                split_stratify_columns = validation_tab.multiselect(
+                    "Split stratify columns",
+                    options=draft_working_df.columns.tolist(),
+                    default=default_stratify_columns,
+                    key="validation_stratify_columns",
+                    help=(
+                        "Categorical columns are used as-is. Numeric columns are converted into quantile bins "
+                        "before the train/test split is drawn."
+                    ),
+                )
+                split_numeric_bins_input = validation_tab.number_input(
+                    "Split numeric stratify bins",
+                    min_value=2,
+                    max_value=50,
+                    value=DEFAULT_STRATIFY_NUMERIC_BINS,
+                    step=1,
+                    format="%d",
+                    key="validation_stratify_numeric_bins",
+                )
+                split_stratify_columns = normalize_stratify_columns(draft_working_df, split_stratify_columns)
+                split_numeric_bins = safe_int(
+                    split_numeric_bins_input,
+                    default=DEFAULT_STRATIFY_NUMERIC_BINS,
+                    minimum=2,
+                )
                 train_idx, test_idx = train_test_split_indices(
                     draft_working_df,
                     draft_target,
@@ -4587,6 +4587,9 @@ def main() -> None:
                         validation_tab.caption(
                             "Separate test source is staged; active rows update after Apply data setup."
                         )
+                else:
+                    draft_error = "Separate test source is not loaded."
+                    validation_tab.info("Choose and load a separate test source to enable Apply data setup.")
             else:
                 validation_tab.caption("No test data will be used after Apply data setup.")
 
@@ -4612,7 +4615,7 @@ def main() -> None:
                     "split_variable_limit": draft_split_variable_limit,
                 }
 
-            apply_clicked = data_setup_form.form_submit_button(
+            apply_clicked = data_setup_form.button(
                 "Apply data setup",
                 width="stretch",
                 type="primary",

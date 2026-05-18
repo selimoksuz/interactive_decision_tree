@@ -40,9 +40,19 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert at.session_state.filtered_state.get("state_key") is None
 
+    next(radio for radio in at.radio if radio.label == "Test / validation source").set_value("Separate data source")
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert any(radio.label == "Test data source" for radio in at.radio)
+    assert not any(slider.label == "Test share" for slider in at.slider)
+    assert any(button.label == "Apply data setup" for button in at.button)
+    assert at.session_state.filtered_state.get("state_key") is None
+
     next(radio for radio in at.radio if radio.label == "Test / validation source").set_value("Split train data")
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert any(slider.label == "Test share" for slider in at.slider)
+    assert not any(radio.label == "Test data source" for radio in at.radio)
     assert at.session_state.filtered_state.get("state_key") is None
 
     next(button for button in at.button if button.label == "Apply data setup").click()
