@@ -19,10 +19,12 @@ from .woe_binning import (
     evaluate_original_current,
     evaluate_spec,
     merge_selected_bins,
+    missing_mask,
     normal_bins,
     parse_category_groups,
     parse_cutpoints,
     parse_special_values,
+    special_mask,
 )
 from .woe_export import (
     build_project_export,
@@ -311,6 +313,10 @@ def render_special_missing_editor(
     current_spec = state["current_spec"]
     config = dict(current_spec.get("config", {}))
     st.markdown("**Special / missing policy**")
+    st.caption(
+        "SAS-style flow: keep true missing separate first, define business special codes per variable "
+        "(-999, UNKNOWN, NO_INFO), then decide whether each bucket gets calculated WOE or assigned WOE."
+    )
     special_values_text = st.text_area(
         "Special values",
         value=", ".join(str(value) for value in config.get("special_values", [])),
@@ -333,6 +339,27 @@ def render_special_missing_editor(
         value=bool(config.get("protected_special", True)),
         key=f"woe_protected_special::{state['name']}",
     )
+    special_values = parse_special_values(special_values_text)
+    feature_series = df[state["name"]]
+    missing_preview = missing_mask(feature_series, bool(blank_as_missing))
+    special_preview = special_mask(feature_series, special_values) & ~missing_preview
+    preview = pd.DataFrame(
+        [
+            {"bucket": "missing", "rows": int(missing_preview.sum()), "share": float(missing_preview.mean())},
+            {"bucket": "special", "rows": int(special_preview.sum()), "share": float(special_preview.mean())},
+            {
+                "bucket": "normal",
+                "rows": int((~missing_preview & ~special_preview).sum()),
+                "share": float((~missing_preview & ~special_preview).mean()),
+            },
+        ]
+    )
+    st.dataframe(
+        preview,
+        hide_index=True,
+        width="stretch",
+        column_config={"share": st.column_config.NumberColumn(format="%.6f")},
+    )
     if st.button("Apply special / missing policy", width="stretch", key=f"woe_apply_special::{state['name']}"):
         new_config = WoeBuildConfig(
             max_bins=int(config.get("max_bins", 6)),
@@ -340,7 +367,7 @@ def render_special_missing_editor(
             monotonic_trend=str(config.get("monotonic_trend", "auto")),
             missing_separate=bool(missing_separate),
             blank_as_missing=bool(blank_as_missing),
-            special_values=tuple(parse_special_values(special_values_text)),
+            special_values=tuple(special_values),
             protected_special=bool(protected_special),
             engine=str(config.get("engine", "auto")),
         )

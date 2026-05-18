@@ -29,8 +29,13 @@ from interactive_decision_tree_app import (
 
 
 def test_demo_data_default_is_large_enough_for_train_test_validation():
-    assert len(make_demo_data()) == DEFAULT_DEMO_ROWS
+    demo = make_demo_data()
+    assert len(demo) == DEFAULT_DEMO_ROWS
     assert DEFAULT_DEMO_ROWS >= 5_000
+    assert demo[["age", "income", "tenure_months", "segment"]].isna().any().any()
+    assert (demo["income"] == -999).any()
+    assert (demo["region"] == "UNKNOWN").any()
+    assert (demo["product"] == "NO_INFO").any()
 
 
 def test_analysis_row_idx_samples_stably():
@@ -237,6 +242,28 @@ def test_candidate_splits_parallel_matches_serial():
     assert [(item.feature, item.label, item.information_gain) for item in parallel] == [
         (item.feature, item.label, item.information_gain) for item in serial
     ]
+
+
+def test_numeric_split_labels_missing_in_greater_branch():
+    df = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, None, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+
+    candidate = score_split(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+
+    assert candidate is not None
+    assert candidate.branch_labels == ("<= 2.5", "> 2.5 or missing")
 
 
 def test_evaluation_model_metrics_scores_test_dataframe():

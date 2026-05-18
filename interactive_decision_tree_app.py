@@ -77,19 +77,19 @@ class LoadedDataSource:
 
 def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
     rng = np.random.default_rng(7)
-    age = rng.integers(21, 72, size=n)
+    age = rng.integers(21, 72, size=n).astype(float)
     income = rng.normal(52_000, 18_000, size=n).clip(12_000, 140_000)
-    tenure = rng.integers(0, 120, size=n)
+    tenure = rng.integers(0, 120, size=n).astype(float)
     segment = rng.choice(
         ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
         size=n,
         p=[0.11, 0.1, 0.1, 0.09, 0.09, 0.08, 0.08, 0.08, 0.07, 0.07, 0.07, 0.06],
-    )
+    ).astype(object)
     channel = rng.choice(
         ["branch", "mobile", "web", "call_center", "agent", "atm"],
         size=n,
         p=[0.18, 0.32, 0.24, 0.1, 0.09, 0.07],
-    )
+    ).astype(object)
     region = rng.choice(
         [
             "marmara",
@@ -105,7 +105,7 @@ def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
         ],
         size=n,
         p=[0.22, 0.12, 0.11, 0.14, 0.1, 0.08, 0.08, 0.06, 0.04, 0.05],
-    )
+    ).astype(object)
     product = rng.choice(
         [
             "card",
@@ -126,7 +126,7 @@ def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
         ],
         size=n,
         p=[0.11, 0.1, 0.07, 0.08, 0.12, 0.07, 0.07, 0.04, 0.09, 0.05, 0.05, 0.04, 0.03, 0.04, 0.04],
-    )
+    ).astype(object)
 
     score = (
         (income < 42_000).astype(int)
@@ -138,6 +138,30 @@ def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
         - (age > 55).astype(int)
     )
     target = np.where(score >= 3, "high_risk", "low_risk")
+
+    missing_income = rng.choice(n, size=max(1, int(n * 0.035)), replace=False)
+    remaining = np.setdiff1d(np.arange(n), missing_income)
+    special_income = rng.choice(remaining, size=max(1, int(n * 0.012)), replace=False)
+    income[missing_income] = np.nan
+    income[special_income] = -999.0
+
+    missing_age = rng.choice(n, size=max(1, int(n * 0.025)), replace=False)
+    age[missing_age] = np.nan
+
+    missing_tenure = rng.choice(n, size=max(1, int(n * 0.02)), replace=False)
+    tenure[missing_tenure] = np.nan
+
+    segment_missing = rng.choice(n, size=max(1, int(n * 0.025)), replace=False)
+    segment[segment_missing] = None
+
+    channel_blank = rng.choice(n, size=max(1, int(n * 0.015)), replace=False)
+    channel[channel_blank] = ""
+
+    region_unknown = rng.choice(n, size=max(1, int(n * 0.012)), replace=False)
+    region[region_unknown] = "UNKNOWN"
+
+    product_no_info = rng.choice(n, size=max(1, int(n * 0.01)), replace=False)
+    product[product_no_info] = "NO_INFO"
 
     return pd.DataFrame(
         {
@@ -361,9 +385,10 @@ def score_split(
 
     if split_type == "numeric_le":
         numeric = pd.to_numeric(frame[feature], errors="coerce")
+        greater_label = f"> {float(value):.6g}" + (" or missing" if numeric.isna().any() else "")
         masks_and_labels = [
             (numeric <= float(value), f"<= {float(value):.6g}"),
-            (~(numeric <= float(value)), f"> {float(value):.6g}"),
+            (~(numeric <= float(value)), greater_label),
         ]
         label = f"{feature} <= {float(value):.6g}"
     elif split_type == "category_eq":
@@ -639,7 +664,8 @@ def score_numeric_manual_bins(
     last_mask = numeric > thresholds[-1]
     if numeric.isna().any():
         last_mask = last_mask | ~covered
-    masks_and_labels.append((last_mask, f"> {thresholds[-1]:.6g}"))
+    last_label = f"> {thresholds[-1]:.6g}" + (" or missing" if numeric.isna().any() else "")
+    masks_and_labels.append((last_mask, last_label))
 
     scored = score_branch_split(frame, target, masks_and_labels, min_leaf, infer_target_kind(df[target]))
     if scored is None:
