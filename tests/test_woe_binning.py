@@ -8,6 +8,7 @@ from interactive_decision_tree.woe_binning import (
     WoeBuildConfig,
     apply_bin_table_edits,
     apply_numeric_cutpoints,
+    bin_display_label,
     build_initial_spec,
     evaluate_spec,
     merge_selected_bins,
@@ -60,6 +61,28 @@ def test_apply_numeric_cutpoints_rebuilds_normal_bins():
 
 def test_numeric_bin_label_avoids_scientific_notation():
     assert numeric_bin_label(33280.0, 43650.0) == "(33280, 43650]"
+
+
+def test_numeric_table_reformats_stale_scientific_interval_label():
+    df = pd.DataFrame(
+        {
+            "income": [20_000.0, 35_000.0, 50_000.0, 70_000.0],
+            "target": [1, 0, 0, 1],
+        }
+    )
+    spec = build_initial_spec(df, "target", "income", 1, WoeBuildConfig(engine="fallback"))
+    spec = apply_numeric_cutpoints(spec, [30000.0, 44090.0, 60000.0])
+    normal = [bin_spec for bin_spec in spec["bins"] if bin_spec["kind"] == "normal"]
+    normal[1]["lower"] = 33520.0
+    normal[1]["upper"] = 44090.0
+    normal[1]["label"] = "(3.352e+04, 4.409e+04]"
+
+    table = evaluate_spec(df, "target", spec, 1)["table"]
+    middle_label = table.loc[table["bin_id"] == normal[1]["bin_id"], "label"].iloc[0]
+
+    assert bin_display_label(spec, normal[1]) == "(33520, 44090]"
+    assert middle_label == "(33520, 44090]"
+    assert "e+" not in middle_label
 
 
 def test_numeric_table_edits_can_change_shared_boundary_from_lower_or_upper():

@@ -126,6 +126,15 @@ def numeric_bin_label(lower: float | None, upper: float | None) -> str:
     return f"({format_bound(lower, '-inf')}, {format_bound(upper, 'inf')}]"
 
 
+def bin_display_label(spec: dict[str, Any], bin_spec: dict[str, Any]) -> str:
+    if spec.get("feature_kind") == "numeric" and bin_spec.get("kind") == "normal":
+        return numeric_bin_label(
+            safe_float_or_none(bin_spec.get("lower")),
+            safe_float_or_none(bin_spec.get("upper")),
+        )
+    return str(bin_spec.get("label", "Unmapped"))
+
+
 def quantile_splits(values: pd.Series, max_bins: int, min_bin_size: float) -> list[float]:
     numeric = pd.to_numeric(values, errors="coerce").dropna()
     if numeric.nunique() <= 1:
@@ -432,7 +441,7 @@ def build_bin_table(
                 "bin_id": bin_id,
                 "bin_order": position,
                 "kind": str(bin_spec.get("kind", "unmapped")),
-                "label": str(bin_spec.get("label", "Unmapped")),
+                "label": bin_display_label(spec, bin_spec),
                 "lower": bin_spec.get("lower"),
                 "upper": bin_spec.get("upper"),
                 "values": ", ".join(str(value) for value in bin_spec.get("values", [])),

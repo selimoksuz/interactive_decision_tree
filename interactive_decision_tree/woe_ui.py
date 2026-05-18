@@ -12,6 +12,7 @@ from .woe_binning import (
     apply_bin_table_edits,
     apply_categorical_groups,
     apply_numeric_cutpoints,
+    bin_display_label,
     build_initial_spec,
     categorical_groups_from_spec,
     copy_spec,
@@ -452,7 +453,7 @@ def render_manual_structure_editor(state: dict[str, Any]) -> None:
             "Bins to merge",
             options=merge_options,
             format_func=lambda bin_id: next(
-                str(bin_spec.get("label"))
+                bin_display_label(current_spec, bin_spec)
                 for bin_spec in normal
                 if str(bin_spec.get("bin_id")) == str(bin_id)
             ),
