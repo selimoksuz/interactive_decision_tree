@@ -567,6 +567,77 @@ def set_assigned_woe_from_table(spec: dict[str, Any], edited_table: pd.DataFrame
     return updated
 
 
+def numeric_values_close(left: float | None, right: float | None) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    return abs(float(left) - float(right)) <= 1e-9
+
+
+def edited_numeric_boundary(
+    old_left: dict[str, Any],
+    old_right: dict[str, Any],
+    edited_left: dict[str, Any],
+    edited_right: dict[str, Any],
+) -> float | None:
+    old_boundary = safe_float_or_none(old_left.get("upper"))
+    old_right_lower = safe_float_or_none(old_right.get("lower"))
+    if old_boundary is None:
+        old_boundary = old_right_lower
+    edited_upper = safe_float_or_none(edited_left.get("upper"))
+    edited_lower = safe_float_or_none(edited_right.get("lower"))
+    upper_changed = not numeric_values_close(edited_upper, old_boundary)
+    lower_changed = not numeric_values_close(edited_lower, old_boundary)
+
+    if upper_changed and lower_changed and not numeric_values_close(edited_upper, edited_lower):
+        raise ValueError(
+            "Adjacent lower/upper boundary mismatch. Edit only one side of the boundary or set both sides equal."
+        )
+    if lower_changed:
+        return edited_lower
+    if upper_changed:
+        return edited_upper
+    return old_boundary
+
+
+def apply_numeric_range_edits_from_table(spec: dict[str, Any], edited_table: pd.DataFrame) -> dict[str, Any]:
+    if spec.get("feature_kind") != "numeric" or "bin_id" not in edited_table.columns:
+        return copy_spec(spec)
+
+    old_normal = normal_bins(spec)
+    if len(old_normal) <= 1:
+        return copy_spec(spec)
+    edited_by_id = edited_table.set_index("bin_id").to_dict("index")
+    edited_normal = [edited_by_id.get(str(bin_spec.get("bin_id")), {}) for bin_spec in old_normal]
+
+    first_lower = safe_float_or_none(edited_normal[0].get("lower"))
+    last_upper = safe_float_or_none(edited_normal[-1].get("upper"))
+    if first_lower is not None or last_upper is not None:
+        raise ValueError("The first lower and last upper boundary must stay blank to cover the full value range.")
+
+    cutpoints: list[float] = []
+    for left_index in range(len(old_normal) - 1):
+        boundary = edited_numeric_boundary(
+            old_normal[left_index],
+            old_normal[left_index + 1],
+            edited_normal[left_index],
+            edited_normal[left_index + 1],
+        )
+        if boundary is None:
+            raise ValueError("Interior numeric boundaries cannot be blank.")
+        cutpoints.append(boundary)
+    if any(right <= left for left, right in zip(cutpoints, cutpoints[1:])):
+        raise ValueError("Numeric boundaries must be strictly increasing.")
+
+    return apply_numeric_cutpoints(spec, cutpoints)
+
+
+def apply_bin_table_edits(spec: dict[str, Any], edited_table: pd.DataFrame) -> dict[str, Any]:
+    updated = apply_numeric_range_edits_from_table(spec, edited_table)
+    return set_assigned_woe_from_table(updated, edited_table)
+
+
 def normal_bins(spec: dict[str, Any]) -> list[dict[str, Any]]:
     return [bin_spec for bin_spec in spec.get("bins", []) if bin_spec.get("kind") == "normal"]
 
@@ -594,28 +665,56 @@ def apply_numeric_cutpoints(spec: dict[str, Any], cutpoints: list[float]) -> dic
     return updated
 
 
-def merge_with_next(spec: dict[str, Any], bin_id: str) -> dict[str, Any]:
+def merge_selected_bins(spec: dict[str, Any], bin_ids: list[str]) -> dict[str, Any]:
     updated = copy_spec(spec)
     prefix = special_prefix_bins(updated)
     normal = normal_bins(updated)
-    index = next((idx for idx, bin_spec in enumerate(normal) if str(bin_spec.get("bin_id")) == str(bin_id)), None)
-    if index is None or index >= len(normal) - 1:
+    selected = {str(bin_id) for bin_id in bin_ids}
+    selected_indices = [
+        idx for idx, bin_spec in enumerate(normal) if str(bin_spec.get("bin_id")) in selected
+    ]
+    if len(selected_indices) < 2:
         return updated
-    left = copy.deepcopy(normal[index])
-    right = normal[index + 1]
+
     if updated.get("feature_kind") == "numeric":
+        if max(selected_indices) - min(selected_indices) + 1 != len(selected_indices):
+            raise ValueError("Numeric bin merge requires adjacent bins.")
+        index = min(selected_indices)
+        right_index = max(selected_indices)
+        left = copy.deepcopy(normal[index])
+        right = normal[right_index]
         left["upper"] = right.get("upper")
         left["label"] = numeric_bin_label(safe_float_or_none(left.get("lower")), safe_float_or_none(left.get("upper")))
         left["assigned_woe"] = None
+        merged = normal[:index] + [left] + normal[right_index + 1 :]
     else:
-        left["values"] = list(left.get("values", [])) + list(right.get("values", []))
-        left["label"] = ", ".join(str(value) for value in left["values"][:4]) + (
-            " ..." if len(left["values"]) > 4 else ""
+        insert_at = min(selected_indices)
+        merged_values: list[Any] = []
+        for idx in selected_indices:
+            merged_values.extend(normal[idx].get("values", []))
+        merged_bin = copy.deepcopy(normal[insert_at])
+        merged_bin["values"] = list(dict.fromkeys(str(value) for value in merged_values))
+        merged_bin["label"] = ", ".join(str(value) for value in merged_bin["values"][:4]) + (
+            " ..." if len(merged_bin["values"]) > 4 else ""
         )
-        left["assigned_woe"] = None
-    merged = normal[:index] + [left] + normal[index + 2 :]
+        merged_bin["assigned_woe"] = None
+        merged = []
+        for idx, bin_spec in enumerate(normal):
+            if idx == insert_at:
+                merged.append(merged_bin)
+            if idx in selected_indices:
+                continue
+            merged.append(bin_spec)
     updated["bins"] = renumber_normal_bins(prefix, merged)
     return updated
+
+
+def merge_with_next(spec: dict[str, Any], bin_id: str) -> dict[str, Any]:
+    normal = normal_bins(spec)
+    index = next((idx for idx, bin_spec in enumerate(normal) if str(bin_spec.get("bin_id")) == str(bin_id)), None)
+    if index is None or index >= len(normal) - 1:
+        return copy_spec(spec)
+    return merge_selected_bins(spec, [str(normal[index].get("bin_id")), str(normal[index + 1].get("bin_id"))])
 
 
 def apply_categorical_groups(spec: dict[str, Any], groups: list[list[str]]) -> dict[str, Any]:

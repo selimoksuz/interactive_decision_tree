@@ -9,6 +9,7 @@ import streamlit as st
 
 from .woe_binning import (
     WoeBuildConfig,
+    apply_bin_table_edits,
     apply_categorical_groups,
     apply_numeric_cutpoints,
     build_initial_spec,
@@ -17,12 +18,11 @@ from .woe_binning import (
     cutpoints_from_spec,
     evaluate_original_current,
     evaluate_spec,
-    merge_with_next,
+    merge_selected_bins,
     normal_bins,
     parse_category_groups,
     parse_cutpoints,
     parse_special_values,
-    set_assigned_woe_from_table,
 )
 from .woe_export import (
     build_project_export,
@@ -107,6 +107,8 @@ def woe_column_config() -> dict[str, Any]:
         "non_event_concentration": st.column_config.NumberColumn("non_event_pct", format="%.6f"),
         "calculated_woe": st.column_config.NumberColumn("calculated_woe", format="%.6f"),
         "assigned_woe": st.column_config.NumberColumn("assigned_woe", format="%.6f"),
+        "lower": st.column_config.NumberColumn("lower", format="%.12g"),
+        "upper": st.column_config.NumberColumn("upper", format="%.12g"),
         "export_woe": st.column_config.NumberColumn("export_woe", format="%.6f"),
         "calculated_iv": st.column_config.NumberColumn("calculated_iv", format="%.6f"),
         "export_iv": st.column_config.NumberColumn("export_iv", format="%.6f"),
@@ -358,6 +360,37 @@ def render_special_missing_editor(
 
 def render_manual_structure_editor(state: dict[str, Any]) -> None:
     current_spec = state["current_spec"]
+    normal = normal_bins(current_spec)
+    merge_options = [str(bin_spec.get("bin_id")) for bin_spec in normal]
+    if len(merge_options) >= 2:
+        selected_bins = st.multiselect(
+            "Bins to merge",
+            options=merge_options,
+            format_func=lambda bin_id: next(
+                str(bin_spec.get("label"))
+                for bin_spec in normal
+                if str(bin_spec.get("bin_id")) == str(bin_id)
+            ),
+            key=f"woe_merge_bins::{state['name']}",
+            help=(
+                "Numeric variables require adjacent bins. Categorical variables can merge any selected groups."
+            ),
+        )
+        if st.button(
+            "Merge selected bins",
+            width="stretch",
+            key=f"woe_merge_selected::{state['name']}",
+            disabled=len(selected_bins) < 2,
+        ):
+            try:
+                state["current_spec"] = merge_selected_bins(current_spec, selected_bins)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                state["status"] = "edited"
+                add_edit(state, "merge_selected_bins", {"bin_ids": selected_bins})
+                st.rerun()
+
     if current_spec.get("feature_kind") == "numeric":
         st.markdown("**Numeric cutpoints**")
         cutpoint_key = f"woe_cutpoints::{state['name']}"
@@ -367,30 +400,12 @@ def render_manual_structure_editor(state: dict[str, Any]) -> None:
             key=cutpoint_key,
             help="Comma or newline separated numeric cutpoints.",
         )
-        col1, col2 = st.columns(2)
+        col1, _ = st.columns(2)
         if col1.button("Apply cutpoints", width="stretch", key=f"woe_apply_cutpoints::{state['name']}"):
             state["current_spec"] = apply_numeric_cutpoints(current_spec, parse_cutpoints(cutpoint_text))
             state["status"] = "edited"
             add_edit(state, "apply_cutpoints", {"cutpoints": parse_cutpoints(cutpoint_text)})
             st.rerun()
-        normal = normal_bins(current_spec)
-        merge_options = [bin_spec for bin_spec in normal[:-1]]
-        if merge_options:
-            selected_bin = col2.selectbox(
-                "Merge bin with next",
-                options=[str(bin_spec.get("bin_id")) for bin_spec in merge_options],
-                format_func=lambda bin_id: next(
-                    str(bin_spec.get("label"))
-                    for bin_spec in merge_options
-                    if str(bin_spec.get("bin_id")) == str(bin_id)
-                ),
-                key=f"woe_merge_bin::{state['name']}",
-            )
-            if col2.button("Merge selected", width="stretch", key=f"woe_merge_selected::{state['name']}"):
-                state["current_spec"] = merge_with_next(current_spec, selected_bin)
-                state["status"] = "edited"
-                add_edit(state, "merge_with_next", {"bin_id": selected_bin})
-                st.rerun()
     else:
         st.markdown("**Categorical groups**")
         group_key = f"woe_category_groups::{state['name']}"
@@ -464,39 +479,44 @@ def render_variable_editor(
         if not chart_frame.empty:
             st.line_chart(chart_frame)
         editor_key = f"woe_bin_editor::{project['project_key']}::{variable}"
+        disabled_columns = [
+            "bin_id",
+            "bin_order",
+            "kind",
+            "label",
+            "values",
+            "count",
+            "event_count",
+            "non_event_count",
+            "event_rate",
+            "all_concentration",
+            "event_concentration",
+            "non_event_concentration",
+            "calculated_woe",
+            "export_woe",
+            "calculated_iv",
+            "export_iv",
+            "protected",
+        ]
+        if state["current_spec"].get("feature_kind") != "numeric":
+            disabled_columns.extend(["lower", "upper"])
         edited = st.data_editor(
             editable_bin_table(current_train["table"]),
             hide_index=True,
             width="stretch",
             key=editor_key,
-            disabled=[
-                "bin_id",
-                "bin_order",
-                "kind",
-                "label",
-                "lower",
-                "upper",
-                "values",
-                "count",
-                "event_count",
-                "non_event_count",
-                "event_rate",
-                "all_concentration",
-                "event_concentration",
-                "non_event_concentration",
-                "calculated_woe",
-                "export_woe",
-                "calculated_iv",
-                "export_iv",
-                "protected",
-            ],
+            disabled=disabled_columns,
             column_config=woe_column_config(),
         )
-        if st.button("Apply assigned WOE", width="stretch", key=f"woe_apply_manual_woe::{variable}"):
-            state["current_spec"] = set_assigned_woe_from_table(state["current_spec"], edited)
-            state["status"] = "edited"
-            add_edit(state, "apply_assigned_woe")
-            st.rerun()
+        if st.button("Apply table edits", width="stretch", key=f"woe_apply_table_edits::{variable}"):
+            try:
+                state["current_spec"] = apply_bin_table_edits(state["current_spec"], edited)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                state["status"] = "edited"
+                add_edit(state, "apply_table_edits")
+                st.rerun()
 
     with structure_tab:
         render_manual_structure_editor(state)
