@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from interactive_decision_tree import score_tree_payload
+from interactive_decision_tree import compile_tree_scorer, condition_matches, score_tree_payload
 
 
 def sample_payload():
@@ -95,6 +96,43 @@ def test_score_tree_payload_dataframe_row():
     assert result["prediction_probability"] == 0.8
     assert result["positive_class_probability"] == 0.2
     assert result["leaf_node_id"] == 2
+
+
+def test_compile_tree_scorer_matches_public_scoring():
+    scorer = compile_tree_scorer(sample_payload())
+
+    compiled_result = scorer({"income": 30_000})
+    direct_result = score_tree_payload(sample_payload(), {"income": 30_000})
+
+    assert compiled_result == direct_result
+
+
+@pytest.mark.parametrize(
+    ("condition", "row", "expected"),
+    [
+        ({"feature": "x", "operator": "<=", "threshold": 10}, {"x": 9}, True),
+        ({"feature": "x", "operator": ">", "threshold": 10}, {"x": 9}, False),
+        (
+            {
+                "feature": "x",
+                "operator": "range",
+                "lower": 5,
+                "upper": 10,
+                "lower_inclusive": True,
+                "upper_inclusive": False,
+            },
+            {"x": 5},
+            True,
+        ),
+        ({"feature": "x", "operator": "==", "value": "A"}, {"x": "A"}, True),
+        ({"feature": "x", "operator": "!=", "value": "A"}, {"x": "B"}, True),
+        ({"feature": "x", "operator": "in", "values": ["A", "B"]}, {"x": "B"}, True),
+        ({"feature": "x", "operator": "not_in", "values": ["A", "B"]}, {"x": "C"}, True),
+        ({"feature": "x", "operator": ">", "threshold": 10, "includes_missing": True}, {"x": None}, True),
+    ],
+)
+def test_condition_matches_operator_helpers(condition, row, expected):
+    assert condition_matches(condition, row) is expected
 
 
 def test_score_tree_payload_rebuilds_leaf_path_from_trace_when_exported_path_is_stale():

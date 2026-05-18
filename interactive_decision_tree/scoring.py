@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
 
+RowInput = dict[str, Any] | pd.Series | pd.DataFrame
+TreeNode = dict[str, Any]
+TraceStep = dict[str, Any]
 
-def _row_to_mapping(row: dict[str, Any] | pd.Series | pd.DataFrame) -> dict[str, Any]:
+
+def _row_to_mapping(row: RowInput) -> dict[str, Any]:
     if isinstance(row, pd.DataFrame):
         if len(row) != 1:
             raise ValueError("DataFrame scoring input must contain exactly one row.")
@@ -37,41 +42,68 @@ def _same_value(left: Any, right: Any) -> bool:
         return str(left) == str(right)
 
 
+def _threshold_matches(condition: dict[str, Any], value: Any) -> bool:
+    if _is_missing(value):
+        return bool(condition.get("includes_missing"))
+    numeric_value = float(value)
+    threshold = float(condition["threshold"])
+    return numeric_value <= threshold if condition.get("operator") == "<=" else numeric_value > threshold
+
+
+def _range_matches(condition: dict[str, Any], value: Any) -> bool:
+    if _is_missing(value):
+        return bool(condition.get("includes_missing"))
+    numeric_value = float(value)
+    lower = float(condition["lower"])
+    upper = float(condition["upper"])
+    return _lower_bound_matches(condition, numeric_value, lower) and _upper_bound_matches(
+        condition,
+        numeric_value,
+        upper,
+    )
+
+
+def _lower_bound_matches(condition: dict[str, Any], numeric_value: float, lower: float) -> bool:
+    return numeric_value >= lower if condition.get("lower_inclusive") else numeric_value > lower
+
+
+def _upper_bound_matches(condition: dict[str, Any], numeric_value: float, upper: float) -> bool:
+    return numeric_value <= upper if condition.get("upper_inclusive") else numeric_value < upper
+
+
+def _equals_matches(condition: dict[str, Any], value: Any) -> bool:
+    return _same_value(value, condition.get("value"))
+
+
+def _not_equals_matches(condition: dict[str, Any], value: Any) -> bool:
+    return not _equals_matches(condition, value)
+
+
+def _in_matches(condition: dict[str, Any], value: Any) -> bool:
+    return any(_same_value(value, item) for item in condition.get("values", []))
+
+
+def _not_in_matches(condition: dict[str, Any], value: Any) -> bool:
+    return not _in_matches(condition, value)
+
+
+_CONDITION_HANDLERS: dict[str, Callable[[dict[str, Any], Any], bool]] = {
+    "<=": _threshold_matches,
+    ">": _threshold_matches,
+    "range": _range_matches,
+    "==": _equals_matches,
+    "!=": _not_equals_matches,
+    "in": _in_matches,
+    "not_in": _not_in_matches,
+}
+
+
 def condition_matches(condition: dict[str, Any], row: dict[str, Any]) -> bool:
     operator = condition.get("operator")
-    feature = condition.get("feature")
-    value = row.get(feature)
-
-    if operator in ("<=", ">"):
-        if _is_missing(value):
-            return bool(condition.get("includes_missing"))
-        numeric_value = float(value)
-        threshold = float(condition["threshold"])
-        return numeric_value <= threshold if operator == "<=" else numeric_value > threshold
-
-    if operator == "range":
-        if _is_missing(value):
-            return bool(condition.get("includes_missing"))
-        numeric_value = float(value)
-        lower = float(condition["lower"])
-        upper = float(condition["upper"])
-        lower_ok = numeric_value >= lower if condition.get("lower_inclusive") else numeric_value > lower
-        upper_ok = numeric_value <= upper if condition.get("upper_inclusive") else numeric_value < upper
-        return lower_ok and upper_ok
-
-    if operator == "==":
-        return _same_value(value, condition.get("value"))
-
-    if operator == "!=":
-        return not _same_value(value, condition.get("value"))
-
-    if operator == "in":
-        return any(_same_value(value, item) for item in condition.get("values", []))
-
-    if operator == "not_in":
-        return not any(_same_value(value, item) for item in condition.get("values", []))
-
-    return False
+    handler = _CONDITION_HANDLERS.get(str(operator))
+    if handler is None:
+        return False
+    return handler(condition, row.get(condition.get("feature")))
 
 
 def _class_probabilities(target_summary: dict[str, Any]) -> dict[str, float]:
@@ -136,62 +168,124 @@ def _leaf_path_from_trace(trace: list[dict[str, Any]], fallback_path: Any) -> st
     return " -> ".join(parts)
 
 
-def score_tree_payload(
-    payload: dict[str, Any],
-    row: dict[str, Any] | pd.Series | pd.DataFrame,
-) -> dict[str, Any]:
+def _tree_root(payload: dict[str, Any]) -> TreeNode:
     if not isinstance(payload, dict):
         raise TypeError("payload must be a dictionary.")
-    if "tree" not in payload:
+    tree = payload.get("tree")
+    if not isinstance(tree, dict):
         raise ValueError("payload must contain a nested `tree` export.")
+    return tree
 
-    row_values = _row_to_mapping(row)
-    node = payload["tree"]
-    trace: list[dict[str, Any]] = []
 
-    while True:
-        if node.get("is_leaf") or not node.get("branches"):
-            leaf = node.get("leaf") or {}
-            target_summary = node.get("target_summary", {})
-            prediction = leaf.get("prediction", target_summary.get("prediction"))
-            probabilities = _class_probabilities(target_summary)
-            positive_class = target_summary.get("positive_class", payload.get("positive_class"))
-            positive_probability = (
-                float(target_summary["default_rate"])
-                if target_summary.get("default_rate") is not None
-                else probabilities.get(str(positive_class))
-            )
-            return {
-                "prediction": prediction,
-                "prediction_probability": _prediction_probability(
-                    prediction,
-                    target_summary,
-                    probabilities,
-                ),
-                "class_probabilities": probabilities,
-                "positive_class": positive_class,
-                "positive_class_probability": positive_probability,
-                "leaf_node_id": node.get("node_id"),
-                "leaf_path": _leaf_path_from_trace(trace, node.get("path")),
-                "exported_leaf_path": node.get("path"),
-                "target_summary": target_summary,
-                "trace": trace,
-            }
+def _node_branches(node: TreeNode) -> list[dict[str, Any]]:
+    branches = node.get("branches")
+    return branches if isinstance(branches, list) else []
 
-        for branch in node.get("branches", []):
-            condition = branch.get("condition", {})
-            if condition_matches(condition, row_values):
-                trace.append(
-                    {
-                        "node_id": node.get("node_id"),
-                        "split": node.get("split", {}).get("label"),
-                        "branch_label": branch.get("label"),
-                        "condition": condition,
-                    }
-                )
-                node = branch["child"]
-                break
-        else:
-            raise ValueError(
-                f"No matching branch at node {node.get('node_id')} for row values: {row_values}"
-            )
+
+def _is_leaf_node(node: TreeNode) -> bool:
+    return bool(node.get("is_leaf")) or not _node_branches(node)
+
+
+def _matching_branch(node: TreeNode, row_values: dict[str, Any]) -> dict[str, Any] | None:
+    for branch in _node_branches(node):
+        condition = branch.get("condition", {})
+        if condition_matches(condition, row_values):
+            return branch
+    return None
+
+
+def _trace_step(node: TreeNode, branch: dict[str, Any]) -> TraceStep:
+    return {
+        "node_id": node.get("node_id"),
+        "split": (node.get("split") or {}).get("label"),
+        "branch_label": branch.get("label"),
+        "condition": branch.get("condition", {}),
+    }
+
+
+def _branch_child(branch: dict[str, Any]) -> TreeNode:
+    child = branch.get("child")
+    if not isinstance(child, dict):
+        raise ValueError("Matching branch does not contain a valid child node.")
+    return child
+
+
+def _walk_tree(root: TreeNode, row_values: dict[str, Any]) -> tuple[TreeNode, list[TraceStep]]:
+    node = root
+    trace: list[TraceStep] = []
+    while not _is_leaf_node(node):
+        branch = _matching_branch(node, row_values)
+        if branch is None:
+            raise ValueError(f"No matching branch at node {node.get('node_id')} for row values: {row_values}")
+        trace.append(_trace_step(node, branch))
+        node = _branch_child(branch)
+    return node, trace
+
+
+def _target_summary(node: TreeNode) -> dict[str, Any]:
+    target_summary = node.get("target_summary", {})
+    return target_summary if isinstance(target_summary, dict) else {}
+
+
+def _leaf_prediction(node: TreeNode, target_summary: dict[str, Any]) -> Any:
+    leaf = node.get("leaf") or {}
+    return leaf.get("prediction", target_summary.get("prediction"))
+
+
+def _positive_class(payload: dict[str, Any], target_summary: dict[str, Any]) -> Any:
+    return target_summary.get("positive_class", payload.get("positive_class"))
+
+
+def _positive_probability(
+    positive_class: Any,
+    target_summary: dict[str, Any],
+    probabilities: dict[str, float],
+) -> float | None:
+    if target_summary.get("default_rate") is not None:
+        return float(target_summary["default_rate"])
+    return probabilities.get(str(positive_class))
+
+
+def _leaf_score_result(
+    payload: dict[str, Any],
+    node: TreeNode,
+    trace: list[TraceStep],
+) -> dict[str, Any]:
+    target_summary = _target_summary(node)
+    prediction = _leaf_prediction(node, target_summary)
+    probabilities = _class_probabilities(target_summary)
+    positive_class = _positive_class(payload, target_summary)
+    return {
+        "prediction": prediction,
+        "prediction_probability": _prediction_probability(prediction, target_summary, probabilities),
+        "class_probabilities": probabilities,
+        "positive_class": positive_class,
+        "positive_class_probability": _positive_probability(positive_class, target_summary, probabilities),
+        "leaf_node_id": node.get("node_id"),
+        "leaf_path": _leaf_path_from_trace(trace, node.get("path")),
+        "exported_leaf_path": node.get("path"),
+        "target_summary": target_summary,
+        "trace": trace,
+    }
+
+
+def _score_with_root(
+    payload: dict[str, Any],
+    root: TreeNode,
+    row: RowInput,
+) -> dict[str, Any]:
+    leaf, trace = _walk_tree(root, _row_to_mapping(row))
+    return _leaf_score_result(payload, leaf, trace)
+
+
+def compile_tree_scorer(payload: dict[str, Any]) -> Callable[[RowInput], dict[str, Any]]:
+    root = _tree_root(payload)
+
+    def score(row: RowInput) -> dict[str, Any]:
+        return _score_with_root(payload, root, row)
+
+    return score
+
+
+def score_tree_payload(payload: dict[str, Any], row: RowInput) -> dict[str, Any]:
+    return _score_with_root(payload, _tree_root(payload), row)
