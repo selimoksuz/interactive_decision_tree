@@ -8,7 +8,6 @@ from interactive_decision_tree_app import (
     DEFAULT_DEMO_ROWS,
     analysis_row_idx,
     apply_feature_manager_edits,
-    apply_feature_selection_action,
     build_optimal_tree,
     cached_ranking_ready_message,
     candidate_cache_key,
@@ -32,6 +31,7 @@ from interactive_decision_tree_app import (
     split_ranking_scope_caption,
     split_node,
     train_test_split_indices,
+    update_feature_selection_for_filtered,
     undo_last_split,
     validate_test_dataframe,
 )
@@ -86,16 +86,14 @@ def test_data_setup_feature_selection_actions_preserve_feature_order():
     selected = ["income"]
     filtered = ["age", "score"]
 
-    assert apply_feature_selection_action(features, selected, filtered, "add_filtered") == [
+    assert update_feature_selection_for_filtered(features, selected, filtered, True) == [
         "age",
         "income",
         "score",
     ]
-    assert apply_feature_selection_action(features, ["age", "income", "score"], filtered, "remove_filtered") == [
+    assert update_feature_selection_for_filtered(features, ["age", "income", "score"], filtered, False) == [
         "income"
     ]
-    assert apply_feature_selection_action(features, selected, filtered, "select_all") == features
-    assert apply_feature_selection_action(features, selected, filtered, "clear_all") == []
     assert normalize_feature_selection(features, ["income", "missing", "age"]) == ["income", "age"]
 
 

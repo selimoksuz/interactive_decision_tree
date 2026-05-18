@@ -1910,23 +1910,23 @@ def filter_feature_options(features: list[str], query: str | None) -> list[str]:
     return [feature for feature in features if matches(feature)]
 
 
-def apply_feature_selection_action(
+def ordered_feature_selection(features: list[str], selected: set[str]) -> list[str]:
+    return [feature for feature in features if feature in selected]
+
+
+def update_feature_selection_for_filtered(
     features: list[str],
     current_selection: list[str],
     filtered_features: list[str],
-    action: str,
+    include: bool,
 ) -> list[str]:
-    if action == "select_all":
-        return list(features)
-    if action == "clear_all":
-        return []
     selected = set(normalize_feature_selection(features, current_selection))
     filtered = set(map(str, filtered_features))
-    if action == "add_filtered":
+    if include:
         selected.update(filtered)
-    elif action == "remove_filtered":
+    else:
         selected.difference_update(filtered)
-    return [feature for feature in features if feature in selected]
+    return ordered_feature_selection(features, selected)
 
 
 def apply_feature_manager_edits(
@@ -1943,6 +1943,82 @@ def apply_feature_manager_edits(
     included = edited_table.loc[edited_table["include"].fillna(False).astype(bool), "variable"].astype(str)
     selected.update(included.tolist())
     return [feature for feature in features if feature in selected]
+
+
+def render_feature_filter_popover(
+    container: Any,
+    features: list[str],
+    selected_features: list[str],
+    *,
+    state_key: str,
+    source_key: str,
+    target: str,
+) -> list[str]:
+    with container.popover("Dropdown Filter Panel"):
+        query = st.text_input(
+            "Search variable",
+            placeholder="Search",
+            key=f"feature_search::{source_key}::{target}",
+            label_visibility="collapsed",
+            help="Case-insensitive contains search. Use comma/newline for multiple terms; * or % works as wildcard.",
+        )
+        filtered_features = filter_feature_options(features, query)
+        filtered_signature = hashlib.sha256(
+            json.dumps(filtered_features, default=str).encode("utf-8")
+        ).hexdigest()[:10]
+        selection_signature = hashlib.sha256(
+            json.dumps(selected_features, default=str).encode("utf-8")
+        ).hexdigest()[:10]
+        st.caption(
+            f"{len(selected_features):,} selected | {len(filtered_features):,} matching | {len(features):,} total"
+        )
+
+        selected_set = set(selected_features)
+        all_filtered_selected = bool(filtered_features) and all(
+            feature in selected_set for feature in filtered_features
+        )
+        select_all_value = st.checkbox(
+            "(Select All)",
+            value=all_filtered_selected,
+            key=f"feature_filter_all::{source_key}::{target}::{filtered_signature}::{selection_signature}",
+            disabled=not filtered_features,
+        )
+        if filtered_features and select_all_value != all_filtered_selected:
+            st.session_state[state_key] = update_feature_selection_for_filtered(
+                features,
+                selected_features,
+                filtered_features,
+                select_all_value,
+            )
+            st.rerun()
+
+        list_container = st.container(height=260, border=True)
+        next_selected = set(selected_features)
+        changed = False
+        for feature in filtered_features:
+            was_selected = feature in selected_set
+            is_selected = list_container.checkbox(
+                str(feature),
+                value=was_selected,
+                key=(
+                    f"feature_filter_item::{source_key}::{target}::"
+                    f"{filtered_signature}::{selection_signature}::{feature}"
+                ),
+            )
+            if is_selected != was_selected:
+                changed = True
+                if is_selected:
+                    next_selected.add(feature)
+                else:
+                    next_selected.discard(feature)
+        if changed:
+            st.session_state[state_key] = ordered_feature_selection(features, next_selected)
+            st.rerun()
+        if not filtered_features:
+            st.caption("No matching variables.")
+        st.caption("Changes apply to Data Table Search & Filter Component before Apply data setup.")
+
+    return filtered_features
 
 
 def feature_manager_frame(
@@ -4506,71 +4582,14 @@ def main() -> None:
                 horizontal=True,
                 key="feature_include_mode",
             )
-            feature_selection_tools = data_setup_form.expander("Dropdown Filter Panel", expanded=False)
-            feature_query = feature_selection_tools.text_input(
-                "Search variable name",
-                key=f"feature_search::{draft_source_data_key}::{draft_target}",
-                help="Case-insensitive contains search. Use comma/newline for multiple terms; * or % works as wildcard.",
+            filtered_features = render_feature_filter_popover(
+                data_setup_form,
+                default_features,
+                current_feature_selection,
+                state_key=feature_selection_key,
+                source_key=draft_source_data_key,
+                target=draft_target,
             )
-            filtered_features = filter_feature_options(default_features, feature_query)
-            feature_selection_tools.caption(
-                f"{len(current_feature_selection):,} selected | {len(filtered_features):,} matching | "
-                f"{len(default_features):,} total"
-            )
-            select_cols = feature_selection_tools.columns(2)
-            if select_cols[0].button(
-                "Select all",
-                key=f"feature_select_all::{draft_source_data_key}::{draft_target}",
-                width="stretch",
-                disabled=not default_features,
-            ):
-                st.session_state[feature_selection_key] = apply_feature_selection_action(
-                    default_features,
-                    current_feature_selection,
-                    filtered_features,
-                    "select_all",
-                )
-                st.rerun()
-            if select_cols[1].button(
-                "Clear selection",
-                key=f"feature_clear_all::{draft_source_data_key}::{draft_target}",
-                width="stretch",
-                disabled=not current_feature_selection,
-            ):
-                st.session_state[feature_selection_key] = apply_feature_selection_action(
-                    default_features,
-                    current_feature_selection,
-                    filtered_features,
-                    "clear_all",
-                )
-                st.rerun()
-            filtered_cols = feature_selection_tools.columns(2)
-            if filtered_cols[0].button(
-                "Add matching",
-                key=f"feature_add_matching::{draft_source_data_key}::{draft_target}",
-                width="stretch",
-                disabled=not filtered_features,
-            ):
-                st.session_state[feature_selection_key] = apply_feature_selection_action(
-                    default_features,
-                    current_feature_selection,
-                    filtered_features,
-                    "add_filtered",
-                )
-                st.rerun()
-            if filtered_cols[1].button(
-                "Remove matching",
-                key=f"feature_remove_matching::{draft_source_data_key}::{draft_target}",
-                width="stretch",
-                disabled=not filtered_features or not current_feature_selection,
-            ):
-                st.session_state[feature_selection_key] = apply_feature_selection_action(
-                    default_features,
-                    current_feature_selection,
-                    filtered_features,
-                    "remove_filtered",
-                )
-                st.rerun()
             filtered_signature = hashlib.sha256(
                 json.dumps(filtered_features, default=str).encode("utf-8")
             ).hexdigest()[:10]
