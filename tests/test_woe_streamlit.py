@@ -32,10 +32,6 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     next(radio for radio in at.radio if radio.label == "Workspace").set_value("WOE Binning")
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
-    assert any(text_input.label == "Search variables" for text_input in at.text_input)
-    assert any(button.label == "Select all" for button in at.button)
-    assert any(button.label == "Add filtered" for button in at.button)
-    assert any(button.label == "Apply table selection" for button in at.button)
     assert any(button.label == "Run initial WOE binning" for button in at.button)
 
     next(button for button in at.button if button.label == "Run initial WOE binning").click()

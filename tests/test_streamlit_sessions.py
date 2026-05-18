@@ -32,6 +32,9 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     assert not any(str(key).startswith("candidate_cache::") for key in at.session_state.filtered_state)
 
     assert any(str(dataframe.key).startswith("feature_manager::") for dataframe in at.dataframe)
+    assert any(text_input.label == "Search variable name" for text_input in at.text_input)
+    assert any(button.label == "Select all" for button in at.button)
+    assert any(button.label == "Add matching" for button in at.button)
     assert any(number_input.label == "Split ranking variable limit" for number_input in at.number_input)
 
     next(checkbox for checkbox in at.checkbox if checkbox.label == "Use sampled working data").set_value(True)

@@ -7,6 +7,8 @@ from interactive_decision_tree.session_store import save_dataframe_session
 from interactive_decision_tree_app import (
     DEFAULT_DEMO_ROWS,
     analysis_row_idx,
+    apply_feature_manager_edits,
+    apply_feature_selection_action,
     build_optimal_tree,
     cached_ranking_ready_message,
     candidate_cache_key,
@@ -15,6 +17,7 @@ from interactive_decision_tree_app import (
     checkpoint_ui_state,
     demo_data_key,
     evaluation_model_metrics,
+    filter_feature_options,
     init_tree,
     leaf_performance_rows,
     make_demo_data,
@@ -24,6 +27,7 @@ from interactive_decision_tree_app import (
     restore_checkpoint_ui_state,
     restore_tree_state_from_checkpoint,
     score_split,
+    normalize_feature_selection,
     split_branch_indices,
     split_ranking_scope_caption,
     split_node,
@@ -66,6 +70,40 @@ def test_cached_ranking_message_distinguishes_leaf_from_active_train():
     )
 
     assert message == "Cached ranking ready: 164 candidate(s), 500 selected-leaf row(s) out of 5,000 active train row(s)."
+
+
+def test_data_setup_feature_search_supports_contains_multiple_terms_and_wildcards():
+    features = ["age", "income", "avg_balance_3m", "risk_score", "segment"]
+
+    assert filter_feature_options(features, "bal") == ["avg_balance_3m"]
+    assert filter_feature_options(features, "age,score") == ["age", "risk_score"]
+    assert filter_feature_options(features, "inc%") == ["income"]
+    assert filter_feature_options(features, "*ment") == ["segment"]
+
+
+def test_data_setup_feature_selection_actions_preserve_feature_order():
+    features = ["age", "income", "segment", "score"]
+    selected = ["income"]
+    filtered = ["age", "score"]
+
+    assert apply_feature_selection_action(features, selected, filtered, "add_filtered") == [
+        "age",
+        "income",
+        "score",
+    ]
+    assert apply_feature_selection_action(features, ["age", "income", "score"], filtered, "remove_filtered") == [
+        "income"
+    ]
+    assert apply_feature_selection_action(features, selected, filtered, "select_all") == features
+    assert apply_feature_selection_action(features, selected, filtered, "clear_all") == []
+    assert normalize_feature_selection(features, ["income", "missing", "age"]) == ["income", "age"]
+
+
+def test_data_setup_feature_manager_edits_preserve_hidden_selection():
+    features = ["age", "income", "segment", "score"]
+    edited = pd.DataFrame({"include": [True, False], "variable": ["age", "score"]})
+
+    assert apply_feature_manager_edits(features, ["income", "score"], edited) == ["age", "income"]
 
 
 def test_analysis_row_idx_samples_stably():

@@ -25,14 +25,7 @@ from interactive_decision_tree.woe_export import (
     project_json_bytes,
     project_pickle_bytes,
 )
-from interactive_decision_tree.woe_ui import (
-    apply_variable_table_selection,
-    apply_variable_selection_action,
-    filter_variable_options,
-    normalized_selected_variables,
-    variable_selection_frame,
-    variable_editor_order,
-)
+from interactive_decision_tree.woe_ui import variable_editor_order
 
 
 def woe_df() -> pd.DataFrame:
@@ -310,47 +303,6 @@ def test_variable_editor_order_sorts_by_current_gini_descending():
     }
 
     assert variable_editor_order(project, df, None, "target", 1) == ["strong", "weak"]
-
-
-def test_variable_selection_filter_supports_contains_multiple_terms_and_wildcards():
-    features = ["age", "income", "avg_balance_3m", "risk_score", "segment"]
-
-    assert filter_variable_options(features, "bal") == ["avg_balance_3m"]
-    assert filter_variable_options(features, "age,score") == ["age", "risk_score"]
-    assert filter_variable_options(features, "inc%") == ["income"]
-    assert filter_variable_options(features, "*ment") == ["segment"]
-
-
-def test_variable_selection_bulk_actions_preserve_feature_order():
-    features = ["age", "income", "segment", "score"]
-    selected = ["income"]
-    filtered = ["age", "score"]
-
-    assert apply_variable_selection_action(features, selected, filtered, "add_filtered") == [
-        "age",
-        "income",
-        "score",
-    ]
-    assert apply_variable_selection_action(
-        features,
-        ["age", "income", "score"],
-        filtered,
-        "remove_filtered",
-    ) == ["income"]
-    assert apply_variable_selection_action(features, selected, filtered, "select_all") == features
-    assert apply_variable_selection_action(features, selected, filtered, "clear_all") == []
-    assert normalized_selected_variables(features, ["income", "missing", "age"]) == ["income", "age"]
-
-
-def test_variable_selection_table_edits_toggle_filtered_variables():
-    features = ["age", "income", "segment", "score"]
-    selected = ["income", "score"]
-    table = variable_selection_frame(["age", "score"], selected)
-
-    table.loc[table["variable"] == "age", "selected"] = True
-    table.loc[table["variable"] == "score", "selected"] = False
-
-    assert apply_variable_table_selection(features, selected, table) == ["age", "income"]
 
 
 def test_parse_special_values_accepts_commas_and_newlines():

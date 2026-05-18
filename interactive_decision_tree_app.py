@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import io
 import json
@@ -1872,6 +1873,78 @@ def feature_kind(series: pd.Series) -> str:
     return "other"
 
 
+def normalize_feature_selection(features: list[str], selected: Any) -> list[str]:
+    feature_set = set(map(str, features))
+    if selected is None:
+        return []
+    if isinstance(selected, str):
+        selected_iterable = [selected]
+    else:
+        try:
+            selected_iterable = list(selected)
+        except TypeError:
+            selected_iterable = []
+    return [str(feature) for feature in selected_iterable if str(feature) in feature_set]
+
+
+def filter_feature_options(features: list[str], query: str | None) -> list[str]:
+    text = str(query or "").strip().lower()
+    if not text:
+        return list(features)
+    tokens = [
+        token.strip().lower().replace("%", "*")
+        for chunk in text.replace("\n", ",").split(",")
+        for token in [chunk]
+        if token.strip()
+    ]
+    if not tokens:
+        return list(features)
+
+    def matches(feature: str) -> bool:
+        lowered = str(feature).lower()
+        return any(
+            fnmatch.fnmatch(lowered, token) if "*" in token or "?" in token else token in lowered
+            for token in tokens
+        )
+
+    return [feature for feature in features if matches(feature)]
+
+
+def apply_feature_selection_action(
+    features: list[str],
+    current_selection: list[str],
+    filtered_features: list[str],
+    action: str,
+) -> list[str]:
+    if action == "select_all":
+        return list(features)
+    if action == "clear_all":
+        return []
+    selected = set(normalize_feature_selection(features, current_selection))
+    filtered = set(map(str, filtered_features))
+    if action == "add_filtered":
+        selected.update(filtered)
+    elif action == "remove_filtered":
+        selected.difference_update(filtered)
+    return [feature for feature in features if feature in selected]
+
+
+def apply_feature_manager_edits(
+    features: list[str],
+    current_selection: list[str],
+    edited_table: pd.DataFrame,
+) -> list[str]:
+    selected = set(normalize_feature_selection(features, current_selection))
+    if edited_table.empty or not {"include", "variable"}.issubset(edited_table.columns):
+        return [feature for feature in features if feature in selected]
+
+    visible_features = [str(feature) for feature in edited_table["variable"].tolist()]
+    selected.difference_update(visible_features)
+    included = edited_table.loc[edited_table["include"].fillna(False).astype(bool), "variable"].astype(str)
+    selected.update(included.tolist())
+    return [feature for feature in features if feature in selected]
+
+
 def feature_manager_frame(
     df: pd.DataFrame,
     features: list[str],
@@ -1899,7 +1972,18 @@ def feature_manager_frame(
                 "profile_rows": int(profile_n),
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "include",
+            "variable",
+            "kind",
+            "dtype",
+            "missing_rate_sample",
+            "unique_count_sample",
+            "profile_rows",
+        ],
+    )
 
 
 def secret_sql_connections() -> dict[str, str]:
@@ -4405,10 +4489,16 @@ def main() -> None:
                 default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
             else:
                 default_selected_features = default_features
+            feature_selection_key = f"feature_selection::{draft_source_data_key}::{draft_target}"
+            st.session_state[feature_selection_key] = normalize_feature_selection(
+                default_features,
+                st.session_state.get(feature_selection_key, default_selected_features),
+            )
+            current_feature_selection = st.session_state[feature_selection_key]
             data_setup_form.markdown("**Feature manager**")
             data_setup_form.caption(
                 f"Profile columns are estimated on the first {min(len(draft_source_df), FEATURE_PROFILE_SAMPLE_ROWS):,} row(s). "
-                "Only included variables are available in Tree Builder."
+                "Only included variables are available in Tree Builder and WOE Binning."
             )
             feature_include_mode = data_setup_form.radio(
                 "Feature include mode",
@@ -4416,11 +4506,89 @@ def main() -> None:
                 horizontal=True,
                 key="feature_include_mode",
             )
+            feature_selection_tools = data_setup_form.expander("Dropdown Filter Panel", expanded=False)
+            feature_query = feature_selection_tools.text_input(
+                "Search variable name",
+                key=f"feature_search::{draft_source_data_key}::{draft_target}",
+                help="Case-insensitive contains search. Use comma/newline for multiple terms; * or % works as wildcard.",
+            )
+            filtered_features = filter_feature_options(default_features, feature_query)
+            feature_selection_tools.caption(
+                f"{len(current_feature_selection):,} selected | {len(filtered_features):,} matching | "
+                f"{len(default_features):,} total"
+            )
+            select_cols = feature_selection_tools.columns(2)
+            if select_cols[0].button(
+                "Select all",
+                key=f"feature_select_all::{draft_source_data_key}::{draft_target}",
+                width="stretch",
+                disabled=not default_features,
+            ):
+                st.session_state[feature_selection_key] = apply_feature_selection_action(
+                    default_features,
+                    current_feature_selection,
+                    filtered_features,
+                    "select_all",
+                )
+                st.rerun()
+            if select_cols[1].button(
+                "Clear selection",
+                key=f"feature_clear_all::{draft_source_data_key}::{draft_target}",
+                width="stretch",
+                disabled=not current_feature_selection,
+            ):
+                st.session_state[feature_selection_key] = apply_feature_selection_action(
+                    default_features,
+                    current_feature_selection,
+                    filtered_features,
+                    "clear_all",
+                )
+                st.rerun()
+            filtered_cols = feature_selection_tools.columns(2)
+            if filtered_cols[0].button(
+                "Add matching",
+                key=f"feature_add_matching::{draft_source_data_key}::{draft_target}",
+                width="stretch",
+                disabled=not filtered_features,
+            ):
+                st.session_state[feature_selection_key] = apply_feature_selection_action(
+                    default_features,
+                    current_feature_selection,
+                    filtered_features,
+                    "add_filtered",
+                )
+                st.rerun()
+            if filtered_cols[1].button(
+                "Remove matching",
+                key=f"feature_remove_matching::{draft_source_data_key}::{draft_target}",
+                width="stretch",
+                disabled=not filtered_features or not current_feature_selection,
+            ):
+                st.session_state[feature_selection_key] = apply_feature_selection_action(
+                    default_features,
+                    current_feature_selection,
+                    filtered_features,
+                    "remove_filtered",
+                )
+                st.rerun()
+            filtered_signature = hashlib.sha256(
+                json.dumps(filtered_features, default=str).encode("utf-8")
+            ).hexdigest()[:10]
+            selection_signature = hashlib.sha256(
+                json.dumps(current_feature_selection, default=str).encode("utf-8")
+            ).hexdigest()[:10]
+            data_setup_form.markdown("**Data Table Search & Filter Component**")
+            data_setup_form.caption(
+                "The table shows matching variables only; selections outside the filter are preserved."
+            )
             feature_manager = data_setup_form.data_editor(
-                feature_manager_frame(draft_source_df, default_features, default_selected_features),
+                feature_manager_frame(draft_source_df, filtered_features, current_feature_selection),
                 hide_index=True,
                 width="stretch",
-                key=f"feature_manager::{draft_source_data_key}::{draft_target}",
+                key=(
+                    f"feature_manager::{draft_source_data_key}::{draft_target}::"
+                    f"{filtered_signature}::{selection_signature}"
+                ),
                 disabled=[
                     "variable",
                     "kind",
@@ -4439,26 +4607,24 @@ def main() -> None:
                     "profile_rows": st.column_config.NumberColumn("profile_rows", format="%d"),
                 },
             )
+            table_selected_features = apply_feature_manager_edits(
+                default_features,
+                current_feature_selection,
+                feature_manager,
+            )
+            st.session_state[feature_selection_key] = table_selected_features
             if feature_include_mode == "Include all":
                 draft_features = default_features
             elif feature_include_mode == "Numeric only":
                 draft_features = [
-                    row["variable"]
-                    for row in feature_manager.to_dict("records")
-                    if row.get("kind") == "numeric"
+                    feature for feature in default_features if feature_kind(draft_source_df[feature]) == "numeric"
                 ]
             elif feature_include_mode == "Categorical only":
                 draft_features = [
-                    row["variable"]
-                    for row in feature_manager.to_dict("records")
-                    if row.get("kind") == "categorical"
+                    feature for feature in default_features if feature_kind(draft_source_df[feature]) == "categorical"
                 ]
             else:
-                draft_features = [
-                    row["variable"]
-                    for row in feature_manager.to_dict("records")
-                    if bool(row.get("include"))
-                ]
+                draft_features = table_selected_features
             data_setup_form.caption(f"Staged split variables: {len(draft_features):,} / {len(default_features):,}")
             draft_split_variable_limit_default = min(
                 max(1, len(draft_features)),
