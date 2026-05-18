@@ -31,7 +31,7 @@ from .woe_export import (
     build_project_export,
     project_excel_bytes,
     project_json_bytes,
-    project_python_transformer_text,
+    project_pickle_bytes,
     project_sql_text,
     state_export_decision,
     state_mapping_state,
@@ -319,7 +319,7 @@ def render_project_exports(
         options=list(scope_options),
         index=0,
         format_func=lambda key: scope_options[str(key)]["label"],
-        help="Applies to JSON, Python transformer and SQL CASE exports. Excel report keeps all variables for audit.",
+        help="Applies to every WOE export download shown below.",
     )
     scope = scope_options[str(scope_key)]
     export_payload = build_project_export(
@@ -343,16 +343,24 @@ def render_project_exports(
     )
     export_cols[1].download_button(
         "Download WOE Excel",
-        data=project_excel_bytes(project, df, test_df, target, positive_class),
+        data=project_excel_bytes(
+            project,
+            df,
+            test_df,
+            target,
+            positive_class,
+            included_only=bool(scope["included_only"]),
+            excluded_only=bool(scope["excluded_only"]),
+        ),
         file_name="interactive_woe_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
     export_cols[2].download_button(
-        "Download Python transformer",
-        data=project_python_transformer_text(export_payload),
-        file_name="woe_transformer.py",
-        mime="text/x-python",
+        "Download WOE cache PKL",
+        data=project_pickle_bytes(export_payload),
+        file_name="interactive_woe_cache.pkl",
+        mime="application/octet-stream",
         width="stretch",
     )
     export_cols[3].download_button(
@@ -362,6 +370,42 @@ def render_project_exports(
         mime="text/plain",
         width="stretch",
     )
+
+
+def _sort_metric(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if pd.notna(parsed) else None
+
+
+def variable_editor_order(
+    project: dict[str, Any],
+    df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    positive_class: Any,
+) -> list[str]:
+    variables = sorted(project.get("variables", {}))
+    if not variables:
+        return []
+    summary = variable_state_rows(project, df, test_df, target, positive_class)
+    if summary.empty or "variable" not in summary.columns:
+        return variables
+    metric_by_variable = {str(row["variable"]): row for row in summary.to_dict("records")}
+
+    def sort_key(variable: str) -> tuple[int, float, float, str]:
+        row = metric_by_variable.get(variable, {})
+        gini = _sort_metric(row.get("current_gini"))
+        iv = _sort_metric(row.get("current_iv"))
+        if gini is not None:
+            return (0, -gini, -(iv or 0.0), variable)
+        if iv is not None:
+            return (1, 0.0, -iv, variable)
+        return (2, 0.0, 0.0, variable)
+
+    return sorted(variables, key=sort_key)
 
 
 def render_special_missing_editor(
@@ -516,7 +560,7 @@ def render_variable_editor(
     target: str,
     positive_class: Any,
 ) -> None:
-    variables = sorted(project.get("variables", {}))
+    variables = variable_editor_order(project, df, test_df, target, positive_class)
     if not variables:
         return
 

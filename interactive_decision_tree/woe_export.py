@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import pickle
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,15 +38,55 @@ def state_export_decision(state: dict[str, Any]) -> str:
     return "include"
 
 
+def scoped_variable_states(
+    project: dict[str, Any],
+    *,
+    approved_only: bool = False,
+    include_statuses: set[str] | None = None,
+    exclude_statuses: set[str] | None = None,
+    included_only: bool = False,
+    excluded_only: bool = False,
+) -> list[tuple[str, dict[str, Any]]]:
+    states: list[tuple[str, dict[str, Any]]] = []
+    for variable, state in sorted(project.get("variables", {}).items()):
+        status = str(state.get("status", "auto"))
+        included = state_export_decision(state) == "include"
+        if approved_only and status != "approved":
+            continue
+        if include_statuses is not None and status not in include_statuses:
+            continue
+        if exclude_statuses is not None and status in exclude_statuses:
+            continue
+        if included_only and not included:
+            continue
+        if excluded_only and included:
+            continue
+        states.append((variable, state))
+    return states
+
+
 def variable_state_rows(
     project: dict[str, Any],
     train_df: pd.DataFrame,
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
+    *,
+    approved_only: bool = False,
+    include_statuses: set[str] | None = None,
+    exclude_statuses: set[str] | None = None,
+    included_only: bool = False,
+    excluded_only: bool = False,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for variable, state in sorted(project.get("variables", {}).items()):
+    for variable, state in scoped_variable_states(
+        project,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    ):
         current_spec = state.get("current_spec")
         original_spec = state.get("original_spec")
         if not isinstance(current_spec, dict) or not isinstance(original_spec, dict):
@@ -93,9 +134,22 @@ def bin_detail_rows(
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
+    *,
+    approved_only: bool = False,
+    include_statuses: set[str] | None = None,
+    exclude_statuses: set[str] | None = None,
+    included_only: bool = False,
+    excluded_only: bool = False,
 ) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    for state in sorted(project.get("variables", {}).values(), key=lambda item: item.get("name", "")):
+    for _, state in scoped_variable_states(
+        project,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    ):
         current_spec = state.get("current_spec")
         if not isinstance(current_spec, dict):
             continue
@@ -174,23 +228,29 @@ def build_project_export(
     excluded_only: bool = False,
 ) -> dict[str, Any]:
     variables: list[dict[str, Any]] = []
-    for state in sorted(project.get("variables", {}).values(), key=lambda item: item.get("name", "")):
-        status = str(state.get("status", "auto"))
-        included = state_export_decision(state) == "include"
-        if approved_only and status != "approved":
-            continue
-        if include_statuses is not None and status not in include_statuses:
-            continue
-        if exclude_statuses is not None and status in exclude_statuses:
-            continue
-        if included_only and not included:
-            continue
-        if excluded_only and included:
-            continue
+    for _, state in scoped_variable_states(
+        project,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    ):
         payload = export_variable_payload(state, train_df, target, positive_class)
         if payload is not None:
             variables.append(payload)
-    summary = variable_state_rows(project, train_df, test_df, target, positive_class)
+    summary = variable_state_rows(
+        project,
+        train_df,
+        test_df,
+        target,
+        positive_class,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    )
     return {
         "format": "interactive_woe_mapping",
         "schema_version": 1,
@@ -208,17 +268,207 @@ def project_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(safe_json(payload), indent=2, ensure_ascii=False).encode("utf-8")
 
 
+def _normal_dc_bins(variable: dict[str, Any]) -> list[dict[str, Any]]:
+    bins: list[dict[str, Any]] = []
+    for bin_payload in variable.get("bins", []):
+        if bin_payload.get("kind") != "normal":
+            continue
+        left = bin_payload.get("lower")
+        right = bin_payload.get("upper")
+        if left is None and right is None:
+            left = float("-inf")
+            right = float("inf")
+        bins.append({"left": left, "right": right, "woe": float(bin_payload.get("export_woe", 0.0) or 0.0)})
+    return bins
+
+
+def _numeric_dc_entry(variable: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    entry: dict[str, Any] = {"type": "numeric", "bins": _normal_dc_bins(variable)}
+    values_entry: dict[str, Any] = {
+        "type": "numeric",
+        "bins": _numeric_edges(variable),
+        "woe_map": {index: row["woe"] for index, row in enumerate(entry["bins"])},
+        "iv": variable.get("metrics", {}).get("export_iv"),
+        "stats": _dc_stats(variable),
+    }
+    special_woe: dict[Any, float] = {}
+    special_values: list[Any] = []
+    for bin_payload in variable.get("bins", []):
+        woe_value = float(bin_payload.get("export_woe", 0.0) or 0.0)
+        if bin_payload.get("kind") == "missing":
+            entry["missing_woe"] = woe_value
+            values_entry["missing_woe"] = woe_value
+            values_entry["missing_label"] = "MISSING"
+        elif bin_payload.get("kind") == "special":
+            for value in bin_payload.get("values", []):
+                special_values.append(value)
+                special_woe[value] = woe_value
+    if special_woe:
+        entry["special_woe"] = special_woe
+        entry["special_values"] = special_values
+        values_entry["special_woe"] = special_woe
+        values_entry["special_values"] = special_values
+    return entry, values_entry
+
+
+def _numeric_edges(variable: dict[str, Any]) -> list[float]:
+    normal_bins = [item for item in variable.get("bins", []) if item.get("kind") == "normal"]
+    if not normal_bins:
+        return [float("-inf"), float("inf")]
+    edges: list[float] = [float("-inf")]
+    for bin_payload in normal_bins[:-1]:
+        upper = bin_payload.get("upper")
+        if upper is not None:
+            edges.append(float(upper))
+    edges.append(float("inf"))
+    return edges
+
+
+def _dc_stats(variable: dict[str, Any]) -> list[dict[str, Any]]:
+    stats: list[dict[str, Any]] = []
+    for bin_payload in variable.get("bins", []):
+        stats.append(
+            {
+                "label": bin_payload.get("label"),
+                "bin_left": bin_payload.get("lower"),
+                "bin_right": bin_payload.get("upper"),
+                "woe": bin_payload.get("export_woe"),
+                "iv_contrib": bin_payload.get("export_iv"),
+                "event_count": bin_payload.get("event_count"),
+                "nonevent_count": bin_payload.get("non_event_count"),
+                "total_count": bin_payload.get("count"),
+                "event_rate": bin_payload.get("event_rate"),
+                "members": bin_payload.get("values", []),
+            }
+        )
+    return stats
+
+
+def _categorical_dc_entry(variable: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    woe_map: dict[str, float] = {}
+    entry: dict[str, Any] = {"type": "categorical", "groups": groups}
+    for bin_payload in variable.get("bins", []):
+        woe_value = float(bin_payload.get("export_woe", 0.0) or 0.0)
+        kind = bin_payload.get("kind")
+        if kind == "missing":
+            entry["missing_woe"] = woe_value
+            entry["missing_label"] = "__MISSING__"
+            woe_map["__MISSING__"] = woe_value
+            woe_map[""] = woe_value
+            continue
+        if kind not in {"normal", "special"}:
+            continue
+        members = [str(value) for value in bin_payload.get("values", [])]
+        groups.append(
+            {
+                "label": str(bin_payload.get("label", "")),
+                "members": members,
+                "woe": woe_value,
+                "event_count": bin_payload.get("event_count"),
+                "nonevent_count": bin_payload.get("non_event_count"),
+                "total_count": bin_payload.get("count"),
+                "event_rate": bin_payload.get("event_rate"),
+                "iv_contrib": bin_payload.get("export_iv"),
+            }
+        )
+        for value in members:
+            woe_map[str(value)] = woe_value
+    entry["woe_map"] = woe_map
+    entry["default_woe"] = 0.0
+    values_entry = {
+        **entry,
+        "iv": variable.get("metrics", {}).get("export_iv"),
+        "stats": groups,
+        "categories": list(woe_map),
+    }
+    return entry, values_entry
+
+
+def dc_corp_woe_artifacts(payload: dict[str, Any]) -> dict[str, Any]:
+    mapping = {"variables": {}}
+    woe_values: dict[str, Any] = {}
+    for variable in payload.get("variables", []):
+        name = str(variable.get("name"))
+        if variable.get("type") == "numeric":
+            entry, values_entry = _numeric_dc_entry(variable)
+        else:
+            entry, values_entry = _categorical_dc_entry(variable)
+        mapping["variables"][name] = entry
+        woe_values[name] = values_entry
+    return {"woe_mapping": mapping, "woe_values": woe_values}
+
+
+def project_pickle_bytes(payload: dict[str, Any]) -> bytes:
+    dc_artifacts = dc_corp_woe_artifacts(payload)
+    cache_payload = {
+        "format": "interactive_woe_cache",
+        "schema_version": 1,
+        "created_at": payload.get("created_at"),
+        "target": payload.get("target"),
+        "positive_class": payload.get("positive_class"),
+        "data_key": payload.get("data_key"),
+        "variable_count": payload.get("variable_count"),
+        "variables": [variable.get("name") for variable in payload.get("variables", [])],
+        "summary": payload.get("summary", []),
+        "interactive_woe_mapping": payload,
+        "dc_corp_pipe": dc_artifacts,
+        "woe_mapping": dc_artifacts["woe_mapping"],
+        "woe_values": dc_artifacts["woe_values"],
+    }
+    return pickle.dumps(cache_payload, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def project_excel_bytes(
     project: dict[str, Any],
     train_df: pd.DataFrame,
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
+    *,
+    approved_only: bool = False,
+    include_statuses: set[str] | None = None,
+    exclude_statuses: set[str] | None = None,
+    included_only: bool = False,
+    excluded_only: bool = False,
 ) -> bytes:
     output = io.BytesIO()
-    summary = variable_state_rows(project, train_df, test_df, target, positive_class)
-    bins = bin_detail_rows(project, train_df, test_df, target, positive_class)
-    export_payload = build_project_export(project, train_df, test_df, target, positive_class)
+    summary = variable_state_rows(
+        project,
+        train_df,
+        test_df,
+        target,
+        positive_class,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    )
+    bins = bin_detail_rows(
+        project,
+        train_df,
+        test_df,
+        target,
+        positive_class,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    )
+    export_payload = build_project_export(
+        project,
+        train_df,
+        test_df,
+        target,
+        positive_class,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    )
     contract = pd.DataFrame(
         [
             {"field": "format", "value": export_payload["format"]},
@@ -230,7 +480,14 @@ def project_excel_bytes(
         ]
     )
     edits = []
-    for variable, state in sorted(project.get("variables", {}).items()):
+    for variable, state in scoped_variable_states(
+        project,
+        approved_only=approved_only,
+        include_statuses=include_statuses,
+        exclude_statuses=exclude_statuses,
+        included_only=included_only,
+        excluded_only=excluded_only,
+    ):
         for edit in state.get("edits", []):
             edits.append({"variable": variable, **safe_json(edit)})
     edits_frame = pd.DataFrame(edits)
@@ -285,72 +542,3 @@ def variable_sql_case(variable: dict[str, Any]) -> str:
 def project_sql_text(payload: dict[str, Any]) -> str:
     cases = [variable_sql_case(variable) for variable in payload.get("variables", [])]
     return ",\n\n".join(cases)
-
-
-def project_python_transformer_text(payload: dict[str, Any]) -> str:
-    mapping_json = json.dumps(safe_json(payload), indent=2, ensure_ascii=False)
-    return f'''from __future__ import annotations
-
-import pandas as pd
-
-
-WOE_MAPPING = {mapping_json}
-
-
-def _is_missing(value):
-    return pd.isna(value) or (isinstance(value, str) and value.strip() == "")
-
-
-def _map_numeric(value, bins):
-    if _is_missing(value):
-        for bin_payload in bins:
-            if bin_payload.get("kind") == "missing":
-                return bin_payload.get("export_woe", 0.0)
-        return 0.0
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    for bin_payload in bins:
-        if bin_payload.get("kind") == "special":
-            try:
-                if numeric in [float(item) for item in bin_payload.get("values", [])]:
-                    return bin_payload.get("export_woe", 0.0)
-            except (TypeError, ValueError):
-                pass
-        if bin_payload.get("kind") != "normal":
-            continue
-        lower = bin_payload.get("lower")
-        upper = bin_payload.get("upper")
-        if lower is not None and numeric <= float(lower):
-            continue
-        if upper is not None and numeric > float(upper):
-            continue
-        return bin_payload.get("export_woe", 0.0)
-    return 0.0
-
-
-def _map_categorical(value, bins):
-    if _is_missing(value):
-        for bin_payload in bins:
-            if bin_payload.get("kind") == "missing":
-                return bin_payload.get("export_woe", 0.0)
-        return 0.0
-    text = str(value)
-    for bin_payload in bins:
-        if text in {{str(item) for item in bin_payload.get("values", [])}}:
-            return bin_payload.get("export_woe", 0.0)
-    return 0.0
-
-
-def transform_woe(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for variable in WOE_MAPPING.get("variables", []):
-        name = variable["name"]
-        bins = variable.get("bins", [])
-        if variable.get("type") == "numeric":
-            out[f"{{name}}_WOE"] = out[name].map(lambda value: _map_numeric(value, bins))
-        else:
-            out[f"{{name}}_WOE"] = out[name].map(lambda value: _map_categorical(value, bins))
-    return out
-'''

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import pickle
 
 import pandas as pd
 
@@ -16,7 +18,14 @@ from interactive_decision_tree.woe_binning import (
     parse_special_values,
     set_assigned_woe_from_table,
 )
-from interactive_decision_tree.woe_export import build_project_export, project_json_bytes
+from interactive_decision_tree.woe_export import (
+    build_project_export,
+    dc_corp_woe_artifacts,
+    project_excel_bytes,
+    project_json_bytes,
+    project_pickle_bytes,
+)
+from interactive_decision_tree.woe_ui import variable_editor_order
 
 
 def woe_df() -> pd.DataFrame:
@@ -198,6 +207,102 @@ def test_project_export_filters_by_export_decision_not_manual_status():
     assert {variable["name"] for variable in all_variables["variables"]} == {"age", "segment"}
     assert included["variables"][0]["mapping_state"] == "auto"
     assert included["variables"][0]["export_decision"] == "include"
+
+
+def test_excel_export_respects_selected_export_scope():
+    df = woe_df()
+    age_spec = build_initial_spec(df, "target", "age", 1, WoeBuildConfig(engine="fallback"))
+    segment_spec = build_initial_spec(df, "target", "segment", 1, WoeBuildConfig(engine="fallback"))
+    project = {
+        "data_key": "unit-test",
+        "variables": {
+            "age": {
+                "name": "age",
+                "status": "edited",
+                "export_decision": "include",
+                "original_spec": age_spec,
+                "current_spec": age_spec,
+                "edits": [{"action": "keep_age"}],
+            },
+            "segment": {
+                "name": "segment",
+                "status": "edited",
+                "export_decision": "exclude",
+                "original_spec": segment_spec,
+                "current_spec": segment_spec,
+                "edits": [{"action": "exclude_segment"}],
+            },
+        },
+    }
+
+    workbook = project_excel_bytes(project, df, None, "target", 1, included_only=True)
+    metrics = pd.read_excel(io.BytesIO(workbook), sheet_name="Variable Metrics")
+    details = pd.read_excel(io.BytesIO(workbook), sheet_name="Bin Details")
+    edits = pd.read_excel(io.BytesIO(workbook), sheet_name="Manual Edits")
+
+    assert metrics["variable"].tolist() == ["age"]
+    assert set(details["variable"]) == {"age"}
+    assert edits["variable"].tolist() == ["age"]
+
+
+def test_pickle_export_contains_scoped_dc_corp_pipe_cache_payload():
+    df = woe_df()
+    age_spec = build_initial_spec(df, "target", "age", 1, WoeBuildConfig(engine="fallback"))
+    segment_spec = build_initial_spec(df, "target", "segment", 1, WoeBuildConfig(engine="fallback"))
+    project = {
+        "data_key": "unit-test",
+        "variables": {
+            "age": {
+                "name": "age",
+                "status": "edited",
+                "export_decision": "include",
+                "original_spec": age_spec,
+                "current_spec": age_spec,
+            },
+            "segment": {
+                "name": "segment",
+                "status": "edited",
+                "export_decision": "exclude",
+                "original_spec": segment_spec,
+                "current_spec": segment_spec,
+            },
+        },
+    }
+    payload = build_project_export(project, df, None, "target", 1, included_only=True)
+
+    cache = pickle.loads(project_pickle_bytes(payload))
+    dc_payload = dc_corp_woe_artifacts(payload)
+
+    assert cache["format"] == "interactive_woe_cache"
+    assert cache["variables"] == ["age"]
+    assert cache["woe_mapping"] == dc_payload["woe_mapping"]
+    assert set(cache["dc_corp_pipe"]["woe_mapping"]["variables"]) == {"age"}
+    assert set(cache["dc_corp_pipe"]["woe_values"]) == {"age"}
+    age_entry = cache["dc_corp_pipe"]["woe_mapping"]["variables"]["age"]
+    assert age_entry["type"] == "numeric"
+    assert age_entry["bins"]
+    assert all(isinstance(key, int) for key in cache["woe_values"]["age"]["woe_map"])
+
+
+def test_variable_editor_order_sorts_by_current_gini_descending():
+    df = pd.DataFrame(
+        {
+            "strong": [1, 1, 1, 1, 9, 9, 9, 9],
+            "weak": [1, 9, 1, 9, 1, 9, 1, 9],
+            "target": [1, 1, 1, 1, 0, 0, 0, 0],
+        }
+    )
+    strong_spec = build_initial_spec(df, "target", "strong", 1, WoeBuildConfig(engine="fallback"))
+    weak_spec = build_initial_spec(df, "target", "weak", 1, WoeBuildConfig(engine="fallback"))
+    project = {
+        "data_key": "unit-test",
+        "variables": {
+            "weak": {"name": "weak", "original_spec": weak_spec, "current_spec": weak_spec},
+            "strong": {"name": "strong", "original_spec": strong_spec, "current_spec": strong_spec},
+        },
+    }
+
+    assert variable_editor_order(project, df, None, "target", 1) == ["strong", "weak"]
 
 
 def test_parse_special_values_accepts_commas_and_newlines():
