@@ -298,6 +298,65 @@ def missing_bin() -> dict[str, Any]:
     }
 
 
+def count_event_rows(mask: pd.Series, event: pd.Series) -> dict[str, int]:
+    count = int(mask.sum())
+    event_count = int((mask & event).sum())
+    return {
+        "count": count,
+        "event_count": event_count,
+        "non_event_count": count - event_count,
+    }
+
+
+def build_evaluation_profile(
+    df: pd.DataFrame,
+    target: str,
+    feature: str,
+    positive_class: Any,
+    feature_kind: str,
+    missing: pd.Series,
+    special: pd.Series,
+) -> dict[str, Any]:
+    y_valid = df[target].notna()
+    event = (df[target] == positive_class) & y_valid
+    normal = ~missing & ~special & y_valid
+    profile: dict[str, Any] = {
+        "schema_version": WOE_SCHEMA_VERSION,
+        "dataset_name": "Train",
+        "dataframe_id": id(df),
+        "rows": int(len(df)),
+        "target": str(target),
+        "feature": str(feature),
+        "positive_class": json_safe_value(positive_class),
+        "target_valid_rows": int(y_valid.sum()),
+        "total_events": int(event.sum()),
+        "total_non_events": int((y_valid & ~event).sum()),
+        "missing": count_event_rows(missing & y_valid, event),
+        "special": count_event_rows(special & y_valid, event),
+    }
+    if feature_kind == "categorical":
+        value_frame = pd.DataFrame(
+            {
+                "_value": df.loc[normal, feature].astype("string"),
+                "_event": event.loc[normal].astype(int),
+            }
+        )
+        if value_frame.empty:
+            profile["categorical_values"] = []
+        else:
+            grouped = value_frame.groupby("_value", dropna=False)["_event"].agg(["count", "sum"]).reset_index()
+            profile["categorical_values"] = [
+                {
+                    "value": str(row["_value"]),
+                    "count": int(row["count"]),
+                    "event_count": int(row["sum"]),
+                    "non_event_count": int(row["count"] - row["sum"]),
+                }
+                for row in grouped.to_dict("records")
+            ]
+    return profile
+
+
 def build_initial_spec(
     df: pd.DataFrame,
     target: str,
@@ -310,6 +369,15 @@ def build_initial_spec(
     y_event = (df[target] == positive_class).astype(int)
     miss = missing_mask(df[feature], config.blank_as_missing)
     special = special_mask(df[feature], config.special_values) & ~miss
+    evaluation_profile = build_evaluation_profile(
+        df,
+        target,
+        feature,
+        positive_class,
+        feature_kind,
+        miss,
+        special,
+    )
     normal_frame = df.loc[~miss & ~special & df[target].notna(), [feature, target]]
 
     bins: list[dict[str, Any]] = []
@@ -347,6 +415,7 @@ def build_initial_spec(
             "engine": str(config.engine),
             "engine_used": engine_used,
         },
+        "evaluation_profile": evaluation_profile,
         "bins": bins,
     }
 
@@ -402,30 +471,24 @@ def assigned_woe_value(bin_spec: dict[str, Any]) -> float | None:
     return safe_float_or_none(bin_spec.get("assigned_woe"))
 
 
-def build_bin_table(
-    df: pd.DataFrame,
-    target: str,
+def build_bin_table_from_counts(
     spec: dict[str, Any],
-    positive_class: Any,
+    counts_by_bin: dict[str, dict[str, int]],
+    total_rows: int,
+    total_events: int,
+    total_non_events: int,
+    order: list[str],
     dataset_name: str = "Train",
 ) -> pd.DataFrame:
     feature = str(spec["feature"])
-    assigned = assign_bins(df[feature], spec)
-    y_valid = df[target].notna()
-    event = (df[target] == positive_class) & y_valid
-    non_event = (~event) & y_valid
-    total_events = int(event.sum())
-    total_non_events = int(non_event.sum())
-    total_rows = int(y_valid.sum())
-    order = bin_order(spec, assigned)
     spec_by_id = {str(bin_spec.get("bin_id")): bin_spec for bin_spec in spec.get("bins", [])}
     rows: list[dict[str, Any]] = []
 
     for position, bin_id in enumerate(order, start=1):
         bin_spec = spec_by_id.get(bin_id, {})
-        mask = (assigned == bin_id) & y_valid
-        event_count = int((mask & event).sum())
-        non_event_count = int((mask & non_event).sum())
+        counts = counts_by_bin.get(bin_id, {})
+        event_count = int(counts.get("event_count", 0))
+        non_event_count = int(counts.get("non_event_count", 0))
         count = event_count + non_event_count
         event_dist = (event_count + WOE_EPSILON) / (total_events + WOE_EPSILON * max(1, len(order)))
         non_event_dist = (non_event_count + WOE_EPSILON) / (
@@ -464,6 +527,118 @@ def build_bin_table(
     return pd.DataFrame(rows)
 
 
+def precomputed_categorical_bin_table(
+    df: pd.DataFrame,
+    spec: dict[str, Any],
+    dataset_name: str,
+) -> pd.DataFrame | None:
+    if dataset_name != "Train" or spec.get("feature_kind") != "categorical":
+        return None
+    profile = spec.get("evaluation_profile")
+    if not isinstance(profile, dict) or int(profile.get("dataframe_id", -1)) != id(df):
+        return None
+    records = profile.get("categorical_values")
+    if not isinstance(records, list):
+        return None
+
+    value_counts: dict[str, dict[str, int]] = {
+        str(row.get("value")): {
+            "count": int(row.get("count") or 0),
+            "event_count": int(row.get("event_count") or 0),
+            "non_event_count": int(row.get("non_event_count") or 0),
+        }
+        for row in records
+        if isinstance(row, dict)
+    }
+    counts_by_bin: dict[str, dict[str, int]] = {}
+    covered = {"count": 0, "event_count": 0, "non_event_count": 0}
+
+    def add_counts(bin_id: str, counts: dict[str, int]) -> None:
+        target_counts = counts_by_bin.setdefault(bin_id, {"count": 0, "event_count": 0, "non_event_count": 0})
+        for key in ("count", "event_count", "non_event_count"):
+            value = int(counts.get(key) or 0)
+            target_counts[key] += value
+            covered[key] += value
+
+    for bin_spec in spec.get("bins", []):
+        bin_id = str(bin_spec.get("bin_id"))
+        kind = str(bin_spec.get("kind"))
+        if kind == "missing":
+            add_counts(bin_id, profile.get("missing", {}) if isinstance(profile.get("missing"), dict) else {})
+        elif kind == "special":
+            add_counts(bin_id, profile.get("special", {}) if isinstance(profile.get("special"), dict) else {})
+        elif kind == "normal":
+            for value in bin_spec.get("values", []):
+                add_counts(bin_id, value_counts.get(str(value), {}))
+
+    total_rows = int(profile.get("target_valid_rows") or 0)
+    total_events = int(profile.get("total_events") or 0)
+    total_non_events = int(profile.get("total_non_events") or 0)
+    unmapped = {
+        "count": max(0, total_rows - covered["count"]),
+        "event_count": max(0, total_events - covered["event_count"]),
+        "non_event_count": max(0, total_non_events - covered["non_event_count"]),
+    }
+    order = [str(bin_spec.get("bin_id")) for bin_spec in spec.get("bins", [])]
+    if unmapped["count"] > 0:
+        counts_by_bin["__unmapped__"] = unmapped
+        order.append("__unmapped__")
+    return build_bin_table_from_counts(
+        spec,
+        counts_by_bin,
+        total_rows,
+        total_events,
+        total_non_events,
+        order,
+        dataset_name=dataset_name,
+    )
+
+
+def build_bin_table(
+    df: pd.DataFrame,
+    target: str,
+    spec: dict[str, Any],
+    positive_class: Any,
+    dataset_name: str = "Train",
+) -> pd.DataFrame:
+    fast_table = precomputed_categorical_bin_table(df, spec, dataset_name)
+    if fast_table is not None:
+        return fast_table
+
+    feature = str(spec["feature"])
+    assigned = assign_bins(df[feature], spec)
+    y_valid = df[target].notna()
+    event = ((df[target] == positive_class) & y_valid).astype(int)
+    total_events = int(event.sum())
+    total_rows = int(y_valid.sum())
+    total_non_events = total_rows - total_events
+    if total_rows:
+        grouped = (
+            pd.DataFrame({"bin_id": assigned.loc[y_valid].astype("object"), "event": event.loc[y_valid].astype(int)})
+            .groupby("bin_id", dropna=False)["event"]
+            .agg(["count", "sum"])
+        )
+        counts_by_bin = {
+            str(bin_id): {
+                "count": int(row["count"]),
+                "event_count": int(row["sum"]),
+                "non_event_count": int(row["count"] - row["sum"]),
+            }
+            for bin_id, row in grouped.iterrows()
+        }
+    else:
+        counts_by_bin = {}
+    return build_bin_table_from_counts(
+        spec,
+        counts_by_bin,
+        total_rows,
+        total_events,
+        total_non_events,
+        bin_order(spec, assigned),
+        dataset_name=dataset_name,
+    )
+
+
 def binary_auc(y_true: pd.Series, score: pd.Series) -> float | None:
     valid = y_true.notna() & score.notna()
     if not bool(valid.any()):
@@ -476,6 +651,37 @@ def binary_auc(y_true: pd.Series, score: pd.Series) -> float | None:
         return None
     ranks = scores.rank(method="average")
     rank_sum = float(ranks[y == 1].sum())
+    auc = (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
+    return float(auc)
+
+
+def binary_auc_from_bin_table(table: pd.DataFrame, woe_column: str) -> float | None:
+    required = {woe_column, "event_count", "non_event_count"}
+    if table.empty or not required.issubset(table.columns):
+        return None
+    score_frame = table[[woe_column, "event_count", "non_event_count"]].copy()
+    score_frame[woe_column] = pd.to_numeric(score_frame[woe_column], errors="coerce")
+    score_frame["event_count"] = pd.to_numeric(score_frame["event_count"], errors="coerce").fillna(0)
+    score_frame["non_event_count"] = pd.to_numeric(score_frame["non_event_count"], errors="coerce").fillna(0)
+    score_frame = score_frame.dropna(subset=[woe_column])
+    if score_frame.empty:
+        return None
+    score_frame["score"] = -score_frame[woe_column].astype(float)
+    grouped = score_frame.groupby("score", sort=True)[["event_count", "non_event_count"]].sum()
+    positives = int(grouped["event_count"].sum())
+    negatives = int(grouped["non_event_count"].sum())
+    if positives == 0 or negatives == 0:
+        return None
+    rank = 1.0
+    rank_sum = 0.0
+    for row in grouped.itertuples(index=False):
+        events = int(row.event_count)
+        non_events = int(row.non_event_count)
+        count = events + non_events
+        if count <= 0:
+            continue
+        rank_sum += events * (rank + (count - 1) / 2.0)
+        rank += count
     auc = (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
     return float(auc)
 
@@ -508,14 +714,8 @@ def evaluate_spec(
 ) -> dict[str, Any]:
     table = build_bin_table(df, target, spec, positive_class, dataset_name=dataset_name)
     feature = str(spec["feature"])
-    assigned = assign_bins(df[feature], spec)
-    calc_map = dict(zip(table["bin_id"], table["calculated_woe"]))
-    export_map = dict(zip(table["bin_id"], table["export_woe"]))
-    y = (df[target] == positive_class).astype(int)
-    calc_score = -assigned.map(calc_map).astype(float)
-    export_score = -assigned.map(export_map).astype(float)
-    calc_auc = binary_auc(y, calc_score)
-    export_auc = binary_auc(y, export_score)
+    calc_auc = binary_auc_from_bin_table(table, "calculated_woe")
+    export_auc = binary_auc_from_bin_table(table, "export_woe")
     monotonicity = monotonicity_from_table(table)
     metrics = {
         "dataset": dataset_name,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import pickle
@@ -174,6 +175,30 @@ def test_merge_selected_bins_categorical_can_merge_non_adjacent_groups():
 
     assert normal_values[0]
     assert len(normal_values) == 3
+
+
+def test_categorical_merge_fast_profile_matches_full_scan_evaluation():
+    df = pd.DataFrame(
+        {
+            "segment": ["A", "B", "C", "D", "E", "F", None, ""] * 20,
+            "target": [1, 1, 0, 0, 1, 0, 1, 0] * 20,
+        }
+    )
+    spec = build_initial_spec(df, "target", "segment", 1, WoeBuildConfig(max_bins=4, engine="fallback"))
+    merged = merge_selected_bins(spec, ["b001", "b003"])
+    scan_spec = copy.deepcopy(merged)
+    scan_spec.pop("evaluation_profile", None)
+
+    fast = evaluate_spec(df, "target", merged, 1)
+    scanned = evaluate_spec(df, "target", scan_spec, 1)
+
+    pd.testing.assert_frame_equal(
+        fast["table"].reset_index(drop=True),
+        scanned["table"].reset_index(drop=True),
+        check_dtype=False,
+    )
+    assert fast["metrics"]["export_iv"] == scanned["metrics"]["export_iv"]
+    assert fast["metrics"]["export_gini"] == scanned["metrics"]["export_gini"]
 
 
 def test_project_export_contains_integrated_mapping():

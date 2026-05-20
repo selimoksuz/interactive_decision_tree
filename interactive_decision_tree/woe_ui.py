@@ -35,6 +35,7 @@ from .woe_export import (
     project_json_bytes,
     project_pickle_bytes,
     project_sql_text,
+    scoped_variable_states,
     state_export_decision,
     state_mapping_state,
     variable_state_rows,
@@ -43,8 +44,8 @@ from .woe_export import (
 
 WOE_PROJECTS_KEY = "_interactive_tree_woe_projects"
 WOE_ACTIVE_VARIABLE_KEY = "_interactive_tree_woe_active_variable"
-WOE_SUMMARY_CACHE_KEY = "_interactive_tree_woe_summary_cache"
 WOE_REPORT_CACHE_KEY = "_interactive_tree_woe_report_cache"
+WOE_VARIABLE_ROW_CACHE_KEY = "_interactive_tree_woe_variable_row_cache"
 WOE_VARIABLE_FILTER_MAX_VISIBLE = 250
 
 
@@ -65,24 +66,8 @@ def bounded_cache_set(cache: dict[Any, Any], key: Any, value: Any, max_items: in
 def spec_signature(spec: dict[str, Any] | None) -> str:
     if not isinstance(spec, dict):
         return ""
-    raw = json.dumps(spec, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def project_signature(project: dict[str, Any]) -> str:
-    payload = []
-    for variable, state in sorted(project.get("variables", {}).items()):
-        payload.append(
-            {
-                "variable": str(variable),
-                "status": str(state.get("status", "")),
-                "export_decision": state_export_decision(state),
-                "updated_at": str(state.get("updated_at", "")),
-                "original": spec_signature(state.get("original_spec")),
-                "current": spec_signature(state.get("current_spec")),
-            }
-        )
-    raw = json.dumps(payload, sort_keys=True, default=str)
+    signature_spec = {key: value for key, value in spec.items() if key != "evaluation_profile"}
+    raw = json.dumps(signature_spec, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -515,6 +500,52 @@ def build_config_from_sidebar(
     return list(selected_variables), config, bool(replace_existing)
 
 
+def metric_delta(current: Any, original: Any) -> float | None:
+    try:
+        if current is None or original is None:
+            return None
+        return float(current) - float(original)
+    except (TypeError, ValueError):
+        return None
+
+
+def variable_summary_row(
+    variable: str,
+    state: dict[str, Any],
+    df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    positive_class: Any,
+) -> dict[str, Any]:
+    current_spec = state["current_spec"]
+    original_spec = state["original_spec"]
+    current_train = evaluate_spec(df, target, current_spec, positive_class, "Train")["metrics"]
+    original_train = evaluate_spec(df, target, original_spec, positive_class, "Train")["metrics"]
+    row = {
+        "variable": variable,
+        "type": current_spec.get("feature_kind"),
+        "mapping_state": state_mapping_state(state),
+        "export_decision": state_export_decision(state),
+        "engine": current_train.get("engine_used"),
+        "original_iv": original_train.get("export_iv"),
+        "current_iv": current_train.get("export_iv"),
+        "iv_delta": metric_delta(current_train.get("export_iv"), original_train.get("export_iv")),
+        "original_gini": original_train.get("export_gini"),
+        "current_gini": current_train.get("export_gini"),
+        "gini_delta": metric_delta(current_train.get("export_gini"), original_train.get("export_gini")),
+        "bins": current_train.get("bin_count"),
+        "manual_woe_bins": current_train.get("manual_woe_bins"),
+        "monotonic": current_train.get("is_monotonic"),
+        "monotonic_direction": current_train.get("monotonic_direction"),
+        "monotonic_violations": current_train.get("monotonic_violation_count"),
+    }
+    if test_df is not None:
+        current_test = evaluate_spec(test_df, target, current_spec, positive_class, "Test")["metrics"]
+        row["test_iv"] = current_test.get("export_iv")
+        row["test_gini"] = current_test.get("export_gini")
+    return row
+
+
 @st.fragment
 def render_woe_sidebar_controls(
     project: dict[str, Any],
@@ -592,20 +623,33 @@ def cached_variable_state_rows(
     target: str,
     positive_class: Any,
 ) -> pd.DataFrame:
-    cache = session_cache(WOE_SUMMARY_CACHE_KEY)
-    key = (
-        str(project.get("project_key")),
-        data_signature(df, test_df, target, positive_class),
-        project_signature(project),
-    )
-    if key not in cache:
-        bounded_cache_set(
-            cache,
-            key,
-            variable_state_rows(project, df, test_df, target, positive_class),
-            max_items=16,
+    row_cache = session_cache(WOE_VARIABLE_ROW_CACHE_KEY)
+    data_sig = data_signature(df, test_df, target, positive_class)
+    rows: list[dict[str, Any]] = []
+    for variable, state in scoped_variable_states(project):
+        current_spec = state.get("current_spec")
+        original_spec = state.get("original_spec")
+        if not isinstance(current_spec, dict) or not isinstance(original_spec, dict):
+            continue
+        key = (
+            str(project.get("project_key")),
+            str(variable),
+            data_sig,
+            str(state.get("status", "")),
+            state_export_decision(state),
+            str(state.get("updated_at", "")),
+            spec_signature(original_spec),
+            spec_signature(current_spec),
         )
-    return cache[key].copy()
+        if key not in row_cache:
+            bounded_cache_set(
+                row_cache,
+                key,
+                variable_summary_row(variable, state, df, test_df, target, positive_class),
+                max_items=4096,
+            )
+        rows.append(dict(row_cache[key]))
+    return pd.DataFrame(rows)
 
 
 def cached_evaluate_original_current(
