@@ -25,7 +25,12 @@ from interactive_decision_tree.woe_export import (
     project_json_bytes,
     project_pickle_bytes,
 )
-from interactive_decision_tree.woe_ui import variable_editor_order
+from interactive_decision_tree.woe_ui import (
+    filter_variable_options,
+    normalize_variable_selection,
+    update_variable_selection_for_filtered,
+    variable_editor_order,
+)
 
 
 def woe_df() -> pd.DataFrame:
@@ -36,6 +41,29 @@ def woe_df() -> pd.DataFrame:
             "target": [1, 1, 0, 1, 0, 0, 0, 0, 1, 1],
         }
     )
+
+
+def test_woe_variable_filter_supports_contains_multiple_terms_and_wildcards():
+    variables = ["age", "income", "avg_balance_3m", "risk_score", "segment"]
+
+    assert filter_variable_options(variables, "bal") == ["avg_balance_3m"]
+    assert filter_variable_options(variables, "age,score") == ["age", "risk_score"]
+    assert filter_variable_options(variables, "inc%") == ["income"]
+    assert filter_variable_options(variables, "*ment") == ["segment"]
+
+
+def test_woe_variable_selection_actions_preserve_order():
+    variables = ["age", "income", "segment", "score"]
+
+    assert update_variable_selection_for_filtered(variables, ["income"], ["age", "score"], True) == [
+        "age",
+        "income",
+        "score",
+    ]
+    assert update_variable_selection_for_filtered(variables, ["age", "income", "score"], ["age", "score"], False) == [
+        "income"
+    ]
+    assert normalize_variable_selection(variables, ["income", "missing", "age"]) == ["income", "age"]
 
 
 def test_numeric_woe_supports_special_missing_and_manual_woe():

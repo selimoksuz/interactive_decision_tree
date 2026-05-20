@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ WOE_PROJECTS_KEY = "_interactive_tree_woe_projects"
 WOE_ACTIVE_VARIABLE_KEY = "_interactive_tree_woe_active_variable"
 WOE_SUMMARY_CACHE_KEY = "_interactive_tree_woe_summary_cache"
 WOE_REPORT_CACHE_KEY = "_interactive_tree_woe_report_cache"
+WOE_VARIABLE_FILTER_MAX_VISIBLE = 250
 
 
 def session_cache(key: str) -> dict[Any, Any]:
@@ -260,21 +262,152 @@ def run_initial_binning(
     progress.empty()
 
 
-def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildConfig, bool]:
-    default_variables = features[: min(20, len(features))]
-    remembered_variables = [
-        str(variable)
-        for variable in st.session_state.get("woe_selected_variables", default_variables)
-        if str(variable) in features
+def normalize_variable_selection(variables: list[str], selected: Any) -> list[str]:
+    variable_set = set(map(str, variables))
+    if selected is None:
+        return []
+    if isinstance(selected, str):
+        selected_iterable = [selected]
+    else:
+        try:
+            selected_iterable = list(selected)
+        except TypeError:
+            selected_iterable = []
+    return [str(variable) for variable in selected_iterable if str(variable) in variable_set]
+
+
+def filter_variable_options(variables: list[str], query: str | None) -> list[str]:
+    text = str(query or "").strip().lower()
+    if not text:
+        return list(variables)
+    tokens = [
+        token.strip().lower().replace("%", "*")
+        for chunk in text.replace("\n", ",").split(",")
+        for token in [chunk]
+        if token.strip()
     ]
+    if not tokens:
+        return list(variables)
+
+    def matches(variable: str) -> bool:
+        lowered = str(variable).lower()
+        return any(
+            fnmatch.fnmatch(lowered, token) if "*" in token or "?" in token else token in lowered
+            for token in tokens
+        )
+
+    return [variable for variable in variables if matches(variable)]
+
+
+def ordered_variable_selection(variables: list[str], selected: set[str]) -> list[str]:
+    return [variable for variable in variables if variable in selected]
+
+
+def update_variable_selection_for_filtered(
+    variables: list[str],
+    current_selection: list[str],
+    filtered_variables: list[str],
+    include: bool,
+) -> list[str]:
+    selected = set(normalize_variable_selection(variables, current_selection))
+    filtered = set(map(str, filtered_variables))
+    if include:
+        selected.update(filtered)
+    else:
+        selected.difference_update(filtered)
+    return ordered_variable_selection(variables, selected)
+
+
+def render_woe_variable_selector(variables: list[str]) -> list[str]:
+    default_variables = variables[: min(20, len(variables))]
+    selected_key = "woe_selected_variables"
+    remembered_variables = normalize_variable_selection(
+        variables,
+        st.session_state.get(selected_key, default_variables),
+    )
     if not remembered_variables:
         remembered_variables = default_variables
-    selected_variables = st.sidebar.multiselect(
-        "WOE variables",
-        options=features,
-        default=remembered_variables,
-        key="woe_selected_variables",
+    st.session_state[selected_key] = remembered_variables
+
+    st.sidebar.markdown("**WOE variables**")
+    selected_variables = normalize_variable_selection(
+        variables,
+        st.session_state.get(selected_key, remembered_variables),
     )
+    with st.sidebar.popover("Dropdown Filter Panel"):
+        query = st.text_input(
+            "Search variable",
+            placeholder="Search",
+            key="woe_variable_search",
+            label_visibility="collapsed",
+            help="Case-insensitive contains search. Use comma/newline for multiple terms; * or % works as wildcard.",
+        )
+        filtered_variables = filter_variable_options(variables, query)
+        filtered_signature = hashlib.sha256(
+            json.dumps(filtered_variables, default=str).encode("utf-8")
+        ).hexdigest()[:10]
+        selection_signature = hashlib.sha256(
+            json.dumps(selected_variables, default=str).encode("utf-8")
+        ).hexdigest()[:10]
+        st.caption(
+            f"{len(selected_variables):,} selected | {len(filtered_variables):,} matching | {len(variables):,} total"
+        )
+
+        selected_set = set(selected_variables)
+        all_filtered_selected = bool(filtered_variables) and all(
+            variable in selected_set for variable in filtered_variables
+        )
+        select_all_value = st.checkbox(
+            "(Select All)",
+            value=all_filtered_selected,
+            key=f"woe_variable_filter_all::{filtered_signature}::{selection_signature}",
+            disabled=not filtered_variables,
+        )
+        if filtered_variables and select_all_value != all_filtered_selected:
+            selected_variables = update_variable_selection_for_filtered(
+                variables,
+                selected_variables,
+                filtered_variables,
+                select_all_value,
+            )
+            st.session_state[selected_key] = selected_variables
+            selected_set = set(selected_variables)
+
+        list_container = st.container(height=260, border=True)
+        visible_variables = filtered_variables[:WOE_VARIABLE_FILTER_MAX_VISIBLE]
+        if len(filtered_variables) > len(visible_variables):
+            list_container.caption(
+                f"Showing first {len(visible_variables):,} matching variable(s). Use search to narrow the list."
+            )
+        next_selected = set(selected_variables)
+        changed = False
+        for variable in visible_variables:
+            was_selected = variable in selected_set
+            is_selected = list_container.checkbox(
+                str(variable),
+                value=was_selected,
+                key=f"woe_variable_filter_item::{filtered_signature}::{selection_signature}::{variable}",
+            )
+            if is_selected != was_selected:
+                changed = True
+                if is_selected:
+                    next_selected.add(variable)
+                else:
+                    next_selected.discard(variable)
+        if changed:
+            selected_variables = ordered_variable_selection(variables, next_selected)
+            st.session_state[selected_key] = selected_variables
+        if not filtered_variables:
+            st.caption("No matching variables.")
+        st.caption("Selections are used when you press Run initial WOE binning.")
+
+    selected_variables = normalize_variable_selection(variables, st.session_state.get(selected_key, selected_variables))
+    st.sidebar.caption(f"{len(selected_variables):,} selected | {len(variables):,} available")
+    return selected_variables
+
+
+def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildConfig, bool]:
+    selected_variables = render_woe_variable_selector(features)
     max_bins = st.sidebar.number_input("Max bins", min_value=2, max_value=20, value=6, step=1, key="woe_max_bins")
     min_bin_size = st.sidebar.slider(
         "Min bin size",
