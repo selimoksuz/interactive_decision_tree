@@ -51,6 +51,12 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     ]
     assert status_values
     assert status_values[0]["state"] == "done"
+    assert any(button.label == "Open WOE detail workspace" for button in at.button)
+    assert not any(button.label == "Reset to auto mapping" for button in at.button)
+
+    next(button for button in at.button if button.label == "Open WOE detail workspace").click()
+    at.run(timeout=25)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert all(selectbox.label != "Variable status" for selectbox in at.selectbox)
     assert any(button.label == "Reset to auto mapping" for button in at.button)
     assert any(button.label == "Exclude from export" for button in at.button)

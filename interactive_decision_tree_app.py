@@ -27,7 +27,12 @@ from interactive_decision_tree.session_store import (
     session_path,
 )
 from interactive_decision_tree.sql_source import DEFAULT_SQL_LIMIT, read_sql_dataframe
-from interactive_decision_tree.woe_ui import WOE_CHECKPOINT_DIRTY_KEY, WOE_PROJECTS_KEY, render_woe_workspace
+from interactive_decision_tree.woe_ui import (
+    WOE_CHECKPOINT_DIRTY_KEY,
+    WOE_DETAIL_OPEN_PREFIX,
+    WOE_PROJECTS_KEY,
+    render_woe_workspace,
+)
 
 
 TREE_SCHEMA_VERSION = 4
@@ -40,6 +45,7 @@ WORKSPACE_LAST_RENDERED_KEY = "_interactive_tree_last_rendered_workspace"
 WORKSPACE_TRANSITION_KEY = "_interactive_tree_workspace_transition"
 WORK_CHECKPOINT_CACHE_KEY = "_interactive_tree_checkpoint_cache"
 SESSION_DATA_CACHE_KEY = "_interactive_tree_session_data_cache"
+TREE_DETAIL_OPEN_KEY = "_interactive_tree_detail_open"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
@@ -274,6 +280,10 @@ def mark_workspace_transition() -> None:
             "from": str(last_rendered),
             "to": str(requested),
         }
+        st.session_state[TREE_DETAIL_OPEN_KEY] = False
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(WOE_DETAIL_OPEN_PREFIX):
+                st.session_state[key] = False
 
 
 def render_workspace_transition_overlay(workspace_title: str) -> None:
@@ -5931,10 +5941,115 @@ def main() -> None:
         undo_last_split()
         save_and_rerun()
 
-    tree = st.session_state.tree
+    if st.session_state.get(TREE_DETAIL_OPEN_KEY) and st.sidebar.button("Hide tree details", width="stretch"):
+        st.session_state[TREE_DETAIL_OPEN_KEY] = False
+        st.rerun()
 
+    tree = st.session_state.tree
     if st.session_state.current_node_id not in tree:
         st.session_state.current_node_id = 0
+    current = tree[st.session_state.current_node_id]
+    current_row_count = len(current["row_idx"])
+    candidate_features = ranking_features
+
+    preflight_candidate_key = None
+    preflight_cached_meta: dict[str, Any] = {}
+    preflight_cached_candidates: list[SplitCandidate] | None = None
+    if current["split"] is None and candidate_features:
+        preflight_candidate_key = candidate_cache_key(
+            data_key=data_key,
+            target=target,
+            node_id=current["id"],
+            features=candidate_features,
+            row_count=current_row_count,
+            parameters=parameters,
+            max_rows=current_row_count,
+        )
+        preflight_cached_meta = cached_candidate_meta(data_key, target, current["id"])
+        preflight_cached_candidates = get_cached_candidates(
+            data_key,
+            target,
+            current["id"],
+            preflight_candidate_key,
+        )
+
+    if not bool(st.session_state.get(TREE_DETAIL_OPEN_KEY)):
+        train_panel.markdown("**Split ranking**")
+        if current["split"] is None and features:
+            train_panel.caption(
+                split_ranking_scope_caption(
+                    candidate_feature_count=len(candidate_features),
+                    total_feature_count=len(features),
+                    selected_node_rows=current_row_count,
+                    active_train_rows=len(df),
+                )
+            )
+            if preflight_cached_candidates is not None:
+                analyzed_rows = int(preflight_cached_meta.get("analyzed_rows", current_row_count) or current_row_count)
+                train_panel.success(
+                    cached_ranking_ready_message(
+                        candidate_count=len(preflight_cached_candidates),
+                        analyzed_rows=analyzed_rows,
+                        selected_node_rows=current_row_count,
+                        active_train_rows=len(df),
+                    )
+                )
+            elif preflight_cached_meta:
+                train_panel.caption("Cached ranking exists for another scope; recompute to use current settings.")
+            preflight_compute = train_panel.button(
+                "Recompute split ranking" if preflight_cached_candidates is not None else "Compute split ranking",
+                key=f"preflight_compute_split_ranking::{data_key}::{target}::{current['id']}",
+                type="primary",
+                width="stretch",
+                disabled=not candidate_features,
+                help="Runs the first heavy tree operation. Details render after ranking is ready.",
+            )
+            if preflight_compute:
+                candidate_max_rows = current_row_count
+                sampled_row_idx = analysis_row_idx(current["row_idx"], candidate_max_rows, df=df, target=target)
+                compute_caption = (
+                    f"Compute split ranking on all {current_row_count:,} rows "
+                    f"across {len(candidate_features):,} variable(s)."
+                )
+                with st.spinner(compute_caption):
+                    all_candidates = candidate_splits(
+                        df=df,
+                        target=target,
+                        features=candidate_features,
+                        row_idx=sampled_row_idx,
+                        min_leaf=int(min_leaf),
+                        max_thresholds=int(max_thresholds),
+                        max_categories=int(max_categories),
+                        max_numeric_bins=int(max_numeric_bins),
+                        max_category_groups=int(max_category_groups),
+                        parallel_workers=parallel_workers,
+                    )
+                if preflight_candidate_key is not None:
+                    store_cached_candidates(
+                        data_key,
+                        target,
+                        current["id"],
+                        preflight_candidate_key,
+                        all_candidates,
+                        analyzed_rows=len(sampled_row_idx),
+                        full_rows=current_row_count,
+                    )
+                st.session_state[TREE_DETAIL_OPEN_KEY] = True
+                st.rerun()
+        elif features:
+            train_panel.caption("Select or revise a leaf node after opening tree details.")
+
+        overview_cols = st.columns(4)
+        overview_cols[0].metric("Active train rows", f"{len(df):,}")
+        overview_cols[1].metric("Split variables", f"{len(features):,}")
+        overview_cols[2].metric("Ranking variables", f"{len(candidate_features):,}")
+        overview_cols[3].metric("Tree nodes", f"{len(tree):,}")
+        st.info("Tree details, graph, model performance, and node tables stay idle until you compute ranking or open details.")
+        if st.button("Open tree detail workspace", width="stretch"):
+            st.session_state[TREE_DETAIL_OPEN_KEY] = True
+            st.rerun()
+        finish_workspace_render(effective_workspace_mode)
+        st.stop()
 
     with st.expander("Tree view", expanded=True):
         st.caption("Click a connected node in the tree to edit it. The selected node details appear below.")

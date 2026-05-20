@@ -43,6 +43,7 @@ from .woe_export import (
 
 WOE_PROJECTS_KEY = "_interactive_tree_woe_projects"
 WOE_CHECKPOINT_DIRTY_KEY = "_interactive_tree_woe_checkpoint_dirty"
+WOE_DETAIL_OPEN_PREFIX = "woe_detail_open::"
 WOE_ACTIVE_VARIABLE_KEY = "_interactive_tree_woe_active_variable"
 WOE_REPORT_CACHE_KEY = "_interactive_tree_woe_report_cache"
 WOE_VARIABLE_ROW_CACHE_KEY = "_interactive_tree_woe_variable_row_cache"
@@ -442,6 +443,10 @@ def scoped_woe_project(project: dict[str, Any], selected_variables: list[str]) -
         if str(variable) in selected
     }
     return scoped_project
+
+
+def woe_detail_open_key(data_key: str, target: str) -> str:
+    return f"{WOE_DETAIL_OPEN_PREFIX}{data_key}::{target}"
 
 
 def render_woe_variable_selector(variables: list[str], *, data_key: str, target: str) -> list[str]:
@@ -1326,6 +1331,7 @@ def render_woe_workspace(
     project = get_project(data_key, target, positive_class)
     active_woe_variables = current_woe_variable_selection(features, data_key=data_key, target=target)
     visible_project = scoped_woe_project(project, active_woe_variables)
+    visible_mapping_count = len(visible_project.get("variables", {}))
     with st.sidebar:
         render_woe_sidebar_controls(
             project,
@@ -1336,11 +1342,42 @@ def render_woe_workspace(
             data_key,
         )
 
-    st.caption(
-        f"WOE view scope: {len(active_woe_variables):,} selected variable(s) from Data Setup."
-    )
+    st.caption("Configure WOE variables and binning settings first. Data scans run only from explicit action buttons.")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Active variables", f"{len(features):,}")
+    metric_cols[1].metric("WOE selected", f"{len(active_woe_variables):,}")
+    metric_cols[2].metric("Selected mappings", f"{visible_mapping_count:,}")
+    metric_cols[3].metric("All mappings", f"{len(project.get('variables', {})):,}")
     if project.get("variables") and not visible_project.get("variables"):
         st.info("No stored mappings match the current WOE variable selection.")
+
+    detail_key = woe_detail_open_key(data_key, target)
+    detail_cols = st.columns([1, 1])
+    if detail_cols[0].button(
+        "Open WOE detail workspace",
+        width="stretch",
+        disabled=visible_mapping_count == 0,
+        help="Shows catalog, exports, and variable editor. Metric and bin scans still load on demand.",
+    ):
+        st.session_state[detail_key] = True
+        st.rerun()
+    if detail_cols[1].button(
+        "Hide WOE detail workspace",
+        width="stretch",
+        disabled=not bool(st.session_state.get(detail_key)),
+    ):
+        st.session_state[detail_key] = False
+        st.rerun()
+
+    if visible_mapping_count == 0:
+        st.info("Use the sidebar to select variables and run initial WOE binning.")
+        mark_woe_refresh_done(data_key, target)
+        return
+
+    if not st.session_state.get(detail_key):
+        st.info("WOE mappings are ready. Open the detail workspace only when you need catalog, export, or bin editing.")
+        mark_woe_refresh_done(data_key, target)
+        return
 
     refresh_catalog = st.button(
         "Load / refresh selected catalog metrics",
