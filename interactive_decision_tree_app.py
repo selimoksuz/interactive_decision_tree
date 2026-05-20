@@ -24,9 +24,10 @@ from interactive_decision_tree.session_store import (
     normalize_data_id,
     save_dataframe_session,
     session_data_key,
+    session_path,
 )
 from interactive_decision_tree.sql_source import DEFAULT_SQL_LIMIT, read_sql_dataframe
-from interactive_decision_tree.woe_ui import WOE_PROJECTS_KEY, render_woe_workspace
+from interactive_decision_tree.woe_ui import WOE_CHECKPOINT_DIRTY_KEY, WOE_PROJECTS_KEY, render_woe_workspace
 
 
 TREE_SCHEMA_VERSION = 4
@@ -37,6 +38,8 @@ POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
 APPLIED_DATA_CONTEXT_KEY = "_interactive_tree_applied_data_context"
 WORKSPACE_LAST_RENDERED_KEY = "_interactive_tree_last_rendered_workspace"
 WORKSPACE_TRANSITION_KEY = "_interactive_tree_workspace_transition"
+WORK_CHECKPOINT_CACHE_KEY = "_interactive_tree_checkpoint_cache"
+SESSION_DATA_CACHE_KEY = "_interactive_tree_session_data_cache"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
@@ -1940,7 +1943,15 @@ def load_work_checkpoint(work_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        stat = path.stat()
+        signature = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        cached = st.session_state.get(WORK_CHECKPOINT_CACHE_KEY)
+        if isinstance(cached, dict) and cached.get("signature") == signature:
+            payload = cached.get("payload")
+            return payload if isinstance(payload, dict) else None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        st.session_state[WORK_CHECKPOINT_CACHE_KEY] = {"signature": signature, "payload": payload}
+        return payload
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -1971,12 +1982,45 @@ def read_uploaded_table(uploaded: Any) -> pd.DataFrame:
     raise ValueError("Unsupported upload type. Use CSV or Excel.")
 
 
+def session_file_signature(data_id: str) -> tuple[Any, ...]:
+    path = session_path(data_id)
+    data_stat = (path / "data.pkl").stat()
+    metadata_stat = (path / "metadata.json").stat()
+    return (
+        str(path),
+        int(data_stat.st_mtime_ns),
+        int(data_stat.st_size),
+        int(metadata_stat.st_mtime_ns),
+        int(metadata_stat.st_size),
+    )
+
+
+def load_cached_dataframe_session(data_id: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    signature = session_file_signature(data_id)
+    cache = st.session_state.setdefault(SESSION_DATA_CACHE_KEY, {})
+    if not isinstance(cache, dict):
+        st.session_state[SESSION_DATA_CACHE_KEY] = {}
+        cache = st.session_state[SESSION_DATA_CACHE_KEY]
+    cached = cache.get(data_id)
+    if isinstance(cached, dict) and cached.get("signature") == signature:
+        df = cached.get("df")
+        metadata = cached.get("metadata")
+        if isinstance(df, pd.DataFrame) and isinstance(metadata, dict):
+            return df, metadata
+    df, metadata = load_dataframe_session(data_id)
+    cache[data_id] = {"signature": signature, "df": df, "metadata": metadata}
+    if len(cache) > 3:
+        for stale_key in list(cache)[:-3]:
+            cache.pop(stale_key, None)
+    return df, metadata
+
+
 def load_session_dataframe_from_query() -> tuple[pd.DataFrame, dict[str, Any], str, str] | None:
     data_id = normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM))
     if data_id is None:
         return None
     try:
-        df, metadata = load_dataframe_session(data_id)
+        df, metadata = load_cached_dataframe_session(data_id)
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
         st.sidebar.warning(
             f"Session data could not be loaded: {exc}. "
@@ -2504,7 +2548,7 @@ def save_source_session(
     features: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> str:
-    data_id, _ = save_dataframe_session(
+    data_id, metadata_out = save_dataframe_session(
         df,
         source=source,
         name=name,
@@ -2512,6 +2556,11 @@ def save_source_session(
         features=features,
         metadata=metadata,
     )
+    st.session_state.setdefault(SESSION_DATA_CACHE_KEY, {})[data_id] = {
+        "signature": session_file_signature(data_id),
+        "df": df,
+        "metadata": metadata_out,
+    }
     st.query_params[DATA_ID_QUERY_PARAM] = data_id
     st.session_state["_last_query_data_id"] = None
     return data_id
@@ -2536,7 +2585,7 @@ def persist_source_session(
             features=features,
             metadata=metadata,
         )
-    data_id, _ = save_dataframe_session(
+    data_id, metadata_out = save_dataframe_session(
         df,
         source=source,
         name=name,
@@ -2544,11 +2593,16 @@ def persist_source_session(
         features=features,
         metadata=metadata,
     )
+    st.session_state.setdefault(SESSION_DATA_CACHE_KEY, {})[data_id] = {
+        "signature": session_file_signature(data_id),
+        "df": df,
+        "metadata": metadata_out,
+    }
     return data_id
 
 
 def loaded_source_from_session(data_id: str, fallback_name: str | None = None) -> LoadedDataSource:
-    df, metadata = load_dataframe_session(data_id)
+    df, metadata = load_cached_dataframe_session(data_id)
     name = str(metadata.get("name") or fallback_name or "Session DataFrame")
     source = str(metadata.get("source") or "session")
     return LoadedDataSource(
@@ -3414,6 +3468,11 @@ def save_work_checkpoint(
         temp_path = path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(payload, default=str), encoding="utf-8")
         temp_path.replace(path)
+        stat = path.stat()
+        st.session_state[WORK_CHECKPOINT_CACHE_KEY] = {
+            "signature": (str(path), int(stat.st_mtime_ns), int(stat.st_size)),
+            "payload": payload,
+        }
     except OSError as exc:
         st.session_state["_checkpoint_error"] = str(exc)
 
@@ -5596,19 +5655,21 @@ def main() -> None:
             positive_class=st.session_state.get(POSITIVE_CLASS_SESSION_KEY),
             data_key=data_key,
         )
-        save_work_checkpoint(
-            work_id=work_id,
-            df=df,
-            data_key=data_key,
-            data_source=data_source,
-            uploaded_name=uploaded_name,
-            data_id=source_data_id,
-            source_metadata=source_metadata,
-            target=target,
-            selected_features=features,
-            parameters={"workspace": "WOE Binning"},
-            auto_parameters={},
-        )
+        if st.session_state.get(WOE_CHECKPOINT_DIRTY_KEY):
+            save_work_checkpoint(
+                work_id=work_id,
+                df=df,
+                data_key=data_key,
+                data_source=data_source,
+                uploaded_name=uploaded_name,
+                data_id=source_data_id,
+                source_metadata=source_metadata,
+                target=target,
+                selected_features=features,
+                parameters={"workspace": "WOE Binning"},
+                auto_parameters={},
+            )
+            st.session_state[WOE_CHECKPOINT_DIRTY_KEY] = False
         finish_workspace_render(effective_workspace_mode)
         st.stop()
 

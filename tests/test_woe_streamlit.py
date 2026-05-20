@@ -54,6 +54,11 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     assert all(selectbox.label != "Variable status" for selectbox in at.selectbox)
     assert any(button.label == "Reset to auto mapping" for button in at.button)
     assert any(button.label == "Exclude from export" for button in at.button)
+    assert any(button.label == "Load selected variable metrics" for button in at.button)
+    assert not any(button.label == "Apply current bin changes" for button in at.button)
+    next(button for button in at.button if button.label == "Load selected variable metrics").click()
+    at.run(timeout=30)
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
     assert any(button.label == "Apply current bin changes" for button in at.button)
     assert not any(button.label == "Merge selected bins" for button in at.button)
     assert not any(button.label == "Apply table edits" for button in at.button)

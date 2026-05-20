@@ -14,6 +14,7 @@ from .woe_binning import (
     apply_bin_table_edits,
     apply_categorical_groups,
     apply_numeric_cutpoints,
+    assigned_woe_value,
     build_initial_spec,
     categorical_groups_from_spec,
     copy_spec,
@@ -41,6 +42,7 @@ from .woe_export import (
 
 
 WOE_PROJECTS_KEY = "_interactive_tree_woe_projects"
+WOE_CHECKPOINT_DIRTY_KEY = "_interactive_tree_woe_checkpoint_dirty"
 WOE_ACTIVE_VARIABLE_KEY = "_interactive_tree_woe_active_variable"
 WOE_REPORT_CACHE_KEY = "_interactive_tree_woe_report_cache"
 WOE_VARIABLE_ROW_CACHE_KEY = "_interactive_tree_woe_variable_row_cache"
@@ -115,6 +117,7 @@ def add_edit(state: dict[str, Any], action: str, detail: dict[str, Any] | None =
         }
     )
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    st.session_state[WOE_CHECKPOINT_DIRTY_KEY] = True
 
 
 MAPPING_STATE_LABELS = {
@@ -294,8 +297,9 @@ def run_initial_binning(
         progress.progress(index / total, text=f"Binned {variable}")
     progress.progress(
         1.0,
-        text=f"WOE binning finished. Updating catalog and metrics for {len(variables):,} selected variable(s).",
+        text=f"WOE binning finished for {len(variables):,} selected variable(s).",
     )
+    st.session_state[WOE_CHECKPOINT_DIRTY_KEY] = True
     return {"processed": processed, "total": len(variables)}
 
 
@@ -598,6 +602,30 @@ def variable_summary_row(
     return row
 
 
+def variable_summary_placeholder(variable: str, state: dict[str, Any]) -> dict[str, Any]:
+    current_spec = state.get("current_spec") if isinstance(state.get("current_spec"), dict) else {}
+    bins = current_spec.get("bins", []) if isinstance(current_spec, dict) else []
+    return {
+        "variable": variable,
+        "type": current_spec.get("feature_kind"),
+        "mapping_state": state_mapping_state(state),
+        "export_decision": state_export_decision(state),
+        "engine": current_spec.get("config", {}).get("engine_used") if isinstance(current_spec.get("config"), dict) else None,
+        "original_iv": None,
+        "current_iv": None,
+        "iv_delta": None,
+        "original_gini": None,
+        "current_gini": None,
+        "gini_delta": None,
+        "bins": len(bins),
+        "manual_woe_bins": sum(1 for bin_spec in bins if assigned_woe_value(bin_spec) is not None),
+        "monotonic": None,
+        "monotonic_direction": None,
+        "monotonic_violations": None,
+        "metrics_status": "not loaded",
+    }
+
+
 @st.fragment
 def render_woe_sidebar_controls(
     project: dict[str, Any],
@@ -654,9 +682,13 @@ def render_woe_sidebar_controls(
                 render_woe_initial_run_status(st.session_state.get(status_key))
             raise
         st.session_state[status_key] = {
-            "state": "refreshing",
-            "message": "WOE binning finished. Updating catalog and metrics.",
+            "state": "done",
+            "message": (
+                f"Done: {result['processed']:,} binned, {result['total']:,} selected. "
+                "Catalog and variable metrics load on demand."
+            ),
             "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
             "processed": result["processed"],
             "total": result["total"],
         }
@@ -671,6 +703,8 @@ def cached_variable_state_rows(
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
+    *,
+    compute_missing: bool = False,
 ) -> pd.DataFrame:
     row_cache = session_cache(WOE_VARIABLE_ROW_CACHE_KEY)
     data_sig = data_signature(df, test_df, target, positive_class)
@@ -691,26 +725,33 @@ def cached_variable_state_rows(
             spec_signature(current_spec),
         )
         if key not in row_cache:
-            bounded_cache_set(
-                row_cache,
-                key,
-                variable_summary_row(variable, state, df, test_df, target, positive_class),
-                max_items=4096,
-            )
-        rows.append(dict(row_cache[key]))
+            if compute_missing:
+                computed_row = variable_summary_row(variable, state, df, test_df, target, positive_class)
+                computed_row["metrics_status"] = "loaded"
+                bounded_cache_set(
+                    row_cache,
+                    key,
+                    computed_row,
+                    max_items=4096,
+                )
+            else:
+                rows.append(variable_summary_placeholder(variable, state))
+                continue
+        cached_row = dict(row_cache[key])
+        cached_row.setdefault("metrics_status", "loaded")
+        rows.append(cached_row)
     return pd.DataFrame(rows)
 
 
-def cached_evaluate_original_current(
+def report_cache_key(
     project: dict[str, Any],
     state: dict[str, Any],
     df: pd.DataFrame,
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
-) -> dict[str, Any]:
-    cache = session_cache(WOE_REPORT_CACHE_KEY)
-    key = (
+) -> tuple[Any, ...]:
+    return (
         str(project.get("project_key")),
         str(state.get("name")),
         data_signature(df, test_df, target, positive_class),
@@ -720,6 +761,34 @@ def cached_evaluate_original_current(
         spec_signature(state.get("original_spec")),
         spec_signature(state.get("current_spec")),
     )
+
+
+def has_cached_evaluate_original_current(
+    project: dict[str, Any],
+    state: dict[str, Any],
+    df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    positive_class: Any,
+) -> bool:
+    cache = session_cache(WOE_REPORT_CACHE_KEY)
+    return report_cache_key(project, state, df, test_df, target, positive_class) in cache
+
+
+def cached_evaluate_original_current(
+    project: dict[str, Any],
+    state: dict[str, Any],
+    df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
+    target: str,
+    positive_class: Any,
+    *,
+    compute_missing: bool = True,
+) -> dict[str, Any] | None:
+    cache = session_cache(WOE_REPORT_CACHE_KEY)
+    key = report_cache_key(project, state, df, test_df, target, positive_class)
+    if key not in cache and not compute_missing:
+        return None
     if key not in cache:
         bounded_cache_set(
             cache,
@@ -777,12 +846,27 @@ def render_catalog(
     test_df: pd.DataFrame | None,
     target: str,
     positive_class: Any,
+    *,
+    compute_missing: bool = False,
 ) -> pd.DataFrame:
-    summary = cached_variable_state_rows(project, df, test_df, target, positive_class)
+    summary = cached_variable_state_rows(
+        project,
+        df,
+        test_df,
+        target,
+        positive_class,
+        compute_missing=compute_missing,
+    )
     st.subheader("WOE variable catalog")
     if summary.empty:
         st.info("Run initial WOE binning to create variable mappings.")
         return summary
+    unloaded_count = int((summary.get("metrics_status") == "not loaded").sum()) if "metrics_status" in summary else 0
+    if unloaded_count:
+        st.caption(
+            f"{unloaded_count:,} variable metric row(s) are not loaded. "
+            "Use Load / refresh selected catalog metrics when you want to scan the active data."
+        )
     st.dataframe(
         summary,
         hide_index=True,
@@ -1111,7 +1195,26 @@ def render_variable_editor(
         set_export_decision(state, next_decision)
         st.rerun()
 
-    reports = cached_evaluate_original_current(project, state, df, test_df, target, positive_class)
+    reports_are_cached = has_cached_evaluate_original_current(project, state, df, test_df, target, positive_class)
+    load_report = st.button(
+        "Load selected variable metrics",
+        width="stretch",
+        key=f"woe_load_variable_metrics::{variable}",
+        help="Scans the active data only for this variable. Use this before editing current bins.",
+    )
+    reports = cached_evaluate_original_current(
+        project,
+        state,
+        df,
+        test_df,
+        target,
+        positive_class,
+        compute_missing=load_report or reports_are_cached,
+    )
+    if reports is None:
+        st.info("Selected variable bin table and metrics are not loaded. Press Load selected variable metrics.")
+        return
+
     current_train = reports["current_train"]
     original_train = reports["original_train"]
 
@@ -1223,17 +1326,6 @@ def render_woe_workspace(
     project = get_project(data_key, target, positive_class)
     active_woe_variables = current_woe_variable_selection(features, data_key=data_key, target=target)
     visible_project = scoped_woe_project(project, active_woe_variables)
-    st.caption(
-        f"WOE view scope: {len(active_woe_variables):,} selected variable(s) from Data Setup."
-    )
-    if project.get("variables") and not visible_project.get("variables"):
-        st.info("No stored mappings match the current WOE variable selection.")
-
-    summary = render_catalog(visible_project, df, test_df, target, positive_class)
-    if not summary.empty:
-        render_project_exports(visible_project, df, test_df, target, positive_class)
-        render_variable_editor(visible_project, df, test_df, target, positive_class, summary)
-    mark_woe_refresh_done(data_key, target)
     with st.sidebar:
         render_woe_sidebar_controls(
             project,
@@ -1243,3 +1335,28 @@ def render_woe_workspace(
             positive_class,
             data_key,
         )
+
+    st.caption(
+        f"WOE view scope: {len(active_woe_variables):,} selected variable(s) from Data Setup."
+    )
+    if project.get("variables") and not visible_project.get("variables"):
+        st.info("No stored mappings match the current WOE variable selection.")
+
+    refresh_catalog = st.button(
+        "Load / refresh selected catalog metrics",
+        width="stretch",
+        disabled=not bool(visible_project.get("variables")),
+        help="Scans the active data for the selected WOE variables. Page switching does not run this automatically.",
+    )
+    summary = render_catalog(
+        visible_project,
+        df,
+        test_df,
+        target,
+        positive_class,
+        compute_missing=refresh_catalog,
+    )
+    if not summary.empty:
+        render_project_exports(visible_project, df, test_df, target, positive_class)
+        render_variable_editor(visible_project, df, test_df, target, positive_class, summary)
+    mark_woe_refresh_done(data_key, target)
