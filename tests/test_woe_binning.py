@@ -5,8 +5,11 @@ import io
 import json
 import pickle
 
+import numpy as np
 import pandas as pd
+import pytest
 
+import interactive_decision_tree.woe_binning as woe_binning
 from interactive_decision_tree.woe_binning import (
     WoeBuildConfig,
     apply_bin_table_edits,
@@ -100,6 +103,45 @@ def test_numeric_woe_supports_special_missing_and_manual_woe():
     special_export = updated_report["table"].loc[updated_report["table"]["kind"] == "special", "export_woe"].iloc[0]
     assert special_export == -1.25
     assert updated_report["metrics"]["manual_woe_bins"] == 1
+
+
+def test_auto_optbinning_records_fallback_reason_when_engine_unavailable(monkeypatch):
+    def fail_loader():
+        raise RuntimeError("missing optbinning package")
+
+    monkeypatch.setattr(woe_binning, "_load_optimal_binning_class", fail_loader)
+
+    spec = build_initial_spec(woe_df(), "target", "age", 1, WoeBuildConfig(engine="auto"))
+
+    assert spec["config"]["engine_used"] == "fallback"
+    assert "missing optbinning package" in spec["config"]["engine_fallback_reason"]
+
+
+def test_forced_optbinning_raises_when_engine_unavailable(monkeypatch):
+    def fail_loader():
+        raise RuntimeError("missing optbinning package")
+
+    monkeypatch.setattr(woe_binning, "_load_optimal_binning_class", fail_loader)
+
+    with pytest.raises(RuntimeError, match="missing optbinning package"):
+        build_initial_spec(woe_df(), "target", "age", 1, WoeBuildConfig(engine="optbinning"))
+
+
+def test_forced_optbinning_uses_optbinning_when_available():
+    pytest.importorskip("optbinning")
+    status = woe_binning.optbinning_status()
+    if not status["available"]:
+        pytest.skip(str(status["error"]))
+
+    rng = np.random.default_rng(7)
+    x = rng.normal(size=400)
+    p = 1 / (1 + np.exp(-2 * x))
+    df = pd.DataFrame({"score": x, "target": rng.binomial(1, p)})
+
+    spec = build_initial_spec(df, "target", "score", 1, WoeBuildConfig(engine="optbinning"))
+
+    assert spec["config"]["engine_used"] == "optbinning"
+    assert spec["config"]["engine_fallback_reason"] is None
 
 
 def test_apply_numeric_cutpoints_rebuilds_normal_bins():

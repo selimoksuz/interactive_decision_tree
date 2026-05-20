@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 import math
+import warnings
 from dataclasses import dataclass
+from functools import lru_cache
+from importlib import metadata
 from typing import Any
 
 import numpy as np
@@ -161,23 +164,88 @@ def quantile_splits(values: pd.Series, max_bins: int, min_bin_size: float) -> li
     return accepted
 
 
+def package_version(package_name: str) -> str | None:
+    try:
+        return metadata.version(package_name)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def version_pair(version_text: str | None) -> tuple[int, int] | None:
+    if not version_text:
+        return None
+    parts = str(version_text).split(".")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def optbinning_compatibility_error() -> str | None:
+    optbinning_version = package_version("optbinning")
+    sklearn_version = package_version("scikit-learn")
+    optbinning_pair = version_pair(optbinning_version)
+    sklearn_pair = version_pair(sklearn_version)
+    if optbinning_pair is not None and sklearn_pair is not None:
+        if optbinning_pair <= (0, 20) and sklearn_pair >= (1, 8):
+            return (
+                f"optbinning {optbinning_version} is incompatible with scikit-learn {sklearn_version}. "
+                "Install scikit-learn<1.8 or use a compatible optbinning/OR-Tools/Python combination."
+            )
+    return None
+
+
+@lru_cache(maxsize=1)
+def _load_optimal_binning_class() -> Any:
+    try:
+        from optbinning import OptimalBinning  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("optbinning is not installed in the active Python environment.") from exc
+
+    compatibility_error = optbinning_compatibility_error()
+    if compatibility_error:
+        raise RuntimeError(compatibility_error)
+    return OptimalBinning
+
+
+def optbinning_status() -> dict[str, Any]:
+    try:
+        _load_optimal_binning_class()
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": str(exc),
+            "optbinning_version": package_version("optbinning"),
+            "sklearn_version": package_version("scikit-learn"),
+        }
+    return {
+        "available": True,
+        "error": None,
+        "optbinning_version": package_version("optbinning"),
+        "sklearn_version": package_version("scikit-learn"),
+    }
+
+
 def optbinning_numeric_splits(
     values: pd.Series,
     y_event: pd.Series,
     feature: str,
     config: WoeBuildConfig,
-) -> list[float] | None:
+) -> tuple[list[float] | None, str | None]:
     if config.engine not in {"auto", "optbinning"}:
-        return None
+        return None, None
     try:
-        from optbinning import OptimalBinning  # type: ignore
-    except Exception:
-        return None
+        OptimalBinning = _load_optimal_binning_class()
+    except Exception as exc:
+        message = str(exc)
+        if config.engine == "optbinning":
+            raise RuntimeError(message) from exc
+        return None, message
 
     x = pd.to_numeric(values, errors="coerce")
     valid = x.notna() & y_event.notna()
     if valid.sum() < 2 or x[valid].nunique() <= 1:
-        return []
+        return [], None
 
     monotonic = None if config.monotonic_trend in {"auto", "none"} else config.monotonic_trend
     try:
@@ -188,18 +256,25 @@ def optbinning_numeric_splits(
             min_bin_size=float(config.min_bin_size),
             monotonic_trend=monotonic,
         )
-        optb.fit(x[valid].to_numpy(), y_event[valid].astype(int).to_numpy())
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="'force_all_finite' was renamed to 'ensure_all_finite'.*",
+                category=FutureWarning,
+            )
+            optb.fit(x[valid].to_numpy(), y_event[valid].astype(int).to_numpy())
         return sorted(
             {
                 float(split)
                 for split in getattr(optb, "splits", [])
                 if split is not None and math.isfinite(float(split))
             }
-        )
-    except Exception:
+        ), None
+    except Exception as exc:
+        message = f"optbinning failed for {feature}: {type(exc).__name__}: {exc}"
         if config.engine == "optbinning":
-            raise
-        return None
+            raise RuntimeError(message) from exc
+        return None, message
 
 
 def numeric_bins_from_splits(splits: list[float], start_index: int = 1) -> list[dict[str, Any]]:
@@ -387,11 +462,18 @@ def build_initial_spec(
         bins.append(special_bin(list(config.special_values), config.protected_special))
 
     engine_used = "fallback"
+    engine_fallback_reason = None
     if feature_kind == "numeric":
-        opt_splits = optbinning_numeric_splits(normal_frame[feature], y_event.loc[normal_frame.index], feature, config)
+        opt_splits, engine_fallback_reason = optbinning_numeric_splits(
+            normal_frame[feature],
+            y_event.loc[normal_frame.index],
+            feature,
+            config,
+        )
         if opt_splits is not None:
             splits = opt_splits
             engine_used = "optbinning"
+            engine_fallback_reason = None
         else:
             splits = quantile_splits(normal_frame[feature], config.max_bins, config.min_bin_size)
         bins.extend(numeric_bins_from_splits(splits, start_index=1))
@@ -414,6 +496,7 @@ def build_initial_spec(
             "protected_special": bool(config.protected_special),
             "engine": str(config.engine),
             "engine_used": engine_used,
+            "engine_fallback_reason": engine_fallback_reason,
         },
         "evaluation_profile": evaluation_profile,
         "bins": bins,

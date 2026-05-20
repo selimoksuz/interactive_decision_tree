@@ -31,7 +31,8 @@ oracle = [
     "oracledb",
 ]
 woe = [
-    "optbinning>=0.20",
+    "optbinning==0.20.0",
+    "scikit-learn<1.8",
 ]
 
 [tool.setuptools]

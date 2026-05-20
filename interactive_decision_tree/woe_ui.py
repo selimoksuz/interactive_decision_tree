@@ -23,6 +23,7 @@ from .woe_binning import (
     evaluate_spec,
     merge_selected_bins,
     missing_mask,
+    optbinning_status,
     parse_category_groups,
     parse_cutpoints,
     parse_special_values,
@@ -545,6 +546,16 @@ def build_config_from_sidebar(
         key="woe_monotonic_trend",
     )
     engine = st.selectbox("Binning engine", ["auto", "fallback", "optbinning"], index=0, key="woe_engine")
+    if engine in {"auto", "optbinning"}:
+        status = optbinning_status()
+        version_text = status.get("optbinning_version") or "not installed"
+        sklearn_text = status.get("sklearn_version") or "unknown"
+        if status.get("available"):
+            st.caption(f"optbinning ready: optbinning {version_text}, scikit-learn {sklearn_text}.")
+        elif engine == "optbinning":
+            st.error(f"optbinning cannot run: {status.get('error')}")
+        else:
+            st.caption(f"Auto will use fallback: {status.get('error')}")
     missing_separate = st.checkbox("Missing as separate bin", value=True, key="woe_missing_separate")
     blank_as_missing = st.checkbox("Blank string as missing", value=True, key="woe_blank_as_missing")
     config = WoeBuildConfig(

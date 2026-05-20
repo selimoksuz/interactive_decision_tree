@@ -5,3 +5,5 @@ streamlit-agraph
 SQLAlchemy>=2.0
 openpyxl>=3.1
 xlrd>=2.0
+optbinning==0.20.0
+scikit-learn<1.8
