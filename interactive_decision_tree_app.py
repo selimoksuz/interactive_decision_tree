@@ -4998,8 +4998,7 @@ def cached_model_performance_wide_table(
 
 
 def main() -> None:
-    st.set_page_config(page_title="Interactive entropy tree", layout="wide")
-    st.title("Interactive entropy decision tree")
+    st.set_page_config(page_title="Interactive model workspace", layout="wide")
 
     work_id = ensure_work_id()
     checkpoint = load_work_checkpoint(work_id)
@@ -5048,6 +5047,15 @@ def main() -> None:
         key="workspace_mode",
     )
     show_data_setup = workspace_mode == "Data Setup" or st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is None
+    workspace_title = (
+        "Data Setup"
+        if show_data_setup
+        else {
+            "Tree Builder": "Interactive entropy decision tree",
+            "WOE Binning": "WOE Binning",
+        }.get(workspace_mode, str(workspace_mode))
+    )
+    st.title(workspace_title)
 
     train_source = None
     if show_data_setup:
@@ -5086,7 +5094,6 @@ def main() -> None:
         draft_source_data_key = train_source.data_key
         draft_data_source = train_source.source
         restored_upload = train_source.restored_upload
-        st.subheader("Data setup")
         st.caption("Configure the active dataset here. Tree rendering and split ranking stay idle on this page.")
         data_setup_form = st.container()
         with data_setup_form:

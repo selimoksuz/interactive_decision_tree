@@ -29,6 +29,7 @@ from interactive_decision_tree.woe_export import (
 from interactive_decision_tree.woe_ui import (
     filter_variable_options,
     normalize_variable_selection,
+    scoped_woe_project,
     update_variable_selection_for_filtered,
     variable_editor_order,
 )
@@ -65,6 +66,18 @@ def test_woe_variable_selection_actions_preserve_order():
         "income"
     ]
     assert normalize_variable_selection(variables, ["income", "missing", "age"]) == ["income", "age"]
+
+
+def test_scoped_woe_project_limits_visible_variables_without_copying_states():
+    age_state = {"name": "age"}
+    segment_state = {"name": "segment"}
+    project = {"project_key": "unit", "variables": {"age": age_state, "segment": segment_state}}
+
+    scoped = scoped_woe_project(project, ["segment"])
+
+    assert set(scoped["variables"]) == {"segment"}
+    assert scoped["variables"]["segment"] is segment_state
+    assert set(project["variables"]) == {"age", "segment"}
 
 
 def test_numeric_woe_supports_special_missing_and_manual_woe():

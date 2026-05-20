@@ -24,6 +24,7 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     at.query_params["work_id"] = f"woe_{uuid4().hex}"
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert at.title[0].value == "Data Setup"
 
     next(button for button in at.button if button.label == "Apply data setup").click()
     at.run(timeout=25)
@@ -32,6 +33,8 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     next(radio for radio in at.radio if radio.label == "Workspace").set_value("WOE Binning")
     at.run(timeout=25)
     assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert at.title[0].value == "WOE Binning"
+    assert all(title.value != "Interactive entropy decision tree" for title in at.title)
     assert any(button.label == "Run initial WOE binning" for button in at.button)
 
     next(button for button in at.button if button.label == "Run initial WOE binning").click()

@@ -405,7 +405,7 @@ def woe_variable_selection_key(data_key: str, target: str) -> str:
     return f"woe_selected_variables::{data_key}::{target}"
 
 
-def render_woe_variable_selector(variables: list[str], *, data_key: str, target: str) -> list[str]:
+def current_woe_variable_selection(variables: list[str], *, data_key: str, target: str) -> list[str]:
     default_variables = variables[: min(20, len(variables))]
     selected_key = woe_variable_selection_key(data_key, target)
     if selected_key not in st.session_state:
@@ -415,12 +415,28 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
             variables,
             st.session_state.get(selected_key),
         )
-
-    st.markdown("**WOE variables**")
-    selected_variables = normalize_variable_selection(
+    return normalize_variable_selection(
         variables,
         st.session_state.get(selected_key, default_variables),
     )
+
+
+def scoped_woe_project(project: dict[str, Any], selected_variables: list[str]) -> dict[str, Any]:
+    selected = {str(variable) for variable in selected_variables}
+    scoped_project = dict(project)
+    scoped_project["variables"] = {
+        variable: state
+        for variable, state in project.get("variables", {}).items()
+        if str(variable) in selected
+    }
+    return scoped_project
+
+
+def render_woe_variable_selector(variables: list[str], *, data_key: str, target: str) -> list[str]:
+    selected_key = woe_variable_selection_key(data_key, target)
+
+    st.markdown("**WOE variables**")
+    selected_variables = current_woe_variable_selection(variables, data_key=data_key, target=target)
     scope_signature = hashlib.sha256(f"{data_key}::{target}".encode("utf-8")).hexdigest()[:10]
     with st.popover("Dropdown Filter Panel"):
         query = st.text_input(
@@ -479,7 +495,7 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
             )
         if not filtered_variables:
             st.caption("No matching variables.")
-        st.caption("Selections are used when you press Run initial WOE binning.")
+        st.caption("Selections control this WOE workspace and are used when you press Run initial WOE binning.")
 
     selected_variables = normalize_variable_selection(
         variables,
@@ -789,17 +805,17 @@ def render_project_exports(
     with st.expander("Project exports", expanded=False):
         scope_options = {
             "included": {
-                "label": "Included variables",
+                "label": "Included selected variables",
                 "included_only": True,
                 "excluded_only": False,
             },
             "excluded": {
-                "label": "Excluded variables",
+                "label": "Excluded selected variables",
                 "included_only": False,
                 "excluded_only": True,
             },
             "all": {
-                "label": "All variables",
+                "label": "All selected variables",
                 "included_only": False,
                 "excluded_only": False,
             },
@@ -1025,7 +1041,10 @@ def render_variable_editor(
         return
 
     remembered = st.session_state.get(WOE_ACTIVE_VARIABLE_KEY)
-    default_index = variables.index(remembered) if remembered in variables else 0
+    if remembered not in variables:
+        st.session_state[WOE_ACTIVE_VARIABLE_KEY] = variables[0]
+        remembered = variables[0]
+    default_index = variables.index(remembered)
     variable = st.selectbox("Variable editor", variables, index=default_index, key=WOE_ACTIVE_VARIABLE_KEY)
     state = project["variables"][variable]
     mapping_state = state_mapping_state(state)
@@ -1158,7 +1177,6 @@ def render_woe_workspace(
     positive_class: Any,
     data_key: str,
 ) -> None:
-    st.subheader("WOE Binning")
     st.caption("Variable generation workspace: each variable is edited independently, then exported as one mapping.")
     if positive_class is None:
         st.error("WOE Binning requires a binary target and a positive class.")
@@ -1168,10 +1186,18 @@ def render_woe_workspace(
         return
 
     project = get_project(data_key, target, positive_class)
-    summary = render_catalog(project, df, test_df, target, positive_class)
+    active_woe_variables = current_woe_variable_selection(features, data_key=data_key, target=target)
+    visible_project = scoped_woe_project(project, active_woe_variables)
+    st.caption(
+        f"WOE view scope: {len(active_woe_variables):,} selected variable(s) from Data Setup."
+    )
+    if project.get("variables") and not visible_project.get("variables"):
+        st.info("No stored mappings match the current WOE variable selection.")
+
+    summary = render_catalog(visible_project, df, test_df, target, positive_class)
     if not summary.empty:
-        render_project_exports(project, df, test_df, target, positive_class)
-        render_variable_editor(project, df, test_df, target, positive_class, summary)
+        render_project_exports(visible_project, df, test_df, target, positive_class)
+        render_variable_editor(visible_project, df, test_df, target, positive_class, summary)
     mark_woe_refresh_done(data_key, target)
     with st.sidebar:
         render_woe_sidebar_controls(
