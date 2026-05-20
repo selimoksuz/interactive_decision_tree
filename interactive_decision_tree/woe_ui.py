@@ -318,15 +318,36 @@ def update_variable_selection_for_filtered(
     return ordered_variable_selection(variables, selected)
 
 
+def apply_woe_filtered_selection(
+    selected_key: str,
+    variables: list[str],
+    filtered_variables: list[str],
+    checkbox_key: str,
+) -> None:
+    st.session_state[selected_key] = update_variable_selection_for_filtered(
+        variables,
+        st.session_state.get(selected_key, []),
+        filtered_variables,
+        bool(st.session_state.get(checkbox_key)),
+    )
+
+
+def apply_woe_item_selection(
+    selected_key: str,
+    variables: list[str],
+    variable: str,
+    checkbox_key: str,
+) -> None:
+    selected = set(normalize_variable_selection(variables, st.session_state.get(selected_key, [])))
+    if bool(st.session_state.get(checkbox_key)):
+        selected.add(str(variable))
+    else:
+        selected.discard(str(variable))
+    st.session_state[selected_key] = ordered_variable_selection(variables, selected)
+
+
 def woe_variable_selection_key(data_key: str, target: str) -> str:
     return f"woe_selected_variables::{data_key}::{target}"
-
-
-def rerun_current_view() -> None:
-    try:
-        st.rerun(scope="fragment")
-    except Exception:
-        st.rerun()
 
 
 def render_woe_variable_selector(variables: list[str], *, data_key: str, target: str) -> list[str]:
@@ -340,13 +361,13 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
             st.session_state.get(selected_key),
         )
 
-    st.sidebar.markdown("**WOE variables**")
+    st.markdown("**WOE variables**")
     selected_variables = normalize_variable_selection(
         variables,
         st.session_state.get(selected_key, default_variables),
     )
     scope_signature = hashlib.sha256(f"{data_key}::{target}".encode("utf-8")).hexdigest()[:10]
-    with st.sidebar.popover("Dropdown Filter Panel"):
+    with st.popover("Dropdown Filter Panel"):
         query = st.text_input(
             "Search variable",
             placeholder="Search",
@@ -370,22 +391,15 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
         all_filtered_selected = bool(filtered_variables) and all(
             variable in selected_set for variable in filtered_variables
         )
-        select_all_value = st.checkbox(
+        select_all_key = f"woe_variable_filter_all::{scope_signature}::{filtered_signature}::{selection_signature}"
+        st.checkbox(
             "(Select All)",
             value=all_filtered_selected,
-            key=f"woe_variable_filter_all::{scope_signature}::{filtered_signature}::{selection_signature}",
+            key=select_all_key,
             disabled=not filtered_variables,
+            on_change=apply_woe_filtered_selection,
+            args=(selected_key, variables, filtered_variables, select_all_key),
         )
-        if filtered_variables and select_all_value != all_filtered_selected:
-            selected_variables = update_variable_selection_for_filtered(
-                variables,
-                selected_variables,
-                filtered_variables,
-                select_all_value,
-            )
-            st.session_state[selected_key] = selected_variables
-            selected_set = set(selected_variables)
-            rerun_current_view()
 
         list_container = st.container(height=260, border=True)
         visible_variables = filtered_variables[:WOE_VARIABLE_FILTER_MAX_VISIBLE]
@@ -393,28 +407,19 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
             list_container.caption(
                 f"Showing first {len(visible_variables):,} matching variable(s). Use search to narrow the list."
             )
-        next_selected = set(selected_variables)
-        changed = False
         for variable in visible_variables:
             was_selected = variable in selected_set
-            is_selected = list_container.checkbox(
+            item_key = (
+                f"woe_variable_filter_item::{scope_signature}::"
+                f"{filtered_signature}::{selection_signature}::{variable}"
+            )
+            list_container.checkbox(
                 str(variable),
                 value=was_selected,
-                key=(
-                    f"woe_variable_filter_item::{scope_signature}::"
-                    f"{filtered_signature}::{selection_signature}::{variable}"
-                ),
+                key=item_key,
+                on_change=apply_woe_item_selection,
+                args=(selected_key, variables, variable, item_key),
             )
-            if is_selected != was_selected:
-                changed = True
-                if is_selected:
-                    next_selected.add(variable)
-                else:
-                    next_selected.discard(variable)
-        if changed:
-            selected_variables = ordered_variable_selection(variables, next_selected)
-            st.session_state[selected_key] = selected_variables
-            rerun_current_view()
         if not filtered_variables:
             st.caption("No matching variables.")
         st.caption("Selections are used when you press Run initial WOE binning.")
@@ -423,7 +428,7 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
         variables,
         st.session_state.get(selected_key, selected_variables),
     )
-    st.sidebar.caption(f"{len(selected_variables):,} selected | {len(variables):,} active Data Setup variable(s)")
+    st.caption(f"{len(selected_variables):,} selected | {len(variables):,} active Data Setup variable(s)")
     return selected_variables
 
 
@@ -434,8 +439,8 @@ def build_config_from_sidebar(
     target: str,
 ) -> tuple[list[str], WoeBuildConfig, bool]:
     selected_variables = render_woe_variable_selector(features, data_key=data_key, target=target)
-    max_bins = st.sidebar.number_input("Max bins", min_value=2, max_value=20, value=6, step=1, key="woe_max_bins")
-    min_bin_size = st.sidebar.slider(
+    max_bins = st.number_input("Max bins", min_value=2, max_value=20, value=6, step=1, key="woe_max_bins")
+    min_bin_size = st.slider(
         "Min bin size",
         min_value=0.01,
         max_value=0.30,
@@ -443,16 +448,16 @@ def build_config_from_sidebar(
         step=0.01,
         key="woe_min_bin_size",
     )
-    monotonic_trend = st.sidebar.selectbox(
+    monotonic_trend = st.selectbox(
         "Monotonic trend",
         ["auto", "none", "ascending", "descending"],
         index=0,
         key="woe_monotonic_trend",
     )
-    engine = st.sidebar.selectbox("Binning engine", ["auto", "fallback", "optbinning"], index=0, key="woe_engine")
-    missing_separate = st.sidebar.checkbox("Missing as separate bin", value=True, key="woe_missing_separate")
-    blank_as_missing = st.sidebar.checkbox("Blank string as missing", value=True, key="woe_blank_as_missing")
-    replace_existing = st.sidebar.checkbox(
+    engine = st.selectbox("Binning engine", ["auto", "fallback", "optbinning"], index=0, key="woe_engine")
+    missing_separate = st.checkbox("Missing as separate bin", value=True, key="woe_missing_separate")
+    blank_as_missing = st.checkbox("Blank string as missing", value=True, key="woe_blank_as_missing")
+    replace_existing = st.checkbox(
         "Overwrite existing mappings on rerun",
         value=False,
         key="woe_replace_existing",
@@ -467,6 +472,31 @@ def build_config_from_sidebar(
         engine=str(engine),
     )
     return list(selected_variables), config, bool(replace_existing)
+
+
+@st.fragment
+def render_woe_sidebar_controls(
+    project: dict[str, Any],
+    df: pd.DataFrame,
+    target: str,
+    features: list[str],
+    positive_class: Any,
+    data_key: str,
+) -> None:
+    selected_variables, config, replace_existing = build_config_from_sidebar(
+        features,
+        data_key=data_key,
+        target=target,
+    )
+    run_clicked = st.button(
+        "Run initial WOE binning",
+        width="stretch",
+        type="primary",
+        disabled=not selected_variables,
+    )
+    if run_clicked:
+        run_initial_binning(project, df, target, selected_variables, positive_class, config, replace_existing)
+        st.rerun()
 
 
 def cached_variable_state_rows(
@@ -992,20 +1022,15 @@ def render_woe_workspace(
         return
 
     project = get_project(data_key, target, positive_class)
-    selected_variables, config, replace_existing = build_config_from_sidebar(
-        features,
-        data_key=data_key,
-        target=target,
-    )
-    run_clicked = st.sidebar.button(
-        "Run initial WOE binning",
-        width="stretch",
-        type="primary",
-        disabled=not selected_variables,
-    )
-    if run_clicked:
-        run_initial_binning(project, df, target, selected_variables, positive_class, config, replace_existing)
-        st.rerun()
+    with st.sidebar:
+        render_woe_sidebar_controls(
+            project,
+            df,
+            target,
+            features,
+            positive_class,
+            data_key,
+        )
 
     summary = render_catalog(project, df, test_df, target, positive_class)
     if not summary.empty:
