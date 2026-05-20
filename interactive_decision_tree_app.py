@@ -5704,6 +5704,7 @@ def main() -> None:
                 st.session_state["_tree_import_message"] = (
                     f"Imported editable tree with {len(imported_tree)} node(s)."
                 )
+                clear_candidate_cache(data_key, target)
                 save_and_rerun(imported_selected_features or features)
         if st.session_state.get("_tree_import_message"):
             st.caption(st.session_state["_tree_import_message"])
@@ -5721,7 +5722,6 @@ def main() -> None:
         help="Reverts the last manual split, or all splits added by the last optimal-tree run.",
     ):
         undo_last_split()
-        clear_candidate_cache(data_key, target)
         save_and_rerun()
 
     tree = st.session_state.tree
@@ -5855,7 +5855,6 @@ def main() -> None:
                     save_and_rerun()
             if st.button("Revise this split", width="stretch"):
                 prune_node(current["id"])
-                clear_candidate_cache(data_key, target)
                 save_and_rerun()
 
     with right_col:
@@ -6115,7 +6114,6 @@ def main() -> None:
                         disabled=bool(validation_lookup) and not candidate_passes_validation(selected_candidate, validation_lookup),
                     ):
                         apply_split(df, selected_candidate)
-                        clear_candidate_cache(data_key, target)
                         save_and_rerun()
 
                 st.subheader("Manual split")
@@ -6431,7 +6429,6 @@ def main() -> None:
                         disabled=not manual_validation_safe,
                     ):
                         apply_split(df, manual_candidate)
-                        clear_candidate_cache(data_key, target)
                         save_and_rerun()
         else:
             st.info("Use 'Revise this split' to clear this node's children. Then choose a new variable or manual split for the same node.")

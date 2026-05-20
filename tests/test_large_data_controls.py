@@ -11,6 +11,7 @@ from interactive_decision_tree_app import (
     build_optimal_tree,
     cached_ranking_ready_message,
     candidate_cache_key,
+    get_cached_candidates,
     candidate_splits,
     candidate_validation_stats,
     checkpoint_ui_state,
@@ -30,6 +31,7 @@ from interactive_decision_tree_app import (
     split_branch_indices,
     split_ranking_scope_caption,
     split_node,
+    store_cached_candidates,
     train_test_split_indices,
     update_feature_selection_for_filtered,
     undo_last_split,
@@ -280,6 +282,57 @@ def test_candidate_cache_key_changes_with_variable_set():
     reduced_features = candidate_cache_key(features=["age", "segment"], **base)
 
     assert all_features != reduced_features
+
+
+def test_undo_preserves_cached_ranking_for_restored_leaf():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["low", "low", "high", "high"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+    assert candidate is not None
+    parameters = {
+        "min_leaf": 1,
+        "max_thresholds": 3,
+        "max_numeric_bins": 2,
+        "max_categories": 3,
+        "max_category_groups": 2,
+    }
+    cache_key = candidate_cache_key(
+        data_key="data",
+        target="risk_flag",
+        node_id=0,
+        features=["x"],
+        row_count=len(train),
+        parameters=parameters,
+        max_rows=len(train),
+    )
+    store_cached_candidates(
+        "data",
+        "risk_flag",
+        0,
+        cache_key,
+        [candidate],
+        analyzed_rows=len(train),
+        full_rows=len(train),
+    )
+
+    split_node(train, 0, candidate, select_first_child=False)
+    assert undo_last_split() is True
+
+    assert get_cached_candidates("data", "risk_flag", 0, cache_key) == [candidate]
 
 
 def test_candidate_splits_parallel_matches_serial():
