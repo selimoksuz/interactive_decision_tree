@@ -27,6 +27,7 @@ from interactive_decision_tree.woe_export import (
     project_pickle_bytes,
 )
 from interactive_decision_tree.woe_ui import (
+    apply_current_bin_changes,
     filter_variable_options,
     normalize_variable_selection,
     scoped_woe_project,
@@ -177,6 +178,30 @@ def test_merge_selected_bins_numeric_can_merge_previous_with_current():
     labels = [bin_spec["label"] for bin_spec in updated["bins"] if bin_spec["kind"] == "normal"]
 
     assert labels == ["(-inf, 50]", "(50, inf)"]
+
+
+def test_apply_current_bin_changes_combines_table_edits_and_merge():
+    df = woe_df()
+    spec = build_initial_spec(df, "target", "age", 1, WoeBuildConfig(engine="fallback"))
+    spec = apply_numeric_cutpoints(spec, [30, 50])
+    table = evaluate_spec(df, "target", spec, 1)["table"]
+    edited = table.copy()
+    edited.loc[edited["bin_id"] == "b001", "assigned_woe"] = -0.5
+    state = {"name": "age", "current_spec": spec}
+
+    actions = apply_current_bin_changes(
+        state,
+        edited,
+        ["b002", "b003"],
+        {"kind": "numeric", "changed": False, "cutpoints": [30, 50]},
+    )
+
+    normal = [bin_spec for bin_spec in state["current_spec"]["bins"] if bin_spec["kind"] == "normal"]
+    assert actions == ["apply_table_edits", "merge_selected_bins"]
+    assert len(normal) == 2
+    assert normal[0]["assigned_woe"] == -0.5
+    assert state["status"] == "edited"
+    assert state["edits"][-1]["action"] == "apply_current_bin_changes"
 
 
 def test_merge_selected_bins_categorical_can_merge_non_adjacent_groups():

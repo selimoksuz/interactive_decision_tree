@@ -222,6 +222,14 @@ def category_groups_text(spec: dict[str, Any]) -> str:
     return "\n".join(", ".join(group) for group in categorical_groups_from_spec(spec))
 
 
+def sync_text_widget_to_spec(widget_key: str, spec: dict[str, Any], value: str) -> None:
+    signature_key = f"{widget_key}::spec_signature"
+    signature = spec_signature(spec)
+    if st.session_state.get(signature_key) != signature:
+        st.session_state[widget_key] = value
+        st.session_state[signature_key] = signature
+
+
 def woe_initial_run_status_key(data_key: str, target: str) -> str:
     return f"woe_initial_run_status::{data_key}::{target}"
 
@@ -993,39 +1001,79 @@ def render_special_missing_editor(
         st.rerun()
 
 
-def render_current_bin_structure_controls(state: dict[str, Any]) -> None:
+def render_current_bin_structure_controls(state: dict[str, Any]) -> dict[str, Any]:
     current_spec = state["current_spec"]
     if current_spec.get("feature_kind") == "numeric":
         st.markdown("**Numeric cutpoints**")
         cutpoint_key = f"woe_cutpoints::{state['name']}"
+        current_cutpoints = cutpoints_from_spec(current_spec)
+        sync_text_widget_to_spec(cutpoint_key, current_spec, cutpoints_text(current_spec))
         cutpoint_text = st.text_area(
             "Cutpoints",
-            value=st.session_state.get(cutpoint_key, cutpoints_text(current_spec)),
             key=cutpoint_key,
             help="Comma or newline separated numeric cutpoints.",
         )
-        col1, _ = st.columns(2)
-        if col1.button("Apply cutpoints", width="stretch", key=f"woe_apply_cutpoints::{state['name']}"):
-            state["current_spec"] = apply_numeric_cutpoints(current_spec, parse_cutpoints(cutpoint_text))
-            mark_mapping_edited(state, "apply_cutpoints", {"cutpoints": parse_cutpoints(cutpoint_text)})
-            st.rerun()
+        parsed_cutpoints = parse_cutpoints(cutpoint_text)
+        return {
+            "kind": "numeric",
+            "changed": parsed_cutpoints != current_cutpoints,
+            "cutpoints": parsed_cutpoints,
+        }
     else:
         st.markdown("**Categorical groups**")
         group_key = f"woe_category_groups::{state['name']}"
+        current_groups = categorical_groups_from_spec(current_spec)
+        sync_text_widget_to_spec(group_key, current_spec, category_groups_text(current_spec))
         groups_text = st.text_area(
             "One bin per line, values comma separated",
-            value=st.session_state.get(group_key, category_groups_text(current_spec)),
             key=group_key,
             height=180,
         )
-        if st.button("Apply categorical groups", width="stretch", key=f"woe_apply_groups::{state['name']}"):
-            state["current_spec"] = apply_categorical_groups(current_spec, parse_category_groups(groups_text))
-            mark_mapping_edited(
-                state,
-                "apply_categorical_groups",
-                {"group_count": len(parse_category_groups(groups_text))},
-            )
-            st.rerun()
+        parsed_groups = parse_category_groups(groups_text)
+        return {
+            "kind": "categorical",
+            "changed": parsed_groups != current_groups,
+            "groups": parsed_groups,
+        }
+
+
+def apply_current_bin_changes(
+    state: dict[str, Any],
+    edited_table: pd.DataFrame,
+    selected_merge_bins: list[str],
+    structure_change: dict[str, Any],
+) -> list[str]:
+    current_spec = state["current_spec"]
+    actions: list[dict[str, Any]] = []
+
+    if bool(structure_change.get("changed")):
+        if len(selected_merge_bins) >= 2:
+            raise ValueError("Apply cutpoint/group changes first, then select bins to merge after the table refreshes.")
+        if structure_change.get("kind") == "numeric":
+            updated_spec = apply_numeric_cutpoints(current_spec, list(structure_change.get("cutpoints", [])))
+            actions.append({"action": "apply_cutpoints", "cutpoints": list(structure_change.get("cutpoints", []))})
+        else:
+            groups = list(structure_change.get("groups", []))
+            updated_spec = apply_categorical_groups(current_spec, groups)
+            actions.append({"action": "apply_categorical_groups", "group_count": len(groups)})
+        state["current_spec"] = updated_spec
+        mark_mapping_edited(state, "apply_current_bin_changes", {"actions": actions})
+        return [str(action["action"]) for action in actions]
+
+    updated_spec = apply_bin_table_edits(current_spec, edited_table)
+    if spec_signature(updated_spec) != spec_signature(current_spec):
+        actions.append({"action": "apply_table_edits"})
+
+    if len(selected_merge_bins) >= 2:
+        updated_spec = merge_selected_bins(updated_spec, selected_merge_bins)
+        actions.append({"action": "merge_selected_bins", "bin_ids": selected_merge_bins})
+
+    if not actions:
+        return []
+
+    state["current_spec"] = updated_spec
+    mark_mapping_edited(state, "apply_current_bin_changes", {"actions": actions})
+    return [str(action["action"]) for action in actions]
 
 
 def render_variable_editor(
@@ -1120,33 +1168,20 @@ def render_variable_editor(
             "Numeric variables require adjacent selected bins. "
             "Categorical variables can merge any selected normal bins."
         )
-        merge_cols = st.columns([1, 2])
-        if merge_cols[0].button(
-            "Merge selected bins",
-            width="stretch",
-            key=f"woe_merge_selected_current::{variable}",
-            disabled=len(selected_merge_bins) < 2,
-            help=merge_help,
-        ):
+        st.caption(f"{len(selected_merge_bins):,} normal bin(s) selected for merge. {merge_help}")
+        structure_change = render_current_bin_structure_controls(state)
+        if st.button("Apply current bin changes", width="stretch", key=f"woe_apply_current_bins::{variable}"):
             try:
-                state["current_spec"] = merge_selected_bins(state["current_spec"], selected_merge_bins)
+                applied_actions = apply_current_bin_changes(state, edited, selected_merge_bins, structure_change)
             except ValueError as exc:
                 st.error(str(exc))
             else:
-                mark_mapping_edited(state, "merge_selected_bins", {"bin_ids": selected_merge_bins})
-                st.rerun()
-        merge_cols[1].caption(
-            f"{len(selected_merge_bins):,} normal bin(s) selected for merge. {merge_help}"
-        )
-        if st.button("Apply table edits", width="stretch", key=f"woe_apply_table_edits::{variable}"):
-            try:
-                state["current_spec"] = apply_bin_table_edits(state["current_spec"], edited)
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                mark_mapping_edited(state, "apply_table_edits")
-                st.rerun()
-        render_current_bin_structure_controls(state)
+                if applied_actions:
+                    st.rerun()
+                elif len(selected_merge_bins) == 1:
+                    st.warning("Select at least two normal bins to merge.")
+                else:
+                    st.info("No current bin changes to apply.")
 
     with special_tab:
         render_special_missing_editor(state, df, target, positive_class)
