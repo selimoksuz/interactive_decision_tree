@@ -1906,7 +1906,7 @@ def data_context_signature(context: dict[str, Any] | None) -> tuple[Any, ...] | 
     if not context:
         return None
     return (
-        str(context.get("data_key") or ""),
+        str(context.get("setup_key") or context.get("data_key") or ""),
         str(context.get("target") or ""),
         tuple(str(feature) for feature in context.get("features", []) or []),
         str(context.get("positive_class") or ""),
@@ -2879,6 +2879,189 @@ def restore_applied_context_from_checkpoint(
             minimum=1,
         ),
     }
+
+
+def staged_setup_key(
+    source_data_key: str,
+    sample_metadata: dict[str, Any] | None,
+    validation_metadata: dict[str, Any] | None,
+) -> str:
+    payload = {
+        "source_data_key": str(source_data_key),
+        "sample": json_safe(sample_metadata or {}),
+        "validation": json_safe(validation_metadata or {}),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def staged_data_key(
+    source_data_key: str,
+    sample_metadata: dict[str, Any] | None,
+    validation_metadata: dict[str, Any] | None,
+) -> str:
+    parts = [str(source_data_key)]
+    if isinstance(sample_metadata, dict) and sample_metadata.get("enabled"):
+        parts.append(
+            "sample_pending:"
+            f"{sample_metadata.get('sample_rows')}:"
+            f"{sample_metadata.get('random_state')}:"
+            f"{','.join(map(str, sample_metadata.get('stratify_columns') or [])) or 'random'}:"
+            f"{sample_metadata.get('numeric_bins')}"
+        )
+    if isinstance(validation_metadata, dict):
+        mode = validation_metadata.get("mode")
+        if mode == "split_train_data":
+            parts.append(
+                "train_split_pending:"
+                f"{float(validation_metadata.get('test_fraction', 0.2)):.4f}:"
+                f"{validation_metadata.get('random_state')}:"
+                f"{','.join(map(str, validation_metadata.get('stratify_columns') or [])) or 'random'}:"
+                f"{validation_metadata.get('numeric_bins')}"
+            )
+        elif mode == "separate_data_source":
+            parts.append(
+                "separate_test_pending:"
+                f"{validation_metadata.get('data_id') or validation_metadata.get('name') or 'loaded'}"
+            )
+    return ":".join(parts)
+
+
+def materialize_staged_data_context(context: dict[str, Any]) -> dict[str, Any]:
+    if not context.get("_staged"):
+        return context
+
+    source_df = context["_source_df"]
+    metadata = dict(context.get("source_metadata") or {})
+    source_data_key = str(context.get("source_data_key") or context.get("data_key") or "data")
+    target = str(context["target"])
+    working_df = source_df
+    working_data_key = source_data_key
+
+    sample_metadata = metadata.get("sample") if isinstance(metadata.get("sample"), dict) else None
+    if isinstance(sample_metadata, dict) and sample_metadata.get("enabled"):
+        sample_rows = min(
+            len(source_df),
+            safe_int(sample_metadata.get("sample_rows"), default=len(source_df), minimum=1),
+        )
+        sample_seed = safe_int(sample_metadata.get("random_state"), default=CANDIDATE_RANDOM_STATE)
+        sample_stratify_columns = normalize_stratify_columns(
+            source_df,
+            sample_metadata.get("stratify_columns") or [],
+        )
+        sample_numeric_bins = safe_int(
+            sample_metadata.get("numeric_bins"),
+            default=DEFAULT_STRATIFY_NUMERIC_BINS,
+            minimum=2,
+        )
+        if sample_rows < len(source_df):
+            sample_idx = analysis_row_idx(
+                source_df.index.tolist(),
+                max_rows=sample_rows,
+                random_state=sample_seed,
+                df=source_df,
+                stratify_columns=sample_stratify_columns,
+                stratify_numeric_bins=sample_numeric_bins,
+            )
+            working_df = source_df.loc[sample_idx].copy()
+            working_data_key = (
+                f"{source_data_key}:sample:{sample_rows}:{sample_seed}:"
+                f"{','.join(sample_stratify_columns) or 'random'}:{sample_numeric_bins}:"
+                f"{dataframe_fingerprint(working_df)}"
+            )
+        metadata["sample"] = {
+            **sample_metadata,
+            "enabled": True,
+            "source_rows": int(len(source_df)),
+            "sample_rows": int(len(working_df)),
+            "random_state": int(sample_seed),
+            "stratify_columns": list(sample_stratify_columns),
+            "numeric_bins": int(sample_numeric_bins),
+        }
+    else:
+        metadata.pop("sample", None)
+
+    active_df = working_df
+    test_df: pd.DataFrame | None = context.get("_separate_test_df")
+    validation_metadata = metadata.get("validation") if isinstance(metadata.get("validation"), dict) else None
+    data_key = working_data_key
+    if isinstance(validation_metadata, dict) and validation_metadata.get("mode") == "split_train_data":
+        split_stratify_columns = normalize_stratify_columns(
+            working_df,
+            validation_metadata.get("stratify_columns") or [],
+        )
+        split_numeric_bins = safe_int(
+            validation_metadata.get("numeric_bins"),
+            default=DEFAULT_STRATIFY_NUMERIC_BINS,
+            minimum=2,
+        )
+        split_seed = safe_int(validation_metadata.get("random_state"), default=CANDIDATE_RANDOM_STATE)
+        test_fraction = float(validation_metadata.get("test_fraction", 0.2))
+        train_idx, test_idx = train_test_split_indices(
+            working_df,
+            target,
+            test_fraction=test_fraction,
+            random_state=split_seed,
+            stratify=bool(split_stratify_columns),
+            stratify_columns=split_stratify_columns,
+            stratify_numeric_bins=split_numeric_bins,
+        )
+        active_df = working_df.loc[train_idx].copy()
+        test_df = working_df.loc[test_idx].copy()
+        data_key = (
+            f"{working_data_key}:train_split:{float(test_fraction):.4f}:"
+            f"{int(split_seed)}:{','.join(split_stratify_columns) or 'random'}:"
+            f"{split_numeric_bins}:{dataframe_fingerprint(active_df)}"
+        )
+        metadata["validation"] = {
+            **validation_metadata,
+            "mode": "split_train_data",
+            "test_fraction": float(test_fraction),
+            "random_state": int(split_seed),
+            "stratify_columns": list(split_stratify_columns),
+            "numeric_bins": int(split_numeric_bins),
+            "source_rows": int(len(working_df)),
+            "train_rows": int(len(active_df)),
+            "test_rows": int(len(test_df)),
+        }
+    elif isinstance(validation_metadata, dict) and validation_metadata.get("mode") == "separate_data_source":
+        metadata["validation"] = {
+            **validation_metadata,
+            "rows": int(len(test_df)) if test_df is not None else 0,
+        }
+    else:
+        test_df = None
+        metadata.pop("validation", None)
+
+    return {
+        "df": active_df,
+        "test_df": test_df,
+        "uploaded_name": context.get("uploaded_name"),
+        "source_metadata": metadata,
+        "source_data_id": context.get("source_data_id"),
+        "data_key": data_key,
+        "setup_key": context.get("setup_key"),
+        "data_source": context.get("data_source"),
+        "target": target,
+        "target_kind": infer_target_kind(active_df[target]),
+        "features": list(context.get("features") or []),
+        "positive_class": context.get("positive_class"),
+        "split_variable_limit": safe_int(
+            context.get("split_variable_limit"),
+            default=max(1, len(context.get("features") or [])),
+            minimum=1,
+        ),
+    }
+
+
+def can_auto_apply_draft_context(context: dict[str, Any]) -> bool:
+    if not context.get("_staged"):
+        return len(context.get("df", [])) <= AUTO_APPLY_DATA_SETUP_MAX_ROWS
+    if len(context.get("_source_df", [])) > AUTO_APPLY_DATA_SETUP_MAX_ROWS:
+        return False
+    metadata = context.get("source_metadata") if isinstance(context.get("source_metadata"), dict) else {}
+    sample_metadata = metadata.get("sample") if isinstance(metadata.get("sample"), dict) else None
+    validation_metadata = metadata.get("validation") if isinstance(metadata.get("validation"), dict) else None
+    return not (sample_metadata and sample_metadata.get("enabled")) and not validation_metadata
 
 
 def int_or_none(value: Any) -> int | None:
@@ -4953,9 +5136,9 @@ def main() -> None:
                 saved_parameters=draft_saved_parameters,
             )
 
-            draft_test_df: pd.DataFrame | None = None
-            draft_working_df = draft_source_df
-            draft_working_data_key = draft_source_data_key
+            draft_separate_test_df: pd.DataFrame | None = None
+            sample_metadata: dict[str, Any] | None = None
+            validation_metadata: dict[str, Any] | None = None
             data_sample_tab, validation_tab = data_setup_form.tabs(["Sample", "Test / validation"])
 
             default_stratify_columns = [draft_target] if draft_target_kind != "regression" else []
@@ -5013,35 +5196,19 @@ def main() -> None:
                 )
                 sample_stratify_columns = normalize_stratify_columns(draft_source_df, sample_stratify_columns)
                 if sample_enabled and sample_rows < len(draft_source_df):
-                    sample_idx = analysis_row_idx(
-                        draft_source_df.index.tolist(),
-                        max_rows=sample_rows,
-                        random_state=sample_seed,
-                        df=draft_source_df,
-                        stratify_columns=sample_stratify_columns,
-                        stratify_numeric_bins=sample_numeric_bins,
-                    )
-                    draft_working_df = draft_source_df.loc[sample_idx].copy()
-                    draft_working_data_key = (
-                        f"{draft_source_data_key}:sample:{sample_rows}:{sample_seed}:"
-                        f"{','.join(sample_stratify_columns) or 'random'}:{sample_numeric_bins}:"
-                        f"{dataframe_fingerprint(draft_working_df)}"
-                    )
-                    draft_source_metadata = {
-                        **draft_source_metadata,
-                        "sample": {
-                            "enabled": True,
-                            "source_rows": int(len(draft_source_df)),
-                            "sample_rows": int(len(draft_working_df)),
-                            "random_state": sample_seed,
-                            "stratify_columns": list(sample_stratify_columns),
-                            "numeric_bins": sample_numeric_bins,
-                        },
+                    sample_metadata = {
+                        "enabled": True,
+                        "source_rows": int(len(draft_source_df)),
+                        "sample_rows": int(sample_rows),
+                        "random_state": sample_seed,
+                        "stratify_columns": list(sample_stratify_columns),
+                        "numeric_bins": sample_numeric_bins,
                     }
-                st.caption("Sample settings are staged; active train rows update after Apply data setup.")
+                    draft_source_metadata = {**draft_source_metadata, "sample": sample_metadata}
+                else:
+                    draft_source_metadata = {key: value for key, value in draft_source_metadata.items() if key != "sample"}
+                st.caption("Sample settings are staged only; sampling runs after Apply data setup.")
 
-            draft_df = draft_working_df
-            draft_data_key = draft_working_data_key
             validation_mode = validation_tab.radio(
                 "Test / validation source",
                 ["No test data", "Split train data", "Separate data source"],
@@ -5068,7 +5235,7 @@ def main() -> None:
                 )
                 split_stratify_columns = validation_tab.multiselect(
                     "Split stratify columns",
-                    options=draft_working_df.columns.tolist(),
+                    options=draft_source_df.columns.tolist(),
                     default=default_stratify_columns,
                     key="validation_stratify_columns",
                     help=(
@@ -5085,42 +5252,24 @@ def main() -> None:
                     format="%d",
                     key="validation_stratify_numeric_bins",
                 )
-                split_stratify_columns = normalize_stratify_columns(draft_working_df, split_stratify_columns)
+                split_stratify_columns = normalize_stratify_columns(draft_source_df, split_stratify_columns)
                 split_numeric_bins = safe_int(
                     split_numeric_bins_input,
                     default=DEFAULT_STRATIFY_NUMERIC_BINS,
                     minimum=2,
                 )
-                train_idx, test_idx = train_test_split_indices(
-                    draft_working_df,
-                    draft_target,
-                    test_fraction=float(test_fraction),
-                    random_state=int(split_seed),
-                    stratify=bool(split_stratify_columns),
-                    stratify_columns=split_stratify_columns,
-                    stratify_numeric_bins=split_numeric_bins,
-                )
-                draft_df = draft_working_df.loc[train_idx].copy()
-                draft_test_df = draft_working_df.loc[test_idx].copy()
-                draft_data_key = (
-                    f"{draft_working_data_key}:train_split:{float(test_fraction):.4f}:"
-                    f"{int(split_seed)}:{','.join(split_stratify_columns) or 'random'}:"
-                    f"{split_numeric_bins}:{dataframe_fingerprint(draft_df)}"
-                )
+                validation_metadata = {
+                    "mode": "split_train_data",
+                    "test_fraction": float(test_fraction),
+                    "random_state": int(split_seed),
+                    "stratify_columns": list(split_stratify_columns),
+                    "numeric_bins": split_numeric_bins,
+                }
                 draft_source_metadata = {
                     **draft_source_metadata,
-                    "validation": {
-                        "mode": "split_train_data",
-                        "test_fraction": float(test_fraction),
-                        "random_state": int(split_seed),
-                        "stratify_columns": list(split_stratify_columns),
-                        "numeric_bins": split_numeric_bins,
-                        "source_rows": int(len(draft_working_df)),
-                        "train_rows": int(len(draft_df)),
-                        "test_rows": int(len(draft_test_df)),
-                    },
+                    "validation": validation_metadata,
                 }
-                validation_tab.caption("Split train data settings are staged; active rows update after Apply data setup.")
+                validation_tab.caption("Split train data settings are staged only; split runs after Apply data setup.")
             elif validation_mode == "Separate data source":
                 test_source_choice = validation_tab.radio(
                     "Test data source",
@@ -5144,16 +5293,17 @@ def main() -> None:
                         draft_error = f"Test data is missing column(s): {', '.join(missing_test_columns)}"
                         validation_tab.error(draft_error)
                     else:
-                        draft_test_df = test_source.df
+                        draft_separate_test_df = test_source.df
+                        validation_metadata = {
+                            "mode": "separate_data_source",
+                            "source": test_source.source,
+                            "name": test_source.name,
+                            "data_id": test_source.data_id,
+                            "rows": int(len(draft_separate_test_df)),
+                        }
                         draft_source_metadata = {
                             **draft_source_metadata,
-                            "validation": {
-                                "mode": "separate_data_source",
-                                "source": test_source.source,
-                                "name": test_source.name,
-                                "data_id": test_source.data_id,
-                                "rows": int(len(draft_test_df)),
-                            },
+                            "validation": validation_metadata,
                         }
                         validation_tab.caption(
                             "Separate test source is staged; active rows update after Apply data setup."
@@ -5162,22 +5312,40 @@ def main() -> None:
                     draft_error = "Separate test source is not loaded."
                     validation_tab.info("Choose and load a separate test source to enable Apply data setup.")
             else:
+                draft_source_metadata = {
+                    key: value for key, value in draft_source_metadata.items() if key != "validation"
+                }
                 validation_tab.caption("No test data will be used after Apply data setup.")
 
-            if draft_test_df is not None:
-                missing_test_columns = validate_test_dataframe(draft_test_df, draft_target, draft_features)
+            if draft_separate_test_df is not None:
+                missing_test_columns = validate_test_dataframe(draft_separate_test_df, draft_target, draft_features)
                 if missing_test_columns:
                     draft_error = f"Test data is missing column(s): {', '.join(missing_test_columns)}"
                     validation_tab.error(draft_error)
 
             if draft_error is None:
+                draft_setup_key = staged_setup_key(
+                    draft_source_data_key,
+                    sample_metadata,
+                    validation_metadata,
+                )
+                draft_data_key = staged_data_key(
+                    draft_source_data_key,
+                    sample_metadata,
+                    validation_metadata,
+                )
                 draft_context = {
-                    "df": draft_df,
-                    "test_df": draft_test_df,
+                    "_staged": True,
+                    "_source_df": draft_source_df,
+                    "_separate_test_df": draft_separate_test_df,
+                    "df": draft_source_df,
+                    "test_df": draft_separate_test_df,
                     "uploaded_name": draft_uploaded_name,
                     "source_metadata": draft_source_metadata,
                     "source_data_id": draft_source_data_id,
+                    "source_data_key": draft_source_data_key,
                     "data_key": draft_data_key,
+                    "setup_key": draft_setup_key,
                     "data_source": draft_data_source,
                     "target": draft_target,
                     "target_kind": draft_target_kind,
@@ -5194,16 +5362,20 @@ def main() -> None:
                 help="Only after this click does the configured source/sample/test setup become active for the tree.",
             )
     if apply_clicked and draft_context is not None:
-        st.session_state[APPLIED_DATA_CONTEXT_KEY] = draft_context
+        with st.status("Applying data setup", expanded=True) as status:
+            st.write("Materializing sample and validation data...")
+            applied_draft_context = materialize_staged_data_context(draft_context)
+            status.update(label="Data setup applied", state="complete", expanded=False)
+        st.session_state[APPLIED_DATA_CONTEXT_KEY] = applied_draft_context
         st.session_state["_data_setup_message"] = (
-            f"Applied train rows: {len(draft_context['df']):,}"
+            f"Applied train rows: {len(applied_draft_context['df']):,}"
             + (
-                f" | Test rows: {len(draft_context['test_df']):,}"
-                if draft_context.get("test_df") is not None
+                f" | Test rows: {len(applied_draft_context['test_df']):,}"
+                if applied_draft_context.get("test_df") is not None
                 else ""
             )
         )
-        applied_data_id = normalize_data_id(draft_context.get("source_data_id"))
+        applied_data_id = normalize_data_id(applied_draft_context.get("source_data_id"))
         if applied_data_id is not None:
             st.query_params[DATA_ID_QUERY_PARAM] = applied_data_id
         clear_candidate_cache()
@@ -5213,10 +5385,10 @@ def main() -> None:
     if (
         applied_context is None
         and draft_context is not None
-        and len(draft_context.get("df", [])) <= AUTO_APPLY_DATA_SETUP_MAX_ROWS
+        and can_auto_apply_draft_context(draft_context)
     ):
-        st.session_state[APPLIED_DATA_CONTEXT_KEY] = draft_context
-        applied_context = draft_context
+        applied_context = materialize_staged_data_context(draft_context)
+        st.session_state[APPLIED_DATA_CONTEXT_KEY] = applied_context
     if applied_context is None:
         st.info("Configure a data source and click Apply data setup to start the tree.")
         st.stop()
