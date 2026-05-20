@@ -35,6 +35,8 @@ WORK_ID_QUERY_PARAM = "work_id"
 CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
 APPLIED_DATA_CONTEXT_KEY = "_interactive_tree_applied_data_context"
+WORKSPACE_LAST_RENDERED_KEY = "_interactive_tree_last_rendered_workspace"
+WORKSPACE_TRANSITION_KEY = "_interactive_tree_workspace_transition"
 MIN_INFORMATION_GAIN_EPSILON = 1e-12
 GRAPH_TOOLTIP_LIMIT = 900
 AUTO_COMPUTE_CANDIDATE_ROWS = 100_000
@@ -259,6 +261,95 @@ def class_option_index(classes: list[Any], selected: Any) -> int:
         if class_values_equal(cls, selected):
             return index
     return 0
+
+
+def mark_workspace_transition() -> None:
+    requested = st.session_state.get("workspace_mode")
+    last_rendered = st.session_state.get(WORKSPACE_LAST_RENDERED_KEY)
+    if requested and last_rendered and str(requested) != str(last_rendered):
+        st.session_state[WORKSPACE_TRANSITION_KEY] = {
+            "from": str(last_rendered),
+            "to": str(requested),
+        }
+
+
+def render_workspace_transition_overlay(workspace_title: str) -> None:
+    st.markdown(
+        f"""
+        <style>
+            .workspace-switch-overlay {{
+                position: fixed;
+                inset: 0;
+                z-index: 999999;
+                display: flex;
+                align-items: flex-start;
+                justify-content: center;
+                padding-top: 18vh;
+                background: rgba(248, 250, 252, 0.94);
+                color: #172033;
+                pointer-events: none;
+                animation: workspace-overlay-fade 1.15s ease-in-out 0.35s forwards;
+            }}
+            .workspace-switch-card {{
+                min-width: 260px;
+                max-width: 460px;
+                padding: 18px 22px;
+                border: 1px solid #d6dce5;
+                border-radius: 8px;
+                background: #ffffff;
+                box-shadow: 0 16px 40px rgba(15, 23, 42, 0.12);
+                font-family: sans-serif;
+            }}
+            .workspace-switch-label {{
+                font-size: 12px;
+                color: #5d697b;
+                margin-bottom: 6px;
+            }}
+            .workspace-switch-title {{
+                font-size: 18px;
+                font-weight: 650;
+            }}
+            .workspace-switch-bar {{
+                height: 3px;
+                margin-top: 14px;
+                overflow: hidden;
+                background: #e7ebf0;
+                border-radius: 999px;
+            }}
+            .workspace-switch-bar::after {{
+                content: "";
+                display: block;
+                width: 45%;
+                height: 100%;
+                background: #2f6fed;
+                animation: workspace-bar-slide 0.9s ease-in-out infinite;
+            }}
+            @keyframes workspace-bar-slide {{
+                0% {{ transform: translateX(-110%); }}
+                100% {{ transform: translateX(240%); }}
+            }}
+            @keyframes workspace-overlay-fade {{
+                0%, 80% {{ opacity: 1; visibility: visible; }}
+                100% {{ opacity: 0; visibility: hidden; }}
+            }}
+        </style>
+        <div class="workspace-switch-overlay">
+            <div class="workspace-switch-card">
+                <div class="workspace-switch-label">Opening workspace</div>
+                <div class="workspace-switch-title">{workspace_title}</div>
+                <div class="workspace-switch-bar"></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def finish_workspace_render(workspace_mode: str) -> None:
+    st.session_state[WORKSPACE_LAST_RENDERED_KEY] = workspace_mode
+    transition = st.session_state.get(WORKSPACE_TRANSITION_KEY)
+    if isinstance(transition, dict) and str(transition.get("to")) == workspace_mode:
+        st.session_state.pop(WORKSPACE_TRANSITION_KEY, None)
 
 
 def session_positive_class() -> Any:
@@ -5045,8 +5136,10 @@ def main() -> None:
         if st.session_state.get("workspace_mode", workspace_default) in workspace_options
         else workspace_options.index(workspace_default),
         key="workspace_mode",
+        on_change=mark_workspace_transition,
     )
     show_data_setup = workspace_mode == "Data Setup" or st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is None
+    effective_workspace_mode = "Data Setup" if show_data_setup else str(workspace_mode)
     workspace_title = (
         "Data Setup"
         if show_data_setup
@@ -5056,6 +5149,9 @@ def main() -> None:
         }.get(workspace_mode, str(workspace_mode))
     )
     st.title(workspace_title)
+    transition = st.session_state.get(WORKSPACE_TRANSITION_KEY)
+    if isinstance(transition, dict) and str(transition.get("to")) == effective_workspace_mode:
+        render_workspace_transition_overlay(workspace_title)
 
     train_source = None
     if show_data_setup:
@@ -5436,6 +5532,7 @@ def main() -> None:
         st.session_state[APPLIED_DATA_CONTEXT_KEY] = applied_context
     if applied_context is None:
         st.info("Configure a data source and click Apply data setup to start the tree.")
+        finish_workspace_render(effective_workspace_mode)
         st.stop()
 
     if draft_context is not None and data_context_signature(draft_context) != data_context_signature(applied_context):
@@ -5487,6 +5584,7 @@ def main() -> None:
         with st.expander("Active split variables", expanded=False):
             st.dataframe(pd.DataFrame({"variable": features}), hide_index=True, width="stretch")
         st.info("Switch to Tree Builder when this active dataset is ready for split ranking or tree edits.")
+        finish_workspace_render(effective_workspace_mode)
         st.stop()
 
     if workspace_mode == "WOE Binning":
@@ -5511,7 +5609,10 @@ def main() -> None:
             parameters={"workspace": "WOE Binning"},
             auto_parameters={},
         )
+        finish_workspace_render(effective_workspace_mode)
         st.stop()
+
+    finish_workspace_render(effective_workspace_mode)
 
     checkpoint_data = checkpoint.get("data") if isinstance(checkpoint, dict) else {}
     checkpoint_data_key = checkpoint_data.get("data_key") if isinstance(checkpoint_data, dict) else None
@@ -6518,6 +6619,7 @@ def main() -> None:
         parameters=parameters,
         auto_parameters=auto_parameters,
     )
+    finish_workspace_render(effective_workspace_mode)
 
 
 if __name__ == "__main__":
