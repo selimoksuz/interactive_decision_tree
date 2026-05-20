@@ -1982,11 +1982,59 @@ def update_feature_selection_for_filtered(
     return ordered_feature_selection(features, selected)
 
 
-def rerun_current_fragment() -> None:
-    try:
-        st.rerun(scope="fragment")
-    except Exception:
-        st.rerun()
+def feature_filter_all_key(source_key: str, target: str, filtered_signature: str) -> str:
+    return f"feature_filter_all::{source_key}::{target}::{filtered_signature}"
+
+
+def feature_filter_item_key(source_key: str, target: str, filtered_signature: str, feature: str) -> str:
+    return f"feature_filter_item::{source_key}::{target}::{filtered_signature}::{feature}"
+
+
+def set_widget_state(key: str, value: Any) -> None:
+    if st.session_state.get(key) != value:
+        st.session_state[key] = value
+
+
+def apply_feature_filtered_selection(
+    state_key: str,
+    features: list[str],
+    filtered_features: list[str],
+    visible_features: list[str],
+    checkbox_key: str,
+    source_key: str,
+    target: str,
+    filtered_signature: str,
+) -> None:
+    selected_features = update_feature_selection_for_filtered(
+        features,
+        st.session_state.get(state_key, []),
+        filtered_features,
+        bool(st.session_state.get(checkbox_key)),
+    )
+    st.session_state[state_key] = selected_features
+    selected = set(selected_features)
+    for feature in visible_features:
+        st.session_state[feature_filter_item_key(source_key, target, filtered_signature, feature)] = feature in selected
+
+
+def apply_feature_item_selection(
+    state_key: str,
+    features: list[str],
+    feature: str,
+    checkbox_key: str,
+    select_all_key: str,
+    filtered_features: list[str],
+) -> None:
+    selected = set(normalize_feature_selection(features, st.session_state.get(state_key, [])))
+    if bool(st.session_state.get(checkbox_key)):
+        selected.add(str(feature))
+    else:
+        selected.discard(str(feature))
+    selected_features = ordered_feature_selection(features, selected)
+    st.session_state[state_key] = selected_features
+    if filtered_features:
+        selected_set = set(selected_features)
+        st.session_state[select_all_key] = all(feature in selected_set for feature in filtered_features)
 
 
 def apply_feature_manager_edits(
@@ -2030,9 +2078,6 @@ def render_feature_filter_popover(
         filtered_signature = hashlib.sha256(
             json.dumps(filtered_features, default=str).encode("utf-8")
         ).hexdigest()[:10]
-        selection_signature = hashlib.sha256(
-            json.dumps(selected_features, default=str).encode("utf-8")
-        ).hexdigest()[:10]
         st.caption(
             f"{len(selected_features):,} selected | {len(filtered_features):,} matching | {len(features):,} total"
         )
@@ -2041,48 +2086,41 @@ def render_feature_filter_popover(
         all_filtered_selected = bool(filtered_features) and all(
             feature in selected_set for feature in filtered_features
         )
-        select_all_value = st.checkbox(
+        visible_features = filtered_features[:FEATURE_FILTER_MAX_VISIBLE]
+        select_all_key = feature_filter_all_key(source_key, target, filtered_signature)
+        set_widget_state(select_all_key, all_filtered_selected)
+        st.checkbox(
             "(Select All)",
-            value=all_filtered_selected,
-            key=f"feature_filter_all::{source_key}::{target}::{filtered_signature}::{selection_signature}",
+            key=select_all_key,
             disabled=not filtered_features,
-        )
-        if filtered_features and select_all_value != all_filtered_selected:
-            st.session_state[state_key] = update_feature_selection_for_filtered(
+            on_change=apply_feature_filtered_selection,
+            args=(
+                state_key,
                 features,
-                selected_features,
                 filtered_features,
-                select_all_value,
-            )
-            rerun_current_fragment()
+                visible_features,
+                select_all_key,
+                source_key,
+                target,
+                filtered_signature,
+            ),
+        )
 
         list_container = st.container(height=260, border=True)
-        next_selected = set(selected_features)
-        changed = False
-        visible_features = filtered_features[:FEATURE_FILTER_MAX_VISIBLE]
         if len(filtered_features) > len(visible_features):
             list_container.caption(
                 f"Showing first {len(visible_features):,} matching variable(s). Use search to narrow the list."
             )
         for feature in visible_features:
             was_selected = feature in selected_set
-            is_selected = list_container.checkbox(
+            item_key = feature_filter_item_key(source_key, target, filtered_signature, feature)
+            set_widget_state(item_key, was_selected)
+            list_container.checkbox(
                 str(feature),
-                value=was_selected,
-                key=(
-                    f"feature_filter_item::{source_key}::{target}::"
-                    f"{filtered_signature}::{selection_signature}::{feature}"
-                ),
+                key=item_key,
+                on_change=apply_feature_item_selection,
+                args=(state_key, features, feature, item_key, select_all_key, filtered_features),
             )
-            if is_selected != was_selected:
-                changed = True
-                if is_selected:
-                    next_selected.add(feature)
-                else:
-                    next_selected.discard(feature)
-        if changed:
-            st.session_state[state_key] = ordered_feature_selection(features, next_selected)
-            rerun_current_fragment()
         if not filtered_features:
             st.caption("No matching variables.")
         st.caption("Changes apply to Data Table Search & Filter Component before Apply data setup.")

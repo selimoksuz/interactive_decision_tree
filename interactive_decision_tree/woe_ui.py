@@ -344,18 +344,38 @@ def update_variable_selection_for_filtered(
     return ordered_variable_selection(variables, selected)
 
 
+def woe_filter_all_key(scope_signature: str, filtered_signature: str) -> str:
+    return f"woe_variable_filter_all::{scope_signature}::{filtered_signature}"
+
+
+def woe_filter_item_key(scope_signature: str, filtered_signature: str, variable: str) -> str:
+    return f"woe_variable_filter_item::{scope_signature}::{filtered_signature}::{variable}"
+
+
+def set_widget_state(key: str, value: Any) -> None:
+    if st.session_state.get(key) != value:
+        st.session_state[key] = value
+
+
 def apply_woe_filtered_selection(
     selected_key: str,
     variables: list[str],
     filtered_variables: list[str],
+    visible_variables: list[str],
     checkbox_key: str,
+    scope_signature: str,
+    filtered_signature: str,
 ) -> None:
-    st.session_state[selected_key] = update_variable_selection_for_filtered(
+    selected_variables = update_variable_selection_for_filtered(
         variables,
         st.session_state.get(selected_key, []),
         filtered_variables,
         bool(st.session_state.get(checkbox_key)),
     )
+    st.session_state[selected_key] = selected_variables
+    selected = set(selected_variables)
+    for variable in visible_variables:
+        st.session_state[woe_filter_item_key(scope_signature, filtered_signature, variable)] = variable in selected
 
 
 def apply_woe_item_selection(
@@ -363,13 +383,19 @@ def apply_woe_item_selection(
     variables: list[str],
     variable: str,
     checkbox_key: str,
+    select_all_key: str,
+    filtered_variables: list[str],
 ) -> None:
     selected = set(normalize_variable_selection(variables, st.session_state.get(selected_key, [])))
     if bool(st.session_state.get(checkbox_key)):
         selected.add(str(variable))
     else:
         selected.discard(str(variable))
-    st.session_state[selected_key] = ordered_variable_selection(variables, selected)
+    selected_variables = ordered_variable_selection(variables, selected)
+    st.session_state[selected_key] = selected_variables
+    if filtered_variables:
+        selected_set = set(selected_variables)
+        st.session_state[select_all_key] = all(variable in selected_set for variable in filtered_variables)
 
 
 def woe_variable_selection_key(data_key: str, target: str) -> str:
@@ -405,9 +431,6 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
         filtered_signature = hashlib.sha256(
             json.dumps(filtered_variables, default=str).encode("utf-8")
         ).hexdigest()[:10]
-        selection_signature = hashlib.sha256(
-            json.dumps(selected_variables, default=str).encode("utf-8")
-        ).hexdigest()[:10]
         st.caption(
             f"{len(selected_variables):,} selected | {len(filtered_variables):,} matching | "
             f"{len(variables):,} active Data Setup variable(s)"
@@ -417,34 +440,39 @@ def render_woe_variable_selector(variables: list[str], *, data_key: str, target:
         all_filtered_selected = bool(filtered_variables) and all(
             variable in selected_set for variable in filtered_variables
         )
-        select_all_key = f"woe_variable_filter_all::{scope_signature}::{filtered_signature}::{selection_signature}"
+        visible_variables = filtered_variables[:WOE_VARIABLE_FILTER_MAX_VISIBLE]
+        select_all_key = woe_filter_all_key(scope_signature, filtered_signature)
+        set_widget_state(select_all_key, all_filtered_selected)
         st.checkbox(
             "(Select All)",
-            value=all_filtered_selected,
             key=select_all_key,
             disabled=not filtered_variables,
             on_change=apply_woe_filtered_selection,
-            args=(selected_key, variables, filtered_variables, select_all_key),
+            args=(
+                selected_key,
+                variables,
+                filtered_variables,
+                visible_variables,
+                select_all_key,
+                scope_signature,
+                filtered_signature,
+            ),
         )
 
         list_container = st.container(height=260, border=True)
-        visible_variables = filtered_variables[:WOE_VARIABLE_FILTER_MAX_VISIBLE]
         if len(filtered_variables) > len(visible_variables):
             list_container.caption(
                 f"Showing first {len(visible_variables):,} matching variable(s). Use search to narrow the list."
             )
         for variable in visible_variables:
             was_selected = variable in selected_set
-            item_key = (
-                f"woe_variable_filter_item::{scope_signature}::"
-                f"{filtered_signature}::{selection_signature}::{variable}"
-            )
+            item_key = woe_filter_item_key(scope_signature, filtered_signature, variable)
+            set_widget_state(item_key, was_selected)
             list_container.checkbox(
                 str(variable),
-                value=was_selected,
                 key=item_key,
                 on_change=apply_woe_item_selection,
-                args=(selected_key, variables, variable, item_key),
+                args=(selected_key, variables, variable, item_key, select_all_key, filtered_variables),
             )
         if not filtered_variables:
             st.caption("No matching variables.")
@@ -520,7 +548,10 @@ def variable_summary_row(
     current_spec = state["current_spec"]
     original_spec = state["original_spec"]
     current_train = evaluate_spec(df, target, current_spec, positive_class, "Train")["metrics"]
-    original_train = evaluate_spec(df, target, original_spec, positive_class, "Train")["metrics"]
+    if spec_signature(current_spec) == spec_signature(original_spec):
+        original_train = current_train
+    else:
+        original_train = evaluate_spec(df, target, original_spec, positive_class, "Train")["metrics"]
     row = {
         "variable": variable,
         "type": current_spec.get("feature_kind"),

@@ -747,15 +747,32 @@ def evaluate_original_current(
     current_spec: dict[str, Any],
     positive_class: Any,
 ) -> dict[str, Any]:
+    original_semantic = {key: value for key, value in original_spec.items() if key != "evaluation_profile"}
+    current_semantic = {key: value for key, value in current_spec.items() if key != "evaluation_profile"}
+    same_mapping = original_semantic == current_semantic
+    original_train = evaluate_spec(train_df, target, original_spec, positive_class, "Train")
+    current_train = copy.deepcopy(original_train) if same_mapping else evaluate_spec(
+        train_df,
+        target,
+        current_spec,
+        positive_class,
+        "Train",
+    )
     result = {
-        "original_train": evaluate_spec(train_df, target, original_spec, positive_class, "Train"),
-        "current_train": evaluate_spec(train_df, target, current_spec, positive_class, "Train"),
+        "original_train": original_train,
+        "current_train": current_train,
         "original_test": None,
         "current_test": None,
     }
     if test_df is not None:
         result["original_test"] = evaluate_spec(test_df, target, original_spec, positive_class, "Test")
-        result["current_test"] = evaluate_spec(test_df, target, current_spec, positive_class, "Test")
+        result["current_test"] = copy.deepcopy(result["original_test"]) if same_mapping else evaluate_spec(
+            test_df,
+            target,
+            current_spec,
+            positive_class,
+            "Test",
+        )
     return result
 
 
