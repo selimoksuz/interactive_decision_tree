@@ -42,6 +42,7 @@ AUTO_APPLY_DATA_SETUP_MAX_ROWS = 100_000
 DEFAULT_DATA_SAMPLE_ROWS = 100_000
 DEFAULT_STRATIFY_NUMERIC_BINS = 10
 FEATURE_PROFILE_SAMPLE_ROWS = 10_000
+FEATURE_FILTER_MAX_VISIBLE = 250
 CANDIDATE_RANDOM_STATE = 20260514
 CHECKPOINT_EMBED_MAX_ROWS = 50_000
 CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -1981,6 +1982,13 @@ def update_feature_selection_for_filtered(
     return ordered_feature_selection(features, selected)
 
 
+def rerun_current_fragment() -> None:
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+
 def apply_feature_manager_edits(
     features: list[str],
     current_selection: list[str],
@@ -2007,6 +2015,10 @@ def render_feature_filter_popover(
     target: str,
 ) -> list[str]:
     with container.popover("Dropdown Filter Panel"):
+        selected_features = normalize_feature_selection(
+            features,
+            st.session_state.get(state_key, selected_features),
+        )
         query = st.text_input(
             "Search variable",
             placeholder="Search",
@@ -2042,12 +2054,17 @@ def render_feature_filter_popover(
                 filtered_features,
                 select_all_value,
             )
-            st.rerun()
+            rerun_current_fragment()
 
         list_container = st.container(height=260, border=True)
         next_selected = set(selected_features)
         changed = False
-        for feature in filtered_features:
+        visible_features = filtered_features[:FEATURE_FILTER_MAX_VISIBLE]
+        if len(filtered_features) > len(visible_features):
+            list_container.caption(
+                f"Showing first {len(visible_features):,} matching variable(s). Use search to narrow the list."
+            )
+        for feature in visible_features:
             was_selected = feature in selected_set
             is_selected = list_container.checkbox(
                 str(feature),
@@ -2065,7 +2082,7 @@ def render_feature_filter_popover(
                     next_selected.discard(feature)
         if changed:
             st.session_state[state_key] = ordered_feature_selection(features, next_selected)
-            st.rerun()
+            rerun_current_fragment()
         if not filtered_features:
             st.caption("No matching variables.")
         st.caption("Changes apply to Data Table Search & Filter Component before Apply data setup.")
@@ -2175,6 +2192,155 @@ def feature_manager_frame_from_profile(
             "profile_rows",
         ],
     )
+
+
+def effective_feature_selection(
+    df: pd.DataFrame,
+    features: list[str],
+    table_selected_features: list[str],
+    include_mode: str,
+) -> list[str]:
+    if include_mode == "Include all":
+        return list(features)
+    if include_mode == "Numeric only":
+        return [feature for feature in features if feature_kind(df[feature]) == "numeric"]
+    if include_mode == "Categorical only":
+        return [feature for feature in features if feature_kind(df[feature]) == "categorical"]
+    return list(table_selected_features)
+
+
+@st.fragment
+def render_feature_manager_fragment(
+    df: pd.DataFrame,
+    features: list[str],
+    default_selected_features: list[str],
+    *,
+    data_key: str,
+    target: str,
+    saved_parameters: dict[str, Any],
+) -> tuple[list[str], int]:
+    feature_selection_key = f"feature_selection::{data_key}::{target}"
+    st.session_state[feature_selection_key] = normalize_feature_selection(
+        features,
+        st.session_state.get(feature_selection_key, default_selected_features),
+    )
+    current_feature_selection = st.session_state[feature_selection_key]
+
+    st.markdown("**Feature manager**")
+    st.caption(
+        f"Profile columns are estimated on the first {min(len(df), FEATURE_PROFILE_SAMPLE_ROWS):,} row(s). "
+        "Only included variables are available in Tree Builder and WOE Binning."
+    )
+    feature_include_mode_key = f"feature_include_mode::{data_key}::{target}"
+    legacy_include_mode = st.session_state.get("feature_include_mode", "Use table selection")
+    feature_include_mode = st.radio(
+        "Feature include mode",
+        ["Use table selection", "Include all", "Numeric only", "Categorical only"],
+        horizontal=True,
+        key=feature_include_mode_key,
+        index=["Use table selection", "Include all", "Numeric only", "Categorical only"].index(
+            legacy_include_mode
+            if legacy_include_mode in {"Use table selection", "Include all", "Numeric only", "Categorical only"}
+            else "Use table selection"
+        )
+        if feature_include_mode_key not in st.session_state
+        else None,
+    )
+    filtered_features = render_feature_filter_popover(
+        st,
+        features,
+        current_feature_selection,
+        state_key=feature_selection_key,
+        source_key=data_key,
+        target=target,
+    )
+    current_feature_selection = normalize_feature_selection(
+        features,
+        st.session_state.get(feature_selection_key, current_feature_selection),
+    )
+    filtered_signature = hashlib.sha256(
+        json.dumps(filtered_features, default=str).encode("utf-8")
+    ).hexdigest()[:10]
+    selection_signature = hashlib.sha256(
+        json.dumps(current_feature_selection, default=str).encode("utf-8")
+    ).hexdigest()[:10]
+    feature_profile = cached_feature_profile_frame(
+        df,
+        features,
+        data_key=data_key,
+        target=target,
+    )
+    st.markdown("**Data Table Search & Filter Component**")
+    st.caption("The table shows matching variables only; selections outside the filter are preserved.")
+    feature_manager = st.data_editor(
+        feature_manager_frame_from_profile(feature_profile, filtered_features, current_feature_selection),
+        hide_index=True,
+        width="stretch",
+        key=f"feature_manager::{data_key}::{target}::{filtered_signature}::{selection_signature}",
+        disabled=[
+            "variable",
+            "kind",
+            "dtype",
+            "missing_rate_sample",
+            "unique_count_sample",
+            "profile_rows",
+        ],
+        column_config={
+            "include": st.column_config.CheckboxColumn("include"),
+            "variable": st.column_config.TextColumn("variable"),
+            "kind": st.column_config.TextColumn("kind"),
+            "dtype": st.column_config.TextColumn("dtype"),
+            "missing_rate_sample": st.column_config.NumberColumn("missing_rate_sample", format="%.4f"),
+            "unique_count_sample": st.column_config.NumberColumn("unique_count_sample", format="%d"),
+            "profile_rows": st.column_config.NumberColumn("profile_rows", format="%d"),
+        },
+    )
+    table_selected_features = apply_feature_manager_edits(
+        features,
+        current_feature_selection,
+        feature_manager,
+    )
+    st.session_state[feature_selection_key] = table_selected_features
+    draft_features = effective_feature_selection(df, features, table_selected_features, str(feature_include_mode))
+    st.caption(f"Staged split variables: {len(draft_features):,} / {len(features):,}")
+
+    split_limit_key = f"split_variable_limit::{data_key}::{target}"
+    saved_limit = safe_int(
+        saved_parameters.get("split_variable_limit", min(50, max(1, len(draft_features)))),
+        default=min(50, max(1, len(draft_features))),
+        minimum=1,
+    )
+    split_limit_default = min(max(1, len(draft_features)), saved_limit) if draft_features else 1
+    if split_limit_key not in st.session_state:
+        st.session_state[split_limit_key] = split_limit_default
+    elif draft_features:
+        st.session_state[split_limit_key] = min(
+            max(1, safe_int(st.session_state.get(split_limit_key), default=split_limit_default, minimum=1)),
+            max(1, len(draft_features)),
+        )
+    draft_split_variable_limit_input = st.number_input(
+        "Split ranking variable limit",
+        value=int(st.session_state.get(split_limit_key, split_limit_default)),
+        min_value=1,
+        max_value=max(1, len(draft_features)),
+        step=1,
+        format="%d",
+        disabled=not draft_features,
+        key=split_limit_key,
+        help=(
+            "Only the first N active split variables are evaluated for split ranking and optimal tree. "
+            "Set this here, then apply data setup before computing rankings."
+        ),
+    )
+    draft_split_variable_limit = min(
+        len(draft_features),
+        safe_int(
+            draft_split_variable_limit_input,
+            default=min(50, max(1, len(draft_features))),
+            minimum=1,
+        ),
+    ) if draft_features else 0
+    return draft_features, draft_split_variable_limit
 
 
 def secret_sql_connections() -> dict[str, str]:
@@ -4778,121 +4944,14 @@ def main() -> None:
                 default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
             else:
                 default_selected_features = default_features
-            feature_selection_key = f"feature_selection::{draft_source_data_key}::{draft_target}"
-            st.session_state[feature_selection_key] = normalize_feature_selection(
-                default_features,
-                st.session_state.get(feature_selection_key, default_selected_features),
-            )
-            current_feature_selection = st.session_state[feature_selection_key]
-            data_setup_form.markdown("**Feature manager**")
-            data_setup_form.caption(
-                f"Profile columns are estimated on the first {min(len(draft_source_df), FEATURE_PROFILE_SAMPLE_ROWS):,} row(s). "
-                "Only included variables are available in Tree Builder and WOE Binning."
-            )
-            feature_include_mode = data_setup_form.radio(
-                "Feature include mode",
-                ["Use table selection", "Include all", "Numeric only", "Categorical only"],
-                horizontal=True,
-                key="feature_include_mode",
-            )
-            filtered_features = render_feature_filter_popover(
-                data_setup_form,
-                default_features,
-                current_feature_selection,
-                state_key=feature_selection_key,
-                source_key=draft_source_data_key,
-                target=draft_target,
-            )
-            filtered_signature = hashlib.sha256(
-                json.dumps(filtered_features, default=str).encode("utf-8")
-            ).hexdigest()[:10]
-            selection_signature = hashlib.sha256(
-                json.dumps(current_feature_selection, default=str).encode("utf-8")
-            ).hexdigest()[:10]
-            feature_profile = cached_feature_profile_frame(
+            draft_features, draft_split_variable_limit = render_feature_manager_fragment(
                 draft_source_df,
                 default_features,
+                default_selected_features,
                 data_key=draft_source_data_key,
                 target=draft_target,
+                saved_parameters=draft_saved_parameters,
             )
-            data_setup_form.markdown("**Data Table Search & Filter Component**")
-            data_setup_form.caption(
-                "The table shows matching variables only; selections outside the filter are preserved."
-            )
-            feature_manager = data_setup_form.data_editor(
-                feature_manager_frame_from_profile(feature_profile, filtered_features, current_feature_selection),
-                hide_index=True,
-                width="stretch",
-                key=(
-                    f"feature_manager::{draft_source_data_key}::{draft_target}::"
-                    f"{filtered_signature}::{selection_signature}"
-                ),
-                disabled=[
-                    "variable",
-                    "kind",
-                    "dtype",
-                    "missing_rate_sample",
-                    "unique_count_sample",
-                    "profile_rows",
-                ],
-                column_config={
-                    "include": st.column_config.CheckboxColumn("include"),
-                    "variable": st.column_config.TextColumn("variable"),
-                    "kind": st.column_config.TextColumn("kind"),
-                    "dtype": st.column_config.TextColumn("dtype"),
-                    "missing_rate_sample": st.column_config.NumberColumn("missing_rate_sample", format="%.4f"),
-                    "unique_count_sample": st.column_config.NumberColumn("unique_count_sample", format="%d"),
-                    "profile_rows": st.column_config.NumberColumn("profile_rows", format="%d"),
-                },
-            )
-            table_selected_features = apply_feature_manager_edits(
-                default_features,
-                current_feature_selection,
-                feature_manager,
-            )
-            st.session_state[feature_selection_key] = table_selected_features
-            if feature_include_mode == "Include all":
-                draft_features = default_features
-            elif feature_include_mode == "Numeric only":
-                draft_features = [
-                    feature for feature in default_features if feature_kind(draft_source_df[feature]) == "numeric"
-                ]
-            elif feature_include_mode == "Categorical only":
-                draft_features = [
-                    feature for feature in default_features if feature_kind(draft_source_df[feature]) == "categorical"
-                ]
-            else:
-                draft_features = table_selected_features
-            data_setup_form.caption(f"Staged split variables: {len(draft_features):,} / {len(default_features):,}")
-            draft_split_variable_limit_default = min(
-                max(1, len(draft_features)),
-                safe_int(
-                    draft_saved_parameters.get("split_variable_limit", min(50, max(1, len(draft_features)))),
-                    default=min(50, max(1, len(draft_features))),
-                    minimum=1,
-                ),
-            ) if draft_features else 1
-            draft_split_variable_limit_input = data_setup_form.number_input(
-                "Split ranking variable limit",
-                value=draft_split_variable_limit_default,
-                min_value=1,
-                max_value=max(1, len(draft_features)),
-                step=1,
-                format="%d",
-                disabled=not draft_features,
-                help=(
-                    "Only the first N active split variables are evaluated for split ranking and optimal tree. "
-                    "Set this here, then apply data setup before computing rankings."
-                ),
-            )
-            draft_split_variable_limit = min(
-                len(draft_features),
-                safe_int(
-                    draft_split_variable_limit_input,
-                    default=min(50, max(1, len(draft_features))),
-                    minimum=1,
-                ),
-            ) if draft_features else 0
 
             draft_test_df: pd.DataFrame | None = None
             draft_working_df = draft_source_df
