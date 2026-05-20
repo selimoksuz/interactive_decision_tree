@@ -227,6 +227,39 @@ def category_groups_text(spec: dict[str, Any]) -> str:
     return "\n".join(", ".join(group) for group in categorical_groups_from_spec(spec))
 
 
+def woe_initial_run_status_key(data_key: str, target: str) -> str:
+    return f"woe_initial_run_status::{data_key}::{target}"
+
+
+def render_woe_initial_run_status(status: Any) -> None:
+    if not isinstance(status, dict) or not status.get("state"):
+        return
+    state = str(status.get("state"))
+    message = str(status.get("message") or "")
+    if state == "done":
+        st.success(message or "Done")
+    elif state == "failed":
+        st.error(message or "Failed")
+    else:
+        st.info(message or "Running")
+
+
+def mark_woe_refresh_done(data_key: str, target: str) -> None:
+    status_key = woe_initial_run_status_key(data_key, target)
+    status = st.session_state.get(status_key)
+    if not isinstance(status, dict) or status.get("state") != "refreshing":
+        return
+    processed = int(status.get("processed") or 0)
+    skipped = int(status.get("skipped") or 0)
+    total = int(status.get("total") or processed + skipped)
+    st.session_state[status_key] = {
+        **status,
+        "state": "done",
+        "message": f"Done: {processed:,} binned, {skipped:,} skipped, {total:,} selected.",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def run_initial_binning(
     project: dict[str, Any],
     df: pd.DataFrame,
@@ -235,14 +268,18 @@ def run_initial_binning(
     positive_class: Any,
     config: WoeBuildConfig,
     replace_existing: bool,
-) -> None:
+) -> dict[str, int]:
     progress = st.progress(0.0, text="Running WOE binning")
     total = max(1, len(variables))
+    processed = 0
+    skipped = 0
     for index, variable in enumerate(variables, start=1):
         if not replace_existing and variable in project.get("variables", {}):
+            skipped += 1
             progress.progress(index / total, text=f"Skipped existing variable {variable}")
             continue
         spec = build_initial_spec(df, target, variable, positive_class, config)
+        processed += 1
         project.setdefault("variables", {})[variable] = {
             "name": variable,
             "status": "auto",
@@ -259,7 +296,11 @@ def run_initial_binning(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         progress.progress(index / total, text=f"Binned {variable}")
-    progress.empty()
+    progress.progress(
+        1.0,
+        text=f"WOE binning finished. Updating catalog and metrics for {len(variables):,} selected variable(s).",
+    )
+    return {"processed": processed, "skipped": skipped, "total": len(variables)}
 
 
 def normalize_variable_selection(variables: list[str], selected: Any) -> list[str]:
@@ -488,14 +529,59 @@ def render_woe_sidebar_controls(
         data_key=data_key,
         target=target,
     )
+    status_key = woe_initial_run_status_key(data_key, target)
     run_clicked = st.button(
         "Run initial WOE binning",
         width="stretch",
         type="primary",
         disabled=not selected_variables,
     )
+    status_slot = st.empty()
+    with status_slot.container():
+        render_woe_initial_run_status(st.session_state.get(status_key))
     if run_clicked:
-        run_initial_binning(project, df, target, selected_variables, positive_class, config, replace_existing)
+        started_at = datetime.now(timezone.utc).isoformat()
+        st.session_state[status_key] = {
+            "state": "running",
+            "message": f"Running initial WOE binning for {len(selected_variables):,} selected variable(s).",
+            "started_at": started_at,
+            "total": len(selected_variables),
+            "processed": 0,
+            "skipped": 0,
+        }
+        with status_slot.container():
+            render_woe_initial_run_status(st.session_state.get(status_key))
+        try:
+            result = run_initial_binning(
+                project,
+                df,
+                target,
+                selected_variables,
+                positive_class,
+                config,
+                replace_existing,
+            )
+        except Exception as exc:
+            st.session_state[status_key] = {
+                "state": "failed",
+                "message": f"Failed: {exc}",
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "total": len(selected_variables),
+            }
+            with status_slot.container():
+                render_woe_initial_run_status(st.session_state.get(status_key))
+            raise
+        st.session_state[status_key] = {
+            "state": "refreshing",
+            "message": "WOE binning finished. Updating catalog and metrics.",
+            "started_at": started_at,
+            "processed": result["processed"],
+            "skipped": result["skipped"],
+            "total": result["total"],
+        }
+        with status_slot.container():
+            render_woe_initial_run_status(st.session_state.get(status_key))
         st.rerun()
 
 
@@ -1022,6 +1108,11 @@ def render_woe_workspace(
         return
 
     project = get_project(data_key, target, positive_class)
+    summary = render_catalog(project, df, test_df, target, positive_class)
+    if not summary.empty:
+        render_project_exports(project, df, test_df, target, positive_class)
+        render_variable_editor(project, df, test_df, target, positive_class, summary)
+    mark_woe_refresh_done(data_key, target)
     with st.sidebar:
         render_woe_sidebar_controls(
             project,
@@ -1031,8 +1122,3 @@ def render_woe_workspace(
             positive_class,
             data_key,
         )
-
-    summary = render_catalog(project, df, test_df, target, positive_class)
-    if not summary.empty:
-        render_project_exports(project, df, test_df, target, positive_class)
-        render_variable_editor(project, df, test_df, target, positive_class, summary)

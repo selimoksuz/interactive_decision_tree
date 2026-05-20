@@ -41,6 +41,13 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     assert len(projects) == 1
     project = next(iter(projects.values()))
     assert set(project["variables"]) == {"age", "income"}
+    status_values = [
+        value
+        for key, value in at.session_state.filtered_state.items()
+        if str(key).startswith("woe_initial_run_status::")
+    ]
+    assert status_values
+    assert status_values[0]["state"] == "done"
     assert all(selectbox.label != "Variable status" for selectbox in at.selectbox)
     assert any(button.label == "Reset to auto mapping" for button in at.button)
     assert any(button.label == "Exclude from export" for button in at.button)
