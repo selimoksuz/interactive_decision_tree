@@ -245,12 +245,11 @@ def mark_woe_refresh_done(data_key: str, target: str) -> None:
     if not isinstance(status, dict) or status.get("state") != "refreshing":
         return
     processed = int(status.get("processed") or 0)
-    skipped = int(status.get("skipped") or 0)
-    total = int(status.get("total") or processed + skipped)
+    total = int(status.get("total") or processed)
     st.session_state[status_key] = {
         **status,
         "state": "done",
-        "message": f"Done: {processed:,} binned, {skipped:,} skipped, {total:,} selected.",
+        "message": f"Done: {processed:,} binned, {total:,} selected.",
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -262,17 +261,11 @@ def run_initial_binning(
     variables: list[str],
     positive_class: Any,
     config: WoeBuildConfig,
-    replace_existing: bool,
 ) -> dict[str, int]:
     progress = st.progress(0.0, text="Running WOE binning")
     total = max(1, len(variables))
     processed = 0
-    skipped = 0
     for index, variable in enumerate(variables, start=1):
-        if not replace_existing and variable in project.get("variables", {}):
-            skipped += 1
-            progress.progress(index / total, text=f"Skipped existing variable {variable}")
-            continue
         spec = build_initial_spec(df, target, variable, positive_class, config)
         processed += 1
         project.setdefault("variables", {})[variable] = {
@@ -295,7 +288,7 @@ def run_initial_binning(
         1.0,
         text=f"WOE binning finished. Updating catalog and metrics for {len(variables):,} selected variable(s).",
     )
-    return {"processed": processed, "skipped": skipped, "total": len(variables)}
+    return {"processed": processed, "total": len(variables)}
 
 
 def normalize_variable_selection(variables: list[str], selected: Any) -> list[str]:
@@ -501,7 +494,7 @@ def build_config_from_sidebar(
     *,
     data_key: str,
     target: str,
-) -> tuple[list[str], WoeBuildConfig, bool]:
+) -> tuple[list[str], WoeBuildConfig]:
     selected_variables = render_woe_variable_selector(features, data_key=data_key, target=target)
     max_bins = st.number_input("Max bins", min_value=2, max_value=20, value=6, step=1, key="woe_max_bins")
     min_bin_size = st.slider(
@@ -521,12 +514,6 @@ def build_config_from_sidebar(
     engine = st.selectbox("Binning engine", ["auto", "fallback", "optbinning"], index=0, key="woe_engine")
     missing_separate = st.checkbox("Missing as separate bin", value=True, key="woe_missing_separate")
     blank_as_missing = st.checkbox("Blank string as missing", value=True, key="woe_blank_as_missing")
-    replace_existing = st.checkbox(
-        "Overwrite existing mappings on rerun",
-        value=False,
-        key="woe_replace_existing",
-        help="When enabled, running initial WOE binning again replaces the stored auto and current mapping for selected variables.",
-    )
     config = WoeBuildConfig(
         max_bins=int(max_bins),
         min_bin_size=float(min_bin_size),
@@ -535,7 +522,7 @@ def build_config_from_sidebar(
         blank_as_missing=bool(blank_as_missing),
         engine=str(engine),
     )
-    return list(selected_variables), config, bool(replace_existing)
+    return list(selected_variables), config
 
 
 def metric_delta(current: Any, original: Any) -> float | None:
@@ -596,7 +583,7 @@ def render_woe_sidebar_controls(
     positive_class: Any,
     data_key: str,
 ) -> None:
-    selected_variables, config, replace_existing = build_config_from_sidebar(
+    selected_variables, config = build_config_from_sidebar(
         features,
         data_key=data_key,
         target=target,
@@ -619,7 +606,6 @@ def render_woe_sidebar_controls(
             "started_at": started_at,
             "total": len(selected_variables),
             "processed": 0,
-            "skipped": 0,
         }
         with status_slot.container():
             render_woe_initial_run_status(st.session_state.get(status_key))
@@ -631,7 +617,6 @@ def render_woe_sidebar_controls(
                 selected_variables,
                 positive_class,
                 config,
-                replace_existing,
             )
         except Exception as exc:
             st.session_state[status_key] = {
@@ -649,7 +634,6 @@ def render_woe_sidebar_controls(
             "message": "WOE binning finished. Updating catalog and metrics.",
             "started_at": started_at,
             "processed": result["processed"],
-            "skipped": result["skipped"],
             "total": result["total"],
         }
         with status_slot.container():
@@ -993,7 +977,7 @@ def render_special_missing_editor(
         st.rerun()
 
 
-def render_manual_structure_editor(state: dict[str, Any]) -> None:
+def render_current_bin_structure_controls(state: dict[str, Any]) -> None:
     current_spec = state["current_spec"]
     if current_spec.get("feature_kind") == "numeric":
         st.markdown("**Numeric cutpoints**")
@@ -1072,8 +1056,8 @@ def render_variable_editor(
     metric_cols[3].metric("Manual WOE bins", str(current_train["metrics"].get("manual_woe_bins")))
     metric_cols[4].metric("Monotonic", str(current_train["metrics"].get("monotonic_direction")))
 
-    bins_tab, structure_tab, special_tab, compare_tab = st.tabs(
-        ["Current bins", "Bin structure", "Special / missing", "Original comparison"]
+    bins_tab, special_tab, compare_tab = st.tabs(
+        ["Current bins", "Special / missing", "Original comparison"]
     )
 
     with bins_tab:
@@ -1143,9 +1127,7 @@ def render_variable_editor(
             else:
                 mark_mapping_edited(state, "apply_table_edits")
                 st.rerun()
-
-    with structure_tab:
-        render_manual_structure_editor(state)
+        render_current_bin_structure_controls(state)
 
     with special_tab:
         render_special_missing_editor(state, df, target, positive_class)

@@ -3241,7 +3241,6 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "woe_engine",
         "woe_missing_separate",
         "woe_blank_as_missing",
-        "woe_replace_existing",
         "_interactive_tree_woe_active_variable",
     }
     return key.startswith(prefixes) or key in exact_keys
