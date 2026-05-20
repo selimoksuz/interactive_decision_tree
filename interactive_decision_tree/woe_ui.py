@@ -14,7 +14,6 @@ from .woe_binning import (
     apply_bin_table_edits,
     apply_categorical_groups,
     apply_numeric_cutpoints,
-    bin_display_label,
     build_initial_spec,
     categorical_groups_from_spec,
     copy_spec,
@@ -23,7 +22,6 @@ from .woe_binning import (
     evaluate_spec,
     merge_selected_bins,
     missing_mask,
-    normal_bins,
     parse_category_groups,
     parse_cutpoints,
     parse_special_values,
@@ -158,6 +156,7 @@ def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
 
 def woe_column_config() -> dict[str, Any]:
     return {
+        "merge": st.column_config.CheckboxColumn("merge"),
         "bin_order": st.column_config.NumberColumn("order", format="%d"),
         "count": st.column_config.NumberColumn("count", format="%d"),
         "event_count": st.column_config.NumberColumn("event", format="%d"),
@@ -177,7 +176,7 @@ def woe_column_config() -> dict[str, Any]:
     }
 
 
-def editable_bin_table(table: pd.DataFrame) -> pd.DataFrame:
+def editable_bin_table(table: pd.DataFrame, *, include_merge: bool = False) -> pd.DataFrame:
     columns = [
         "bin_id",
         "bin_order",
@@ -201,7 +200,18 @@ def editable_bin_table(table: pd.DataFrame) -> pd.DataFrame:
         "protected",
         "note",
     ]
-    return table[[column for column in columns if column in table.columns]].copy()
+    out = table[[column for column in columns if column in table.columns]].copy()
+    if include_merge:
+        out.insert(0, "merge", False)
+    return out
+
+
+def selected_normal_merge_bin_ids(edited_table: pd.DataFrame) -> list[str]:
+    if edited_table.empty or not {"merge", "bin_id", "kind"}.issubset(edited_table.columns):
+        return []
+    selected = edited_table["merge"].fillna(False).astype(bool)
+    normal = edited_table["kind"].astype(str) == "normal"
+    return edited_table.loc[selected & normal, "bin_id"].astype(str).tolist()
 
 
 def cutpoints_text(spec: dict[str, Any]) -> str:
@@ -985,36 +995,6 @@ def render_special_missing_editor(
 
 def render_manual_structure_editor(state: dict[str, Any]) -> None:
     current_spec = state["current_spec"]
-    normal = normal_bins(current_spec)
-    merge_options = [str(bin_spec.get("bin_id")) for bin_spec in normal]
-    if len(merge_options) >= 2:
-        selected_bins = st.multiselect(
-            "Bins to merge",
-            options=merge_options,
-            format_func=lambda bin_id: next(
-                bin_display_label(current_spec, bin_spec)
-                for bin_spec in normal
-                if str(bin_spec.get("bin_id")) == str(bin_id)
-            ),
-            key=f"woe_merge_bins::{state['name']}",
-            help=(
-                "Numeric variables require adjacent bins. Categorical variables can merge any selected groups."
-            ),
-        )
-        if st.button(
-            "Merge selected bins",
-            width="stretch",
-            key=f"woe_merge_selected::{state['name']}",
-            disabled=len(selected_bins) < 2,
-        ):
-            try:
-                state["current_spec"] = merge_selected_bins(current_spec, selected_bins)
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                mark_mapping_edited(state, "merge_selected_bins", {"bin_ids": selected_bins})
-                st.rerun()
-
     if current_spec.get("feature_kind") == "numeric":
         st.markdown("**Numeric cutpoints**")
         cutpoint_key = f"woe_cutpoints::{state['name']}"
@@ -1125,12 +1105,35 @@ def render_variable_editor(
         if state["current_spec"].get("feature_kind") != "numeric":
             disabled_columns.extend(["lower", "upper"])
         edited = st.data_editor(
-            editable_bin_table(current_train["table"]),
+            editable_bin_table(current_train["table"], include_merge=True),
             hide_index=True,
             width="stretch",
             key=editor_key,
             disabled=disabled_columns,
             column_config=woe_column_config(),
+        )
+        selected_merge_bins = selected_normal_merge_bin_ids(edited)
+        merge_help = (
+            "Numeric variables require adjacent selected bins. "
+            "Categorical variables can merge any selected normal bins."
+        )
+        merge_cols = st.columns([1, 2])
+        if merge_cols[0].button(
+            "Merge selected bins",
+            width="stretch",
+            key=f"woe_merge_selected_current::{variable}",
+            disabled=len(selected_merge_bins) < 2,
+            help=merge_help,
+        ):
+            try:
+                state["current_spec"] = merge_selected_bins(state["current_spec"], selected_merge_bins)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                mark_mapping_edited(state, "merge_selected_bins", {"bin_ids": selected_merge_bins})
+                st.rerun()
+        merge_cols[1].caption(
+            f"{len(selected_merge_bins):,} normal bin(s) selected for merge. {merge_help}"
         )
         if st.button("Apply table edits", width="stretch", key=f"woe_apply_table_edits::{variable}"):
             try:
