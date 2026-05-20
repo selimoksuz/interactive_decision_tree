@@ -3172,6 +3172,7 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
     prefixes = (
         "category_groups::",
         "node_features_v2::",
+        "woe_selected_variables::",
         "manual_thresholds_",
         "manual_missing_policy_",
         "group_source_",

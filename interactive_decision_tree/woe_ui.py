@@ -318,27 +318,39 @@ def update_variable_selection_for_filtered(
     return ordered_variable_selection(variables, selected)
 
 
-def render_woe_variable_selector(variables: list[str]) -> list[str]:
+def woe_variable_selection_key(data_key: str, target: str) -> str:
+    return f"woe_selected_variables::{data_key}::{target}"
+
+
+def rerun_current_view() -> None:
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+
+def render_woe_variable_selector(variables: list[str], *, data_key: str, target: str) -> list[str]:
     default_variables = variables[: min(20, len(variables))]
-    selected_key = "woe_selected_variables"
-    remembered_variables = normalize_variable_selection(
-        variables,
-        st.session_state.get(selected_key, default_variables),
-    )
-    if not remembered_variables:
-        remembered_variables = default_variables
-    st.session_state[selected_key] = remembered_variables
+    selected_key = woe_variable_selection_key(data_key, target)
+    if selected_key not in st.session_state:
+        st.session_state[selected_key] = default_variables
+    else:
+        st.session_state[selected_key] = normalize_variable_selection(
+            variables,
+            st.session_state.get(selected_key),
+        )
 
     st.sidebar.markdown("**WOE variables**")
     selected_variables = normalize_variable_selection(
         variables,
-        st.session_state.get(selected_key, remembered_variables),
+        st.session_state.get(selected_key, default_variables),
     )
+    scope_signature = hashlib.sha256(f"{data_key}::{target}".encode("utf-8")).hexdigest()[:10]
     with st.sidebar.popover("Dropdown Filter Panel"):
         query = st.text_input(
             "Search variable",
             placeholder="Search",
-            key="woe_variable_search",
+            key=f"woe_variable_search::{scope_signature}",
             label_visibility="collapsed",
             help="Case-insensitive contains search. Use comma/newline for multiple terms; * or % works as wildcard.",
         )
@@ -350,7 +362,8 @@ def render_woe_variable_selector(variables: list[str]) -> list[str]:
             json.dumps(selected_variables, default=str).encode("utf-8")
         ).hexdigest()[:10]
         st.caption(
-            f"{len(selected_variables):,} selected | {len(filtered_variables):,} matching | {len(variables):,} total"
+            f"{len(selected_variables):,} selected | {len(filtered_variables):,} matching | "
+            f"{len(variables):,} active Data Setup variable(s)"
         )
 
         selected_set = set(selected_variables)
@@ -360,7 +373,7 @@ def render_woe_variable_selector(variables: list[str]) -> list[str]:
         select_all_value = st.checkbox(
             "(Select All)",
             value=all_filtered_selected,
-            key=f"woe_variable_filter_all::{filtered_signature}::{selection_signature}",
+            key=f"woe_variable_filter_all::{scope_signature}::{filtered_signature}::{selection_signature}",
             disabled=not filtered_variables,
         )
         if filtered_variables and select_all_value != all_filtered_selected:
@@ -372,6 +385,7 @@ def render_woe_variable_selector(variables: list[str]) -> list[str]:
             )
             st.session_state[selected_key] = selected_variables
             selected_set = set(selected_variables)
+            rerun_current_view()
 
         list_container = st.container(height=260, border=True)
         visible_variables = filtered_variables[:WOE_VARIABLE_FILTER_MAX_VISIBLE]
@@ -386,7 +400,10 @@ def render_woe_variable_selector(variables: list[str]) -> list[str]:
             is_selected = list_container.checkbox(
                 str(variable),
                 value=was_selected,
-                key=f"woe_variable_filter_item::{filtered_signature}::{selection_signature}::{variable}",
+                key=(
+                    f"woe_variable_filter_item::{scope_signature}::"
+                    f"{filtered_signature}::{selection_signature}::{variable}"
+                ),
             )
             if is_selected != was_selected:
                 changed = True
@@ -397,17 +414,26 @@ def render_woe_variable_selector(variables: list[str]) -> list[str]:
         if changed:
             selected_variables = ordered_variable_selection(variables, next_selected)
             st.session_state[selected_key] = selected_variables
+            rerun_current_view()
         if not filtered_variables:
             st.caption("No matching variables.")
         st.caption("Selections are used when you press Run initial WOE binning.")
 
-    selected_variables = normalize_variable_selection(variables, st.session_state.get(selected_key, selected_variables))
-    st.sidebar.caption(f"{len(selected_variables):,} selected | {len(variables):,} available")
+    selected_variables = normalize_variable_selection(
+        variables,
+        st.session_state.get(selected_key, selected_variables),
+    )
+    st.sidebar.caption(f"{len(selected_variables):,} selected | {len(variables):,} active Data Setup variable(s)")
     return selected_variables
 
 
-def build_config_from_sidebar(features: list[str]) -> tuple[list[str], WoeBuildConfig, bool]:
-    selected_variables = render_woe_variable_selector(features)
+def build_config_from_sidebar(
+    features: list[str],
+    *,
+    data_key: str,
+    target: str,
+) -> tuple[list[str], WoeBuildConfig, bool]:
+    selected_variables = render_woe_variable_selector(features, data_key=data_key, target=target)
     max_bins = st.sidebar.number_input("Max bins", min_value=2, max_value=20, value=6, step=1, key="woe_max_bins")
     min_bin_size = st.sidebar.slider(
         "Min bin size",
@@ -966,7 +992,11 @@ def render_woe_workspace(
         return
 
     project = get_project(data_key, target, positive_class)
-    selected_variables, config, replace_existing = build_config_from_sidebar(features)
+    selected_variables, config, replace_existing = build_config_from_sidebar(
+        features,
+        data_key=data_key,
+        target=target,
+    )
     run_clicked = st.sidebar.button(
         "Run initial WOE binning",
         width="stretch",
