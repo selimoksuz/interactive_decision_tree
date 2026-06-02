@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "Interactive Tree: Start Streamlit",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}\\scripts\\start_app.py",
       "args": [
@@ -21,7 +21,7 @@
     },
     {
       "name": "Interactive Tree: Debug Streamlit App",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "module": "streamlit",
       "args": [
