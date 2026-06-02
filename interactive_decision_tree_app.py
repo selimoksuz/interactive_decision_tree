@@ -27,6 +27,11 @@ from interactive_decision_tree.session_store import (
     session_path,
 )
 from interactive_decision_tree.sql_source import DEFAULT_SQL_LIMIT, read_sql_dataframe
+from interactive_decision_tree.model_ui import (
+    render_model_setup_workspace,
+    render_shap_workspace,
+    render_what_if_workspace,
+)
 from interactive_decision_tree.woe_ui import (
     WOE_CHECKPOINT_DIRTY_KEY,
     WOE_DETAIL_OPEN_PREFIX,
@@ -3444,6 +3449,11 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "woe_engine",
         "woe_missing_separate",
         "woe_blank_as_missing",
+        "shap_background_rows",
+        "shap_explain_rows",
+        "shap_kernel_samples",
+        "shap_sample_seed",
+        "what_if_row_position",
         "_interactive_tree_woe_active_variable",
     }
     return key.startswith(prefixes) or key in exact_keys
@@ -5239,12 +5249,20 @@ def main() -> None:
     if (
         st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is None
         and isinstance(checkpoint_ui_state, dict)
-        and checkpoint_ui_state.get("workspace_mode") in {"Tree Builder", "WOE Binning"}
+        and checkpoint_ui_state.get("workspace_mode")
+        in {"Tree Builder", "WOE Binning", "Model Setup", "SHAP Analysis", "What-if Simulator"}
     ):
         restored_context = restore_applied_context_from_checkpoint(checkpoint, query_session)
         if restored_context is not None:
             st.session_state[APPLIED_DATA_CONTEXT_KEY] = restored_context
-    workspace_options = ["Data Setup", "Tree Builder", "WOE Binning"]
+    workspace_options = [
+        "Data Setup",
+        "Tree Builder",
+        "WOE Binning",
+        "Model Setup",
+        "SHAP Analysis",
+        "What-if Simulator",
+    ]
     workspace_default = "Tree Builder" if st.session_state.get(APPLIED_DATA_CONTEXT_KEY) is not None else "Data Setup"
     workspace_mode = st.sidebar.radio(
         "Workspace",
@@ -5263,6 +5281,9 @@ def main() -> None:
         else {
             "Tree Builder": "Interactive entropy decision tree",
             "WOE Binning": "WOE Binning",
+            "Model Setup": "Model Setup",
+            "SHAP Analysis": "SHAP Analysis",
+            "What-if Simulator": "What-if Simulator",
         }.get(workspace_mode, str(workspace_mode))
     )
     st.title(workspace_title)
@@ -5701,6 +5722,36 @@ def main() -> None:
         with st.expander("Active split variables", expanded=False):
             st.dataframe(pd.DataFrame({"variable": features}), hide_index=True, width="stretch")
         st.info("Switch to Tree Builder when this active dataset is ready for split ranking or tree edits.")
+        finish_workspace_render(effective_workspace_mode)
+        st.stop()
+
+    if workspace_mode == "Model Setup":
+        render_model_setup_workspace(
+            df=df,
+            target=target,
+            features=features,
+            positive_class=st.session_state.get(POSITIVE_CLASS_SESSION_KEY),
+            data_key=data_key,
+        )
+        finish_workspace_render(effective_workspace_mode)
+        st.stop()
+
+    if workspace_mode == "SHAP Analysis":
+        render_shap_workspace(
+            df=df,
+            features=features,
+            positive_class=st.session_state.get(POSITIVE_CLASS_SESSION_KEY),
+            data_key=data_key,
+        )
+        finish_workspace_render(effective_workspace_mode)
+        st.stop()
+
+    if workspace_mode == "What-if Simulator":
+        render_what_if_workspace(
+            df=df,
+            features=features,
+            data_key=data_key,
+        )
         finish_workspace_render(effective_workspace_mode)
         st.stop()
 
