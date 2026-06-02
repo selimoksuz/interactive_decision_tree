@@ -227,6 +227,21 @@ def _walk_tree(root: TreeNode, row_values: dict[str, Any]) -> tuple[TreeNode, li
     return node, trace
 
 
+def _walk_tree_with_default(
+    root: TreeNode,
+    row_values: dict[str, Any],
+) -> tuple[TreeNode, list[TraceStep], str | None]:
+    node = root
+    trace: list[TraceStep] = []
+    while not _is_leaf_node(node):
+        branch = _matching_branch(node, row_values)
+        if branch is None:
+            return node, trace, "no_matching_branch"
+        trace.append(_trace_step(node, branch))
+        node = _branch_child(branch)
+    return node, trace, None
+
+
 def _target_summary(node: TreeNode) -> dict[str, Any]:
     target_summary = node.get("target_summary", {})
     return target_summary if isinstance(target_summary, dict) else {}
@@ -255,12 +270,13 @@ def _leaf_score_result(
     payload: dict[str, Any],
     node: TreeNode,
     trace: list[TraceStep],
+    fallback_reason: str | None = None,
 ) -> dict[str, Any]:
     target_summary = _target_summary(node)
     prediction = _leaf_prediction(node, target_summary)
     probabilities = _class_probabilities(target_summary)
     positive_class = _positive_class(payload, target_summary)
-    return {
+    result = {
         "prediction": prediction,
         "prediction_probability": _prediction_probability(prediction, target_summary, probabilities),
         "class_probabilities": probabilities,
@@ -272,6 +288,9 @@ def _leaf_score_result(
         "target_summary": target_summary,
         "trace": trace,
     }
+    if fallback_reason:
+        result["fallback_reason"] = fallback_reason
+    return result
 
 
 def _score_with_root(
@@ -279,8 +298,9 @@ def _score_with_root(
     root: TreeNode,
     row: RowInput,
 ) -> dict[str, Any]:
-    leaf, trace = _walk_tree(root, _row_to_mapping(row))
-    return _leaf_score_result(payload, leaf, trace)
+    row_values = _row_to_mapping(row)
+    leaf, trace, fallback_reason = _walk_tree_with_default(root, row_values)
+    return _leaf_score_result(payload, leaf, trace, fallback_reason=fallback_reason)
 
 
 def compile_tree_scorer(payload: dict[str, Any]) -> Callable[[RowInput], dict[str, Any]]:

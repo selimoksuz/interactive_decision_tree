@@ -217,3 +217,77 @@ def test_score_tree_payload_rebuilds_leaf_path_from_trace_when_exported_path_is_
         == "root -> segment {C} -> channel == mobile -> income <= 46677.3"
     )
     assert result["exported_leaf_path"] == "root -> segment {C} -> income <= 46677.3"
+
+
+def test_score_tree_payload_uses_node_summary_when_category_has_no_branch():
+    payload = {
+        "format": "interactive_entropy_decision_tree",
+        "target": "risk_flag",
+        "positive_class": "high_risk",
+        "tree": {
+            "node_id": 0,
+            "is_leaf": False,
+            "path": "root",
+            "target_summary": {
+                "prediction": "low_risk",
+                "positive_class": "high_risk",
+                "default_rate": 0.4,
+                "class_distribution": [
+                    {"value": "high_risk", "count": 40},
+                    {"value": "low_risk", "count": 60},
+                ],
+            },
+            "split": {"label": "collection_status groups"},
+            "branches": [
+                {
+                    "label": "{monitor}",
+                    "condition": {"feature": "collection_status", "operator": "in", "values": ["monitor"]},
+                    "child": {
+                        "node_id": 2,
+                        "is_leaf": False,
+                        "path": "root -> collection_status {monitor}",
+                        "target_summary": {
+                            "prediction": "high_risk",
+                            "positive_class": "high_risk",
+                            "default_rate": 0.65,
+                            "class_distribution": [
+                                {"value": "high_risk", "count": 65},
+                                {"value": "low_risk", "count": 35},
+                            ],
+                        },
+                        "split": {"label": "segment target-profile groups"},
+                        "branches": [
+                            {
+                                "label": "{B}",
+                                "condition": {"feature": "segment", "operator": "in", "values": ["B"]},
+                                "child": {
+                                    "node_id": 5,
+                                    "is_leaf": True,
+                                    "path": "root -> collection_status {monitor} -> segment {B}",
+                                    "leaf": {"prediction": "low_risk"},
+                                    "target_summary": {
+                                        "prediction": "low_risk",
+                                        "positive_class": "high_risk",
+                                        "default_rate": 0.3,
+                                        "class_distribution": [
+                                            {"value": "high_risk", "count": 30},
+                                            {"value": "low_risk", "count": 70},
+                                        ],
+                                    },
+                                    "branches": [],
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    }
+
+    result = score_tree_payload(payload, {"collection_status": "monitor", "segment": "D"})
+
+    assert result["fallback_reason"] == "no_matching_branch"
+    assert result["leaf_node_id"] == 2
+    assert result["prediction"] == "high_risk"
+    assert result["positive_class_probability"] == 0.65
+    assert result["leaf_path"] == "root -> collection_status {monitor}"

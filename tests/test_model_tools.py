@@ -106,6 +106,70 @@ def tree_payload() -> dict:
     }
 
 
+def tree_payload_with_unseen_category_default() -> dict:
+    return {
+        "format": "interactive_entropy_decision_tree",
+        "target": "risk_flag",
+        "positive_class": "high_risk",
+        "features": ["collection_status", "segment"],
+        "tree": {
+            "node_id": 0,
+            "is_leaf": False,
+            "target_summary": {
+                "prediction": "low_risk",
+                "positive_class": "high_risk",
+                "default_rate": 0.4,
+                "class_distribution": [
+                    {"value": "high_risk", "count": 40},
+                    {"value": "low_risk", "count": 60},
+                ],
+            },
+            "split": {"label": "collection_status groups"},
+            "branches": [
+                {
+                    "label": "{monitor}",
+                    "condition": {"feature": "collection_status", "operator": "in", "values": ["monitor"]},
+                    "child": {
+                        "node_id": 2,
+                        "is_leaf": False,
+                        "target_summary": {
+                            "prediction": "high_risk",
+                            "positive_class": "high_risk",
+                            "default_rate": 0.65,
+                            "class_distribution": [
+                                {"value": "high_risk", "count": 65},
+                                {"value": "low_risk", "count": 35},
+                            ],
+                        },
+                        "split": {"label": "segment groups"},
+                        "branches": [
+                            {
+                                "label": "{B}",
+                                "condition": {"feature": "segment", "operator": "in", "values": ["B"]},
+                                "child": {
+                                    "node_id": 5,
+                                    "is_leaf": True,
+                                    "leaf": {"prediction": "low_risk"},
+                                    "target_summary": {
+                                        "prediction": "low_risk",
+                                        "positive_class": "high_risk",
+                                        "default_rate": 0.3,
+                                        "class_distribution": [
+                                            {"value": "high_risk", "count": 30},
+                                            {"value": "low_risk", "count": 70},
+                                        ],
+                                    },
+                                    "branches": [],
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    }
+
+
 def test_loaded_raw_pipeline_predicts_with_feature_alignment():
     model, df = raw_pipeline()
     loaded = load_model_from_bytes(pickle.dumps(model))
@@ -140,6 +204,16 @@ def test_interactive_tree_pickle_loads_as_raw_feature_model_adapter():
     assert model.predict(df).tolist() == ["high_risk", "low_risk"]
 
 
+def test_interactive_tree_pickle_scores_unseen_category_with_node_default():
+    model = load_model_from_bytes(pickle.dumps(tree_payload_with_unseen_category_default()))
+    df = pd.DataFrame([{"collection_status": "monitor", "segment": "D"}])
+
+    prediction = predict_model_scores(model, df, positive_class="high_risk")
+
+    assert prediction.scores.tolist() == [0.65]
+    assert model.predict(df).tolist() == ["high_risk"]
+
+
 def test_kernel_shap_contributions_are_real_shap_values():
     pytest.importorskip("shap")
     model, df = raw_pipeline()
@@ -159,3 +233,26 @@ def test_kernel_shap_contributions_are_real_shap_values():
     assert shap_explanation(result).values.shape == (2, 2)
     assert shap_global_importance(result)["feature"].tolist()
     assert shap_local_contributions(result, 0)["feature"].tolist()
+
+
+def test_kernel_shap_handles_tree_pickle_unseen_category_default():
+    pytest.importorskip("shap")
+    model = load_model_from_bytes(pickle.dumps(tree_payload_with_unseen_category_default()))
+    df = pd.DataFrame(
+        [
+            {"collection_status": "monitor", "segment": "B"},
+            {"collection_status": "monitor", "segment": "B"},
+            {"collection_status": "monitor", "segment": "D"},
+        ]
+    )
+
+    result = kernel_shap_contributions(
+        model,
+        df.head(2),
+        df.tail(1),
+        model_feature_names(model),
+        positive_class="high_risk",
+        nsamples=10,
+    )
+
+    assert result["values"].shape == (1, 2)
