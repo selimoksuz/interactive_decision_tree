@@ -69,6 +69,15 @@ VALIDATION_CANDIDATE_LIMIT = 100
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
 TARGET_META_CACHE_KEY = "_interactive_tree_target_meta_cache"
+IDENTIFIER_COLUMN_NAMES = {
+    "id",
+    "customer_id",
+    "cust_id",
+    "client_id",
+    "account_id",
+    "application_id",
+    "musteri_id",
+}
 
 
 @dataclass(frozen=True)
@@ -100,6 +109,7 @@ class LoadedDataSource:
 
 def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
     rng = np.random.default_rng(7)
+    customer_id = [f"CUST{i:06d}" for i in range(1, n + 1)]
     age = rng.integers(21, 72, size=n).astype(float)
     income = rng.normal(52_000, 18_000, size=n).clip(12_000, 140_000)
     tenure = rng.integers(0, 120, size=n).astype(float)
@@ -188,6 +198,7 @@ def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
 
     return pd.DataFrame(
         {
+            "customer_id": customer_id,
             "age": age,
             "income": income.round(2),
             "tenure_months": tenure,
@@ -198,6 +209,15 @@ def make_demo_data(n: int = DEFAULT_DEMO_ROWS) -> pd.DataFrame:
             "risk_flag": target,
         }
     )
+
+
+def is_identifier_column(column: Any) -> bool:
+    lowered = str(column).strip().casefold()
+    return lowered in IDENTIFIER_COLUMN_NAMES or lowered.endswith("_id")
+
+
+def default_model_feature_selection(features: list[str]) -> list[str]:
+    return [str(feature) for feature in features if not is_identifier_column(feature)]
 
 
 def entropy(y: pd.Series) -> float:
@@ -5411,7 +5431,7 @@ def main() -> None:
             elif isinstance(source_features, list):
                 default_selected_features = [str(feature) for feature in source_features if str(feature) in default_features]
             else:
-                default_selected_features = default_features
+                default_selected_features = default_model_feature_selection(default_features)
             draft_features, draft_split_variable_limit = render_feature_manager_fragment(
                 draft_source_df,
                 default_features,

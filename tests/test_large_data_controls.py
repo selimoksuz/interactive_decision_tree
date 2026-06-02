@@ -15,6 +15,7 @@ from interactive_decision_tree_app import (
     candidate_splits,
     candidate_validation_stats,
     checkpoint_ui_state,
+    default_model_feature_selection,
     demo_data_key,
     evaluation_model_metrics,
     filter_feature_options,
@@ -43,11 +44,15 @@ def test_demo_data_default_is_large_enough_for_train_test_validation():
     demo = make_demo_data()
     assert len(demo) == DEFAULT_DEMO_ROWS
     assert DEFAULT_DEMO_ROWS >= 5_000
+    assert demo["customer_id"].iloc[0] == "CUST000001"
+    assert demo["customer_id"].is_unique
     assert demo[["age", "income", "tenure_months", "segment"]].isna().any().any()
     assert (demo["income"] == -999).any()
     assert (demo["region"] == "UNKNOWN").any()
     assert (demo["product"] == "NO_INFO").any()
-    assert demo_data_key(demo).startswith("demo:5000:8:")
+    default_features = [column for column in demo.columns if column != "risk_flag"]
+    assert "customer_id" not in default_model_feature_selection(default_features)
+    assert demo_data_key(demo).startswith("demo:5000:9:")
 
 
 def test_split_ranking_scope_caption_distinguishes_leaf_from_active_train():
