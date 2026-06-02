@@ -1806,6 +1806,12 @@ def build_optimal_tree(
         init_tree(df)
     else:
         st.session_state.auto_tree_message = ""
+    st.session_state.auto_tree_diagnostics = {
+        "candidate_count": 0,
+        "evaluated_features": list(features),
+        "best_candidate": None,
+        "min_information_gain": float(min_information_gain),
+    }
     split_count = 0
     action_node_ids: list[int] = []
     validation_enabled = test_df is not None and infer_target_kind(df[target]) == "binary"
@@ -1847,6 +1853,17 @@ def build_optimal_tree(
                 max_category_groups=max_category_groups,
                 parallel_workers=parallel_workers,
             )
+            st.session_state.auto_tree_diagnostics["candidate_count"] += len(candidates)
+            if candidates:
+                best_seen = candidates[0]
+                current_best = st.session_state.auto_tree_diagnostics.get("best_candidate")
+                if current_best is None or best_seen.information_gain > float(current_best.get("information_gain", -np.inf)):
+                    st.session_state.auto_tree_diagnostics["best_candidate"] = {
+                        "feature": str(best_seen.feature),
+                        "label": str(best_seen.label),
+                        "information_gain": float(best_seen.information_gain),
+                        "split_type": str(best_seen.split_type),
+                    }
             validation_lookup: dict[int, dict[str, Any]] = {}
             if validation_enabled and test_df is not None:
                 validation_lookup = {}
@@ -1909,6 +1926,37 @@ def build_optimal_tree(
     st.session_state.current_node_id = 0
     st.session_state.tree_zoom = recommended_tree_zoom()
     return split_count
+
+
+def auto_tree_zero_split_message(
+    diagnostics: dict[str, Any],
+    evaluated_features: list[str],
+    active_feature_count: int,
+    min_information_gain: float,
+) -> str:
+    evaluated_count = len(evaluated_features)
+    feature_text = ", ".join(evaluated_features[:5])
+    if evaluated_count > 5:
+        feature_text += f", ... (+{evaluated_count - 5})"
+    parts = ["Optimal tree rebuilt from root with 0 split(s)."]
+    if active_feature_count and evaluated_count < active_feature_count:
+        parts.append(
+            f"Only {evaluated_count:,} / {active_feature_count:,} active split variable(s) were evaluated: {feature_text}."
+        )
+    elif evaluated_count:
+        parts.append(f"Evaluated {evaluated_count:,} split variable(s): {feature_text}.")
+
+    candidate_count = int(diagnostics.get("candidate_count") or 0)
+    best_candidate = diagnostics.get("best_candidate")
+    if isinstance(best_candidate, dict):
+        gain = safe_float(best_candidate.get("information_gain"), default=0.0)
+        parts.append(
+            f"Best candidate was {best_candidate.get('label')} with information gain {gain:.8g}; "
+            f"minimum required is {float(min_information_gain):.8g}."
+        )
+    elif candidate_count == 0:
+        parts.append("No valid candidate split was produced for the evaluated variable set.")
+    return " ".join(parts)
 
 
 def json_safe(value: Any) -> Any:
@@ -5881,14 +5929,37 @@ def main() -> None:
                 reset_tree=build_from_root_requested,
             )
             if continue_requested:
-                st.session_state.auto_tree_message = (
-                    f"Optimal tree continued from current tree with {split_count} added split(s)."
-                )
+                if split_count == 0:
+                    st.session_state.auto_tree_message = auto_tree_zero_split_message(
+                        st.session_state.get("auto_tree_diagnostics", {}),
+                        ranking_features,
+                        len(features),
+                        auto_min_gain,
+                    ).replace("rebuilt from root", "continued from current tree")
+                    st.session_state.auto_tree_message_level = "warning"
+                else:
+                    st.session_state.auto_tree_message = (
+                        f"Optimal tree continued from current tree with {split_count} added split(s)."
+                    )
+                    st.session_state.auto_tree_message_level = "info"
             else:
-                st.session_state.auto_tree_message = f"Optimal tree rebuilt from root with {split_count} split(s)."
+                if split_count == 0:
+                    st.session_state.auto_tree_message = auto_tree_zero_split_message(
+                        st.session_state.get("auto_tree_diagnostics", {}),
+                        ranking_features,
+                        len(features),
+                        auto_min_gain,
+                    )
+                    st.session_state.auto_tree_message_level = "warning"
+                else:
+                    st.session_state.auto_tree_message = f"Optimal tree rebuilt from root with {split_count} split(s)."
+                    st.session_state.auto_tree_message_level = "info"
             save_and_rerun()
         if st.session_state.get("auto_tree_message"):
-            st.caption(st.session_state.auto_tree_message)
+            if st.session_state.get("auto_tree_message_level") == "warning":
+                st.warning(st.session_state.auto_tree_message)
+            else:
+                st.caption(st.session_state.auto_tree_message)
 
     with st.sidebar.expander("Import editable tree", expanded=False):
         st.caption("Upload a tree JSON/pickle exported from this app after loading the same data.")

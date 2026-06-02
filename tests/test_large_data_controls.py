@@ -669,6 +669,40 @@ def test_build_optimal_tree_skips_validation_unsafe_split():
     assert st.session_state.tree[0]["split"] is None
 
 
+def test_build_optimal_tree_records_zero_split_diagnostics_when_gain_is_too_low():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": list(range(100)),
+            "risk_flag": ["high" if i % 2 else "low" for i in range(100)],
+        }
+    )
+
+    split_count = build_optimal_tree(
+        df=train,
+        target="risk_flag",
+        features=["x"],
+        test_df=None,
+        min_leaf=1,
+        max_thresholds=5,
+        max_categories=3,
+        max_numeric_bins=2,
+        max_category_groups=2,
+        max_depth=1,
+        max_leaves=2,
+        min_information_gain=1.0,
+        candidate_rows=len(train),
+        parallel_workers=1,
+        max_validation_gini_gap=0.1,
+    )
+
+    diagnostics = st.session_state.auto_tree_diagnostics
+    assert split_count == 0
+    assert diagnostics["candidate_count"] > 0
+    assert diagnostics["best_candidate"]["feature"] == "x"
+    assert diagnostics["best_candidate"]["information_gain"] < 1.0
+
+
 def test_build_optimal_tree_can_continue_from_existing_tree():
     st.session_state.clear()
     train = pd.DataFrame(
