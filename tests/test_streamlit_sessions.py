@@ -90,3 +90,16 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
         1 for node in at2.session_state.filtered_state["tree"].values() if node["split"] is not None
     )
     assert restored_split_count == split_count
+
+
+def test_streamlit_treats_demo_query_data_id_as_builtin_demo_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("INTERACTIVE_TREE_SESSION_DIR", str(tmp_path))
+
+    at = AppTest.from_file("interactive_decision_tree_app.py")
+    at.query_params["data_id"] = "demo"
+    at.query_params["work_id"] = f"test_{uuid4().hex}"
+    at.run(timeout=25)
+
+    assert len(at.exception) == 0, [exc.value for exc in at.exception]
+    assert not any("Session data could not be loaded" in str(warning.value) for warning in at.warning)
+    assert at.session_state.filtered_state.get("data_source_choice") == "Demo"

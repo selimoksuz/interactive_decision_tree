@@ -2100,7 +2100,7 @@ def load_cached_dataframe_session(data_id: str) -> tuple[pd.DataFrame, dict[str,
 
 def load_session_dataframe_from_query() -> tuple[pd.DataFrame, dict[str, Any], str, str] | None:
     data_id = normalize_data_id(st.query_params.get(DATA_ID_QUERY_PARAM))
-    if data_id is None:
+    if data_id is None or data_id.casefold() == "demo":
         return None
     try:
         df, metadata = load_cached_dataframe_session(data_id)
@@ -2698,6 +2698,19 @@ def loaded_source_from_session(data_id: str, fallback_name: str | None = None) -
     )
 
 
+def demo_loaded_source() -> LoadedDataSource:
+    df = make_demo_data()
+    metadata = {"source": "demo", "name": "Demo"}
+    return LoadedDataSource(
+        df=df,
+        name="Demo",
+        data_key=demo_data_key(df),
+        source="demo",
+        data_id=None,
+        metadata=metadata,
+    )
+
+
 def render_session_source_loader(
     container: Any,
     *,
@@ -2721,6 +2734,9 @@ def render_session_source_loader(
     if data_id is None:
         container.info("Session DataFrame icin notebook URL'indeki data_id degerini girin.")
         return None
+    if data_id.casefold() == "demo":
+        container.info("`demo` built-in kaynaktir; session dosyasi aranmadan Demo data yuklendi.")
+        return demo_loaded_source()
     if query_session is not None and data_id == query_session[2]:
         df, metadata, source_data_id, data_key = query_session
         return LoadedDataSource(
@@ -2965,16 +2981,7 @@ def render_dataframe_source_loader(
             use_form=use_sql_form,
         )
 
-    df = make_demo_data()
-    metadata = {"source": "demo", "name": "Demo"}
-    return LoadedDataSource(
-        df=df,
-        name="Demo",
-        data_key=demo_data_key(df),
-        source="demo",
-        data_id=None,
-        metadata=metadata,
-    )
+    return demo_loaded_source()
 
 
 def restore_checkpoint_dataframe(checkpoint: dict[str, Any] | None) -> tuple[pd.DataFrame, str, str] | None:
@@ -5265,6 +5272,14 @@ def main() -> None:
         st.session_state.pop(APPLIED_DATA_CONTEXT_KEY, None)
         remembered_source = "Session DataFrame"
         st.session_state["_last_query_data_id"] = query_data_id
+    elif (
+        query_session is None
+        and remembered_source == "Session DataFrame"
+        and str(st.session_state.get("train_session_data_id") or "").strip().casefold() == "demo"
+    ):
+        st.session_state.pop("data_source_choice", None)
+        st.session_state.pop("train_session_data_id", None)
+        remembered_source = "Demo"
     elif remembered_source == "CSV Upload":
         st.session_state.pop("data_source_choice", None)
         remembered_source = "CSV / Excel Upload"
