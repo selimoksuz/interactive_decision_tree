@@ -33,6 +33,7 @@ from interactive_decision_tree_app import (
     restore_tree_state_from_checkpoint,
     score_split,
     normalize_feature_selection,
+    session_auto_tree_needs_generalization_restore,
     split_branch_indices,
     split_ranking_scope_caption,
     split_node,
@@ -1071,3 +1072,22 @@ def test_generalized_split_selection_penalizes_large_validation_gap():
     selected = choose_generalized_split_candidate([balanced_choice, leaky_choice])
 
     assert selected is balanced_choice
+
+
+def test_session_auto_tree_restore_only_flags_stale_optimal_tree():
+    st.session_state.clear()
+    st.session_state.tree = {
+        0: {"id": 0, "split": {"feature": "x"}},
+        1: {"id": 1, "split": None},
+    }
+    st.session_state.auto_tree_message = "Optimal tree rebuilt from root with 1 split(s)."
+    st.session_state.auto_tree_diagnostics = {"generalization_version": AUTO_TREE_GENERALIZATION_VERSION - 1}
+
+    assert session_auto_tree_needs_generalization_restore() is True
+
+    st.session_state.auto_tree_diagnostics = {"generalization_version": AUTO_TREE_GENERALIZATION_VERSION}
+    assert session_auto_tree_needs_generalization_restore() is False
+
+    st.session_state.auto_tree_message = ""
+    st.session_state.auto_tree_diagnostics = {}
+    assert session_auto_tree_needs_generalization_restore() is False

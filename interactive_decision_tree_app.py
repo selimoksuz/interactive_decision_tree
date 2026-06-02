@@ -4055,6 +4055,28 @@ def restore_tree_state_from_checkpoint(
     return True
 
 
+def session_auto_tree_needs_generalization_restore() -> bool:
+    tree = st.session_state.get("tree")
+    if not isinstance(tree, dict) or not any(node.get("split") is not None for node in tree.values()):
+        return False
+    auto_message = str(st.session_state.get("auto_tree_message", ""))
+    if not auto_message.startswith("Optimal tree"):
+        return False
+    auto_diagnostics = st.session_state.get("auto_tree_diagnostics")
+    if not isinstance(auto_diagnostics, dict):
+        return True
+    return auto_diagnostics.get("generalization_version") != AUTO_TREE_GENERALIZATION_VERSION
+
+
+def init_tree_preserving_restore_message(df: pd.DataFrame) -> None:
+    restore_message = st.session_state.get("auto_tree_message")
+    restore_message_level = st.session_state.get("auto_tree_message_level")
+    init_tree(df)
+    if restore_message:
+        st.session_state.auto_tree_message = str(restore_message)
+        st.session_state.auto_tree_message_level = str(restore_message_level or "warning")
+
+
 def is_checkpoint_ui_state_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
@@ -6870,7 +6892,10 @@ def main() -> None:
     if "state_key" not in st.session_state or st.session_state.state_key != state_key:
         st.session_state.state_key = state_key
         if not restore_tree_state_from_checkpoint(checkpoint, state_key, df):
-            init_tree(df)
+            init_tree_preserving_restore_message(df)
+    elif validation_scoring_enabled and session_auto_tree_needs_generalization_restore():
+        if not restore_tree_state_from_checkpoint(checkpoint, state_key, df):
+            init_tree_preserving_restore_message(df)
 
     parameters = {
         "min_leaf": min_leaf,
