@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Interactive Tree: Start Streamlit",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\start_app.py",
+      "args": [
+        "app",
+        "--mode",
+        "local",
+        "--port",
+        "8501"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "INTERACTIVE_TREE_SESSION_DIR": "${workspaceFolder}\\.tree_sessions"
+      }
+    },
+    {
+      "name": "Interactive Tree: Debug Streamlit App",
+      "type": "python",
+      "request": "launch",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "${workspaceFolder}\\interactive_decision_tree_app.py",
+        "--server.address",
+        "127.0.0.1",
+        "--server.port",
+        "8501",
+        "--server.headless",
+        "true"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "INTERACTIVE_TREE_SESSION_DIR": "${workspaceFolder}\\.tree_sessions"
+      }
+    }
+  ]
+}
