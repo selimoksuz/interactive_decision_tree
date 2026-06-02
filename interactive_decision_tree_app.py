@@ -66,6 +66,7 @@ DEFAULT_PARALLEL_WORKERS = max(1, min(8, CPU_COUNT))
 DEFAULT_DEMO_ROWS = 5_000
 DEFAULT_MAX_VALIDATION_GINI_GAP = 0.10
 VALIDATION_CANDIDATE_LIMIT = 100
+AUTO_TREE_VALIDATION_CANDIDATE_LIMIT = 4
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
 TARGET_META_CACHE_KEY = "_interactive_tree_target_meta_cache"
@@ -431,6 +432,18 @@ def target_impurity(y: pd.Series, target_kind: str | None = None) -> float:
     return entropy(y)
 
 
+def binary_entropy_from_counts(event_count: int | float, total_count: int | float) -> float:
+    total = float(total_count)
+    if total <= 0:
+        return 0.0
+    event = float(event_count)
+    p_event = min(max(event / total, 0.0), 1.0)
+    if p_event <= 0.0 or p_event >= 1.0:
+        return 0.0
+    p_non_event = 1.0 - p_event
+    return float(-(p_event * np.log2(p_event) + p_non_event * np.log2(p_non_event)))
+
+
 def impurity_label(y: pd.Series, target_kind: str | None = None) -> str:
     return "Variance" if (target_kind or infer_target_kind(y)) == "regression" else "Entropy"
 
@@ -520,9 +533,11 @@ def score_branch_split(
     masks_and_labels: list[tuple[pd.Series, str]],
     min_leaf: int,
     target_kind: str | None = None,
+    parent_impurity: float | None = None,
 ) -> tuple[float, float, tuple[str, ...], tuple[int, ...], tuple[float, ...]] | None:
     y_parent = frame[target]
-    parent_impurity = target_impurity(y_parent, target_kind)
+    if parent_impurity is None:
+        parent_impurity = target_impurity(y_parent, target_kind)
 
     branch_labels: list[str] = []
     branch_ns: list[int] = []
@@ -611,6 +626,103 @@ def numeric_split_label(
     return f"{base} (missing -> last/upper branch)"
 
 
+def numeric_le_branch_labels(threshold: float, missing_policy: str, has_missing: bool) -> tuple[str, ...]:
+    left_label = f"<= {threshold:.6g}"
+    right_label = f"> {threshold:.6g}"
+    if has_missing:
+        if missing_policy == "left":
+            left_label = f"{left_label} or missing"
+        elif missing_policy == "separate":
+            return (left_label, right_label, "missing")
+        else:
+            right_label = f"{right_label} or missing"
+    return (left_label, right_label)
+
+
+def score_binary_numeric_le_candidates(
+    feature: str,
+    thresholds: list[float],
+    numeric: pd.Series,
+    target_values: pd.Series,
+    positive_class: Any,
+    min_leaf: int,
+    missing_policies: list[str],
+    parent_impurity: float,
+) -> list[SplitCandidate]:
+    if not thresholds:
+        return []
+
+    numeric_values = pd.to_numeric(numeric, errors="coerce").to_numpy(dtype=float)
+    event_values = (target_values == positive_class).to_numpy(dtype=np.int8)
+    valid_numeric = ~np.isnan(numeric_values)
+    sorted_order = np.argsort(numeric_values[valid_numeric], kind="mergesort")
+    sorted_numeric = numeric_values[valid_numeric][sorted_order]
+    sorted_events = event_values[valid_numeric][sorted_order]
+    non_missing_n = int(len(sorted_numeric))
+    if non_missing_n <= 1:
+        return []
+
+    cumulative_events = np.cumsum(sorted_events, dtype=np.int64)
+    total_n = int(len(numeric_values))
+    total_events = int(event_values.sum())
+    missing_n = int(total_n - non_missing_n)
+    missing_events = int(total_events - int(cumulative_events[-1]))
+    has_missing = missing_n > 0
+
+    candidates: list[SplitCandidate] = []
+    for threshold in thresholds:
+        left_n = int(np.searchsorted(sorted_numeric, float(threshold), side="right"))
+        right_n = non_missing_n - left_n
+        if left_n <= 0:
+            left_events = 0
+        else:
+            left_events = int(cumulative_events[left_n - 1])
+        right_events = int(cumulative_events[-1]) - left_events
+
+        for missing_policy in missing_policies:
+            branch_counts = [left_n, right_n]
+            branch_events = [left_events, right_events]
+            if has_missing:
+                if missing_policy == "left":
+                    branch_counts[0] += missing_n
+                    branch_events[0] += missing_events
+                elif missing_policy == "separate":
+                    branch_counts.append(missing_n)
+                    branch_events.append(missing_events)
+                else:
+                    branch_counts[1] += missing_n
+                    branch_events[1] += missing_events
+
+            if any(count < min_leaf for count in branch_counts):
+                continue
+
+            branch_entropies = [
+                binary_entropy_from_counts(event_count, count)
+                for event_count, count in zip(branch_events, branch_counts)
+            ]
+            weighted_entropy = sum(
+                (count / total_n) * impurity
+                for count, impurity in zip(branch_counts, branch_entropies)
+            )
+            candidates.append(
+                SplitCandidate(
+                    feature=feature,
+                    split_type="numeric_le",
+                    value=float(threshold),
+                    parent_entropy=parent_impurity,
+                    weighted_entropy=float(weighted_entropy),
+                    information_gain=float(parent_impurity - weighted_entropy),
+                    branch_count=len(branch_counts),
+                    branch_labels=numeric_le_branch_labels(float(threshold), missing_policy, has_missing),
+                    branch_ns=tuple(int(count) for count in branch_counts),
+                    branch_entropies=tuple(float(value) for value in branch_entropies),
+                    label=numeric_split_label(feature, [float(threshold)], missing_policy, has_missing=has_missing),
+                    missing_policy=missing_policy,
+                )
+            )
+    return candidates
+
+
 def score_split(
     df: pd.DataFrame,
     target: str,
@@ -656,6 +768,130 @@ def score_split(
         branch_entropies=branch_entropies,
         label=label,
         missing_policy=missing_policy if split_type == "numeric_le" else "category_level",
+    )
+
+
+def score_prepared_numeric_le_split(
+    frame: pd.DataFrame,
+    target: str,
+    feature: str,
+    numeric: pd.Series,
+    threshold: float,
+    min_leaf: int,
+    target_kind: str,
+    missing_policy: str,
+    parent_impurity: float,
+) -> SplitCandidate | None:
+    masks_and_labels = numeric_masks_and_labels(numeric, [float(threshold)], missing_policy)
+    scored = score_branch_split(
+        frame,
+        target,
+        masks_and_labels,
+        min_leaf,
+        target_kind,
+        parent_impurity=parent_impurity,
+    )
+    if scored is None:
+        return None
+    parent_entropy, weighted_entropy, branch_labels, branch_ns, branch_entropies = scored
+    return SplitCandidate(
+        feature=feature,
+        split_type="numeric_le",
+        value=float(threshold),
+        parent_entropy=parent_entropy,
+        weighted_entropy=weighted_entropy,
+        information_gain=parent_entropy - weighted_entropy,
+        branch_count=len(branch_labels),
+        branch_labels=branch_labels,
+        branch_ns=branch_ns,
+        branch_entropies=branch_entropies,
+        label=numeric_split_label(feature, [float(threshold)], missing_policy, has_missing=bool(numeric.isna().any())),
+        missing_policy=missing_policy,
+    )
+
+
+def score_prepared_numeric_multiway_split(
+    frame: pd.DataFrame,
+    target: str,
+    feature: str,
+    numeric: pd.Series,
+    bin_count: int,
+    min_leaf: int,
+    target_kind: str,
+    missing_policy: str,
+    parent_impurity: float,
+) -> SplitCandidate | None:
+    thresholds = numeric_bin_thresholds(numeric, bin_count)
+    if len(thresholds) != bin_count - 1:
+        return None
+
+    masks_and_labels = numeric_masks_and_labels(numeric, thresholds, missing_policy)
+    scored = score_branch_split(
+        frame,
+        target,
+        masks_and_labels,
+        min_leaf,
+        target_kind,
+        parent_impurity=parent_impurity,
+    )
+    if scored is None:
+        return None
+    parent_entropy, weighted_entropy, branch_labels, branch_ns, branch_entropies = scored
+
+    return SplitCandidate(
+        feature=feature,
+        split_type="numeric_bins",
+        value=tuple(thresholds),
+        parent_entropy=parent_entropy,
+        weighted_entropy=weighted_entropy,
+        information_gain=parent_entropy - weighted_entropy,
+        branch_count=len(branch_labels),
+        branch_labels=branch_labels,
+        branch_ns=branch_ns,
+        branch_entropies=branch_entropies,
+        label=numeric_split_label(feature, thresholds, missing_policy, has_missing=bool(numeric.isna().any())),
+        missing_policy=missing_policy,
+    )
+
+
+def score_prepared_category_eq_split(
+    frame: pd.DataFrame,
+    target: str,
+    feature: str,
+    values: pd.Series,
+    value: Any,
+    min_leaf: int,
+    target_kind: str,
+    parent_impurity: float,
+) -> SplitCandidate | None:
+    masks_and_labels = [
+        (values == value, f"== {value}"),
+        (values != value, f"!= {value}"),
+    ]
+    scored = score_branch_split(
+        frame,
+        target,
+        masks_and_labels,
+        min_leaf,
+        target_kind,
+        parent_impurity=parent_impurity,
+    )
+    if scored is None:
+        return None
+    parent_entropy, weighted_entropy, branch_labels, branch_ns, branch_entropies = scored
+    return SplitCandidate(
+        feature=feature,
+        split_type="category_eq",
+        value=value,
+        parent_entropy=parent_entropy,
+        weighted_entropy=weighted_entropy,
+        information_gain=parent_entropy - weighted_entropy,
+        branch_count=len(branch_labels),
+        branch_labels=branch_labels,
+        branch_ns=branch_ns,
+        branch_entropies=branch_entropies,
+        label=f"{feature} == {value}",
+        missing_policy="category_level",
     )
 
 
@@ -1131,36 +1367,55 @@ def candidate_splits_for_feature(
     positive_class: Any = None,
 ) -> list[SplitCandidate]:
     candidates: list[SplitCandidate] = []
-    s = df.loc[row_idx, feature]
+    frame = df.loc[row_idx, [feature, target]]
+    s = frame[feature]
+    parent_impurity = target_impurity(frame[target], target_kind)
 
     if pd.api.types.is_numeric_dtype(s):
         policies = numeric_missing_policies(pd.to_numeric(s, errors="coerce"))
-        for threshold in numeric_thresholds(s, max_thresholds):
-            for missing_policy in policies:
-                candidate = score_split(
-                    df=df,
-                    target=target,
-                    row_idx=row_idx,
+        numeric = pd.to_numeric(s, errors="coerce")
+        thresholds = numeric_thresholds(s, max_thresholds)
+        if target_kind == "binary" and positive_class is not None:
+            candidates.extend(
+                score_binary_numeric_le_candidates(
                     feature=feature,
-                    split_type="numeric_le",
-                    value=threshold,
+                    thresholds=thresholds,
+                    numeric=numeric,
+                    target_values=frame[target],
+                    positive_class=positive_class,
                     min_leaf=min_leaf,
-                    target_kind=target_kind,
-                    missing_policy=missing_policy,
+                    missing_policies=policies,
+                    parent_impurity=parent_impurity,
                 )
-                if candidate is not None:
-                    candidates.append(candidate)
+            )
+        else:
+            for threshold in thresholds:
+                for missing_policy in policies:
+                    candidate = score_prepared_numeric_le_split(
+                        frame=frame,
+                        target=target,
+                        feature=feature,
+                        numeric=numeric,
+                        threshold=threshold,
+                        min_leaf=min_leaf,
+                        target_kind=target_kind,
+                        missing_policy=missing_policy,
+                        parent_impurity=parent_impurity,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
         for bin_count in range(3, max_numeric_bins + 1):
             for missing_policy in policies:
-                candidate = score_numeric_multiway_split(
-                    df=df,
+                candidate = score_prepared_numeric_multiway_split(
+                    frame=frame,
                     target=target,
-                    row_idx=row_idx,
                     feature=feature,
+                    numeric=numeric,
                     bin_count=bin_count,
                     min_leaf=min_leaf,
                     target_kind=target_kind,
                     missing_policy=missing_policy,
+                    parent_impurity=parent_impurity,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -1172,16 +1427,17 @@ def candidate_splits_for_feature(
             .head(max_categories)
             .index.tolist()
         )
+        prepared_values = s.astype("object").where(s.notna(), "__MISSING__")
         for value in values:
-            candidate = score_split(
-                df=df,
+            candidate = score_prepared_category_eq_split(
+                frame=frame,
                 target=target,
-                row_idx=row_idx,
                 feature=feature,
-                split_type="category_eq",
                 value=value,
                 min_leaf=min_leaf,
                 target_kind=target_kind,
+                values=prepared_values,
+                parent_impurity=parent_impurity,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -1833,115 +2089,137 @@ def build_optimal_tree(
         st.session_state.auto_tree_message = ""
     st.session_state.auto_tree_diagnostics = {
         "candidate_count": 0,
+        "validated_candidate_count": 0,
         "evaluated_features": list(features),
         "best_candidate": None,
         "min_information_gain": float(min_information_gain),
+        "stop_reason": None,
+        "leaf_count": 1,
+        "max_leaves": int(max_leaves),
+        "max_depth": int(max_depth),
     }
     split_count = 0
     action_node_ids: list[int] = []
     validation_enabled = test_df is not None and infer_target_kind(df[target]) == "binary"
+    candidate_cache: dict[int, list[SplitCandidate]] = {}
+
+    def cached_leaf_candidates(leaf: dict[str, Any]) -> list[SplitCandidate]:
+        leaf_id = int(leaf["id"])
+        if leaf_id in candidate_cache:
+            return candidate_cache[leaf_id]
+        if len(set(df.loc[leaf["row_idx"], target].astype(str))) <= 1:
+            candidate_cache[leaf_id] = []
+            return []
+
+        search_row_idx = analysis_row_idx(
+            leaf["row_idx"],
+            candidate_rows,
+            df=df,
+            target=target,
+        )
+        candidates = candidate_splits(
+            df=df,
+            target=target,
+            features=features,
+            row_idx=search_row_idx,
+            min_leaf=min_leaf,
+            max_thresholds=max_thresholds,
+            max_categories=max_categories,
+            max_numeric_bins=max_numeric_bins,
+            max_category_groups=max_category_groups,
+            parallel_workers=parallel_workers,
+        )
+        st.session_state.auto_tree_diagnostics["candidate_count"] += len(candidates)
+        if candidates:
+            best_seen = candidates[0]
+            current_best = st.session_state.auto_tree_diagnostics.get("best_candidate")
+            if current_best is None or best_seen.information_gain > float(current_best.get("information_gain", -np.inf)):
+                st.session_state.auto_tree_diagnostics["best_candidate"] = {
+                    "feature": str(best_seen.feature),
+                    "label": str(best_seen.label),
+                    "information_gain": float(best_seen.information_gain),
+                    "split_type": str(best_seen.split_type),
+                }
+        candidate_cache[leaf_id] = candidates
+        return candidates
 
     while True:
-        if len(current_leaves()) >= max_leaves:
+        leaves = current_leaves()
+        st.session_state.auto_tree_diagnostics["leaf_count"] = len(leaves)
+        if len(leaves) >= max_leaves:
+            st.session_state.auto_tree_diagnostics["stop_reason"] = "max_leaves"
             break
 
         best_node_id: int | None = None
         best_candidate: SplitCandidate | None = None
         best_score: tuple[Any, ...] | None = None
 
-        leaf_count_now = len(current_leaves())
-        baseline_train_predictions = tree_predictions_for_dataframe(df, df, target) if validation_enabled else None
-        baseline_test_predictions = (
-            tree_predictions_for_dataframe(df, test_df, target)
-            if validation_enabled and test_df is not None
-            else None
-        )
-        for leaf in current_leaves():
+        leaf_count_now = len(leaves)
+        eligible_candidates: list[tuple[tuple[Any, ...], int, SplitCandidate]] = []
+        per_leaf_limit = AUTO_TREE_VALIDATION_CANDIDATE_LIMIT if validation_enabled else 1
+        for leaf in leaves:
             if leaf["depth"] >= max_depth:
                 continue
 
-            search_row_idx = analysis_row_idx(
-                leaf["row_idx"],
-                candidate_rows,
-                df=df,
-                target=target,
-            )
-            candidates = candidate_splits(
-                df=df,
-                target=target,
-                features=features,
-                row_idx=search_row_idx,
-                min_leaf=min_leaf,
-                max_thresholds=max_thresholds,
-                max_categories=max_categories,
-                max_numeric_bins=max_numeric_bins,
-                max_category_groups=max_category_groups,
-                parallel_workers=parallel_workers,
-            )
-            st.session_state.auto_tree_diagnostics["candidate_count"] += len(candidates)
-            if candidates:
-                best_seen = candidates[0]
-                current_best = st.session_state.auto_tree_diagnostics.get("best_candidate")
-                if current_best is None or best_seen.information_gain > float(current_best.get("information_gain", -np.inf)):
-                    st.session_state.auto_tree_diagnostics["best_candidate"] = {
-                        "feature": str(best_seen.feature),
-                        "label": str(best_seen.label),
-                        "information_gain": float(best_seen.information_gain),
-                        "split_type": str(best_seen.split_type),
-                    }
-            validation_lookup: dict[int, dict[str, Any]] = {}
-            if validation_enabled and test_df is not None:
-                validation_lookup = {}
-                for validation_candidate in candidates_selected_for_validation(candidates, VALIDATION_CANDIDATE_LIMIT):
-                    stats = candidate_validation_stats(
-                        train_df=df,
-                        test_df=test_df,
-                        target=target,
-                        node_id=leaf["id"],
-                        candidate=validation_candidate,
-                        max_gini_gap=max_validation_gini_gap,
-                        baseline_train_predictions=baseline_train_predictions,
-                        baseline_test_predictions=baseline_test_predictions,
-                    )
-                    if stats is not None:
-                        validation_lookup[id(validation_candidate)] = stats
-
-            ordered_candidates = sorted(
-                candidates,
-                key=lambda candidate: candidate_validation_sort_key(candidate, validation_lookup),
-                reverse=True,
-            ) if validation_lookup else candidates
-            for candidate in ordered_candidates:
+            accepted_for_leaf = 0
+            for rank, candidate in enumerate(cached_leaf_candidates(leaf)):
                 if candidate.information_gain < min_information_gain:
-                    if validation_lookup:
-                        continue
                     break
                 if leaf_count_now + candidate.branch_count - 1 > max_leaves:
                     continue
-                if not candidate_passes_validation(candidate, validation_lookup):
-                    continue
 
                 weighted_delta = candidate_total_gain_delta(df, candidate, leaf["row_idx"])
-                if validation_lookup:
-                    stats = validation_lookup.get(id(candidate), {})
-                    candidate_score = (
-                        1 if stats.get("validation_safe") else 0,
-                        numeric_sort_value(stats.get("test_gini_after"), -np.inf),
-                        numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
-                        -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
-                        weighted_delta,
-                    )
-                else:
-                    candidate_score = (weighted_delta,)
+                raw_score = (weighted_delta, candidate.information_gain, -rank)
+                eligible_candidates.append((raw_score, int(leaf["id"]), candidate))
+                accepted_for_leaf += 1
+                if accepted_for_leaf >= per_leaf_limit:
+                    break
+
+        if not eligible_candidates:
+            st.session_state.auto_tree_diagnostics["stop_reason"] = "no_eligible_candidate"
+        elif validation_enabled and test_df is not None:
+            baseline_train_predictions = tree_predictions_for_dataframe(df, df, target)
+            baseline_test_predictions = tree_predictions_for_dataframe(df, test_df, target)
+            ordered_eligible = sorted(eligible_candidates, key=lambda item: item[0], reverse=True)
+            for raw_score, node_id, candidate in ordered_eligible[:AUTO_TREE_VALIDATION_CANDIDATE_LIMIT]:
+                stats = candidate_validation_stats(
+                    train_df=df,
+                    test_df=test_df,
+                    target=target,
+                    node_id=node_id,
+                    candidate=candidate,
+                    max_gini_gap=max_validation_gini_gap,
+                    baseline_train_predictions=baseline_train_predictions,
+                    baseline_test_predictions=baseline_test_predictions,
+                )
+                st.session_state.auto_tree_diagnostics["validated_candidate_count"] += 1
+                if not stats or not stats.get("validation_safe"):
+                    continue
+
+                candidate_score = (
+                    numeric_sort_value(stats.get("test_gini_after"), -np.inf),
+                    numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
+                    -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
+                    *raw_score,
+                )
                 if best_score is None or candidate_score > best_score:
                     best_score = candidate_score
                     best_candidate = candidate
-                    best_node_id = leaf["id"]
-                break
+                    best_node_id = node_id
+            if best_node_id is None:
+                st.session_state.auto_tree_diagnostics["stop_reason"] = "validation_guard"
+        else:
+            for raw_score, node_id, candidate in eligible_candidates:
+                candidate_score = raw_score
+                if best_score is None or candidate_score > best_score:
+                    best_score = candidate_score
+                    best_candidate = candidate
+                    best_node_id = node_id
 
         if best_node_id is None or best_candidate is None:
             break
 
+        st.session_state.auto_tree_diagnostics["stop_reason"] = None
         split_node(df, best_node_id, best_candidate, select_first_child=False, record_action=False)
         action_node_ids.append(best_node_id)
         split_count += 1
@@ -1950,7 +2228,34 @@ def build_optimal_tree(
         st.session_state.setdefault("split_action_history", []).append(action_node_ids)
     st.session_state.current_node_id = 0
     st.session_state.tree_zoom = recommended_tree_zoom()
+    leaves_after = current_leaves()
+    st.session_state.auto_tree_diagnostics["leaf_count"] = len(leaves_after)
+    if st.session_state.auto_tree_diagnostics.get("stop_reason") is None:
+        if len(leaves_after) >= max_leaves:
+            st.session_state.auto_tree_diagnostics["stop_reason"] = "max_leaves"
+        elif all(int(leaf.get("depth", 0)) >= max_depth for leaf in leaves_after):
+            st.session_state.auto_tree_diagnostics["stop_reason"] = "max_depth"
     return split_count
+
+
+def auto_tree_stop_detail(diagnostics: dict[str, Any]) -> str:
+    leaf_count = safe_int(diagnostics.get("leaf_count"), default=0, minimum=0)
+    max_leaves = safe_int(diagnostics.get("max_leaves"), default=0, minimum=0)
+    leaf_text = f"{leaf_count:,}/{max_leaves:,} leaves" if max_leaves else f"{leaf_count:,} leaves"
+    reason = diagnostics.get("stop_reason")
+    if reason == "max_leaves":
+        return f"Reached {leaf_text}."
+    if reason == "max_depth":
+        return f"Stopped at {leaf_text}: max depth limit reached."
+    if reason == "validation_guard":
+        return f"Stopped at {leaf_text}: no remaining candidate passed the test validation guard."
+    if reason == "no_eligible_candidate":
+        return f"Stopped at {leaf_text}: no remaining candidate met min gain, min leaf, depth, and leaf-limit constraints."
+    return f"Stopped at {leaf_text}."
+
+
+def auto_tree_success_message(split_count: int, diagnostics: dict[str, Any], action: str) -> str:
+    return f"Optimal tree {action} with {split_count} split(s). {auto_tree_stop_detail(diagnostics)}"
 
 
 def auto_tree_zero_split_message(
@@ -1981,6 +2286,7 @@ def auto_tree_zero_split_message(
         )
     elif candidate_count == 0:
         parts.append("No valid candidate split was produced for the evaluated variable set.")
+    parts.append(auto_tree_stop_detail(diagnostics))
     return " ".join(parts)
 
 
@@ -6031,8 +6337,10 @@ def main() -> None:
                     ).replace("rebuilt from root", "continued from current tree")
                     st.session_state.auto_tree_message_level = "warning"
                 else:
-                    st.session_state.auto_tree_message = (
-                        f"Optimal tree continued from current tree with {split_count} added split(s)."
+                    st.session_state.auto_tree_message = auto_tree_success_message(
+                        split_count,
+                        st.session_state.get("auto_tree_diagnostics", {}),
+                        "continued from current tree",
                     )
                     st.session_state.auto_tree_message_level = "info"
             else:
@@ -6045,7 +6353,11 @@ def main() -> None:
                     )
                     st.session_state.auto_tree_message_level = "warning"
                 else:
-                    st.session_state.auto_tree_message = f"Optimal tree rebuilt from root with {split_count} split(s)."
+                    st.session_state.auto_tree_message = auto_tree_success_message(
+                        split_count,
+                        st.session_state.get("auto_tree_diagnostics", {}),
+                        "rebuilt from root",
+                    )
                     st.session_state.auto_tree_message_level = "info"
             save_and_rerun()
         if st.session_state.get("auto_tree_message"):

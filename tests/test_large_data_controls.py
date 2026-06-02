@@ -672,6 +672,8 @@ def test_build_optimal_tree_skips_validation_unsafe_split():
 
     assert split_count == 0
     assert st.session_state.tree[0]["split"] is None
+    assert st.session_state.auto_tree_diagnostics["stop_reason"] == "validation_guard"
+    assert st.session_state.auto_tree_diagnostics["leaf_count"] == 1
 
 
 def test_build_optimal_tree_records_zero_split_diagnostics_when_gain_is_too_low():
@@ -806,6 +808,8 @@ def test_build_optimal_tree_reset_true_rebuilds_from_root():
     assert split_count == 1
     assert st.session_state.tree[0]["split"]["feature"] == "x"
     assert len(st.session_state.tree) == 3
+    assert st.session_state.auto_tree_diagnostics["stop_reason"] == "max_leaves"
+    assert st.session_state.auto_tree_diagnostics["leaf_count"] == 2
 
     assert undo_last_split() is True
     assert st.session_state.tree[0]["split"] is None
