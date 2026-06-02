@@ -72,6 +72,8 @@ AUTO_TREE_VALIDATION_CANDIDATE_LIMIT = 40
 VALIDATION_GAP_PENALTY_WEIGHT = 0.05
 AUTO_GENERALIZATION_SPLIT_GAP_PENALTY_WEIGHT = 0.40
 VALIDATION_TEST_DROP_PENALTY_WEIGHT = 2.00
+AUTO_TREE_CANDIDATE_PROPOSAL_ROWS = 500
+AUTO_TREE_GENERALIZATION_VERSION = 4
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
 TARGET_META_CACHE_KEY = "_interactive_tree_target_meta_cache"
@@ -2259,6 +2261,8 @@ def build_optimal_tree(
         "leaf_count": 1,
         "max_leaves": int(max_leaves),
         "max_depth": int(max_depth),
+        "candidate_proposal_rows": int(candidate_rows),
+        "generalization_version": AUTO_TREE_GENERALIZATION_VERSION if test_df is not None else None,
     }
     split_count = 0
     action_node_ids: list[int] = []
@@ -2488,6 +2492,23 @@ def build_optimal_tree(
             "within_gap_target": bool(selected_snapshot.get("within_gap_target")),
             "candidate_snapshots": int(len(validation_snapshots)),
         }
+        final_test_leaf_idx = test_leaf_indices_from_predictions(
+            tree_predictions_for_dataframe(df, test_df, target)
+        )
+        final_validation_state = build_binary_validation_state(df, test_df, target, final_test_leaf_idx)
+        final_gap = gini_gap(final_validation_state.train_gini, final_validation_state.test_gini)
+        st.session_state.auto_tree_diagnostics["generalization"].update(
+            {
+                "leaf_count": int(len(current_leaves())),
+                "train_gini": final_validation_state.train_gini,
+                "test_gini": final_validation_state.test_gini,
+                "gini_gap": final_gap,
+                "within_gap_target": bool(
+                    numeric_sort_value(final_gap, np.inf)
+                    <= float(max_validation_gini_gap) + MIN_INFORMATION_GAIN_EPSILON
+                ),
+            }
+        )
 
     if action_node_ids:
         st.session_state.setdefault("split_action_history", []).append(action_node_ids)
@@ -3976,6 +3997,26 @@ def restore_tree_state_from_checkpoint(
     if 0 not in tree:
         return False
 
+    auto_message = str(tree_state.get("auto_tree_message", ""))
+    auto_diagnostics = tree_state.get("auto_tree_diagnostics")
+    auto_tree_has_splits = any((node.get("split") is not None) for node in tree.values())
+    checkpoint_data = checkpoint.get("data") if isinstance(checkpoint.get("data"), dict) else {}
+    checkpoint_metadata = checkpoint_data.get("metadata") if isinstance(checkpoint_data.get("metadata"), dict) else {}
+    checkpoint_has_validation = isinstance(checkpoint_metadata.get("validation"), dict)
+    if auto_tree_has_splits and auto_message.startswith("Optimal tree") and checkpoint_has_validation:
+        generalization_version = (
+            auto_diagnostics.get("generalization_version")
+            if isinstance(auto_diagnostics, dict)
+            else None
+        )
+        if generalization_version != AUTO_TREE_GENERALIZATION_VERSION:
+            st.session_state.auto_tree_message = (
+                "Stored optimal tree was built with older generalization logic. "
+                "Use Build from root to rebuild it."
+            )
+            st.session_state.auto_tree_message_level = "warning"
+            return False
+
     valid_index = set(df.index.tolist())
     for node in tree.values():
         if any(idx not in valid_index for idx in node["row_idx"]):
@@ -4008,6 +4049,8 @@ def restore_tree_state_from_checkpoint(
         split_action_history = [[node_id] for node_id in st.session_state.split_history]
     st.session_state.split_action_history = split_action_history
     st.session_state.auto_tree_message = str(tree_state.get("auto_tree_message", ""))
+    if isinstance(auto_diagnostics, dict):
+        st.session_state.auto_tree_diagnostics = dict(auto_diagnostics)
     st.session_state.tree_zoom = safe_float(tree_state.get("tree_zoom"), default=recommended_tree_zoom())
     return True
 
@@ -4139,6 +4182,7 @@ def save_work_checkpoint(
             "split_history": json_safe(st.session_state.get("split_history", [])),
             "split_action_history": json_safe(st.session_state.get("split_action_history", [])),
             "auto_tree_message": json_safe(st.session_state.get("auto_tree_message", "")),
+            "auto_tree_diagnostics": json_safe(st.session_state.get("auto_tree_diagnostics", {})),
             "tree_zoom": json_safe(st.session_state.get("tree_zoom")),
         },
         "woe_projects": json_safe(st.session_state.get(WOE_PROJECTS_KEY, {})),
@@ -6898,12 +6942,13 @@ def main() -> None:
         auto_max_depth = safe_int(auto_max_depth_input, default=3, minimum=1)
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
-        auto_candidate_rows = len(df)
+        auto_candidate_rows = min(len(df), AUTO_TREE_CANDIDATE_PROPOSAL_ROWS)
         auto_parameters = {
             "max_depth": auto_max_depth,
             "max_leaves": auto_max_leaves,
             "min_information_gain": auto_min_gain,
             "parallel_workers": parallel_workers,
+            "candidate_proposal_rows": auto_candidate_rows,
         }
 
         build_from_root_requested = st.button(

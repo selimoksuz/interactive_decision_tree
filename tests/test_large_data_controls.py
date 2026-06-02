@@ -18,6 +18,7 @@ from interactive_decision_tree_app import (
     candidate_validation_stats,
     candidate_validation_stats_from_state,
     checkpoint_ui_state,
+    choose_generalized_split_candidate,
     default_model_feature_selection,
     demo_data_key,
     evaluation_model_metrics,
@@ -40,6 +41,7 @@ from interactive_decision_tree_app import (
     update_feature_selection_for_filtered,
     undo_last_split,
     validate_test_dataframe,
+    AUTO_TREE_GENERALIZATION_VERSION,
 )
 
 
@@ -959,3 +961,113 @@ def test_restore_tree_state_ignores_checkpoint_without_tree_state_key():
 
     assert restored is False
     assert "tree" not in st.session_state
+
+
+def test_restore_tree_state_rejects_stale_auto_tree_with_validation():
+    st.session_state.clear()
+    df = pd.DataFrame({"x": [1.0, 2.0], "risk_flag": ["low", "high"]})
+    checkpoint = {
+        "tree_schema_version": 4,
+        "data": {"metadata": {"validation": {"mode": "split_train_data"}}},
+        "tree_state": {
+            "state_key": ["data", "risk_flag", 4],
+            "auto_tree_message": "Optimal tree rebuilt from root with 1 split(s). Reached 2/2 leaves.",
+            "tree": {
+                "0": {
+                    "id": 0,
+                    "depth": 0,
+                    "path": "root",
+                    "row_idx": [0, 1],
+                    "split": {
+                        "feature": "x",
+                        "split_type": "numeric_le",
+                        "value": 1.5,
+                        "label": "x <= 1.5",
+                        "branch_count": 2,
+                        "branch_labels": ["<= 1.5", "> 1.5"],
+                        "information_gain": 1.0,
+                        "weighted_entropy": 0.0,
+                    },
+                    "children": [{"id": 1, "label": "<= 1.5"}, {"id": 2, "label": "> 1.5"}],
+                    "left": 1,
+                    "right": 2,
+                },
+                "1": {"id": 1, "depth": 1, "path": "root -> x <= 1.5", "row_idx": [0], "split": None, "children": [], "left": None, "right": None},
+                "2": {"id": 2, "depth": 1, "path": "root -> x > 1.5", "row_idx": [1], "split": None, "children": [], "left": None, "right": None},
+            },
+        },
+    }
+
+    restored = restore_tree_state_from_checkpoint(checkpoint, ("data", "risk_flag", 4), df)
+
+    assert restored is False
+    assert "tree" not in st.session_state
+    assert "older generalization logic" in st.session_state.auto_tree_message
+
+
+def test_restore_tree_state_accepts_current_auto_tree_generalization_version():
+    st.session_state.clear()
+    df = pd.DataFrame({"x": [1.0, 2.0], "risk_flag": ["low", "high"]})
+    checkpoint = {
+        "tree_schema_version": 4,
+        "data": {"metadata": {"validation": {"mode": "split_train_data"}}},
+        "tree_state": {
+            "state_key": ["data", "risk_flag", 4],
+            "next_node_id": 3,
+            "current_node_id": 0,
+            "split_history": [0],
+            "split_action_history": [[0]],
+            "auto_tree_message": "Optimal tree rebuilt from root with 1 split(s). Reached 2/2 leaves.",
+            "auto_tree_diagnostics": {"generalization_version": AUTO_TREE_GENERALIZATION_VERSION},
+            "tree": {
+                "0": {
+                    "id": 0,
+                    "depth": 0,
+                    "path": "root",
+                    "row_idx": [0, 1],
+                    "split": {
+                        "feature": "x",
+                        "split_type": "numeric_le",
+                        "value": 1.5,
+                        "label": "x <= 1.5",
+                        "branch_count": 2,
+                        "branch_labels": ["<= 1.5", "> 1.5"],
+                        "information_gain": 1.0,
+                        "weighted_entropy": 0.0,
+                    },
+                    "children": [{"id": 1, "label": "<= 1.5"}, {"id": 2, "label": "> 1.5"}],
+                    "left": 1,
+                    "right": 2,
+                },
+                "1": {"id": 1, "depth": 1, "path": "root -> x <= 1.5", "row_idx": [0], "split": None, "children": [], "left": None, "right": None},
+                "2": {"id": 2, "depth": 1, "path": "root -> x > 1.5", "row_idx": [1], "split": None, "children": [], "left": None, "right": None},
+            },
+        },
+    }
+
+    restored = restore_tree_state_from_checkpoint(checkpoint, ("data", "risk_flag", 4), df)
+
+    assert restored is True
+    assert st.session_state.tree[0]["split"]["feature"] == "x"
+    assert st.session_state.auto_tree_diagnostics["generalization_version"] == AUTO_TREE_GENERALIZATION_VERSION
+
+
+def test_generalized_split_selection_penalizes_large_validation_gap():
+    balanced_choice = {
+        "candidate": "balanced",
+        "test_gini_after": 0.673,
+        "gini_gap_after": 0.002,
+        "validation_score": 0.673,
+        "raw_score": (0.1,),
+    }
+    leaky_choice = {
+        "candidate": "leaky",
+        "test_gini_after": 0.680,
+        "gini_gap_after": 0.035,
+        "validation_score": 0.680,
+        "raw_score": (0.2,),
+    }
+
+    selected = choose_generalized_split_candidate([balanced_choice, leaky_choice])
+
+    assert selected is balanced_choice
