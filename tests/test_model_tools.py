@@ -48,7 +48,7 @@ def tree_payload() -> dict:
         "format": "interactive_entropy_decision_tree",
         "target": "risk_flag",
         "positive_class": "high_risk",
-        "features": ["income"],
+        "features": ["income", "unused_export_feature"],
         "tree": {
             "node_id": 0,
             "is_leaf": False,
@@ -111,7 +111,7 @@ def tree_payload_with_unseen_category_default() -> dict:
         "format": "interactive_entropy_decision_tree",
         "target": "risk_flag",
         "positive_class": "high_risk",
-        "features": ["collection_status", "segment"],
+        "features": ["collection_status", "segment", "unused_export_feature"],
         "tree": {
             "node_id": 0,
             "is_leaf": False,
@@ -208,6 +208,7 @@ def test_interactive_tree_pickle_scores_unseen_category_with_node_default():
     model = load_model_from_bytes(pickle.dumps(tree_payload_with_unseen_category_default()))
     df = pd.DataFrame([{"collection_status": "monitor", "segment": "D"}])
 
+    assert model_feature_names(model) == ["collection_status", "segment"]
     prediction = predict_model_scores(model, df, positive_class="high_risk")
 
     assert prediction.scores.tolist() == [0.65]

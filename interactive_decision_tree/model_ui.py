@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -40,10 +41,56 @@ def active_model_state(data_key: str) -> dict[str, Any] | None:
 
 
 def selected_model_features(state: dict[str, Any], _fallback_features: list[str]) -> list[str]:
+    model = state.get("model")
+    if model is not None:
+        current_feature_names = model_feature_names(model)
+        if current_feature_names:
+            saved_feature_names = state.get("feature_names")
+            if list(saved_feature_names or []) != current_feature_names:
+                state["feature_names"] = current_feature_names
+                st.session_state.pop(SHAP_RESULT_KEY, None)
+            return current_feature_names
     feature_names = state.get("feature_names")
     if isinstance(feature_names, list) and feature_names:
         return [str(feature) for feature in feature_names]
     return []
+
+
+def what_if_id_columns(df: pd.DataFrame, target: str) -> list[str]:
+    return [str(column) for column in df.columns if str(column) != str(target)]
+
+
+def default_id_column(columns: list[str]) -> str | None:
+    if not columns:
+        return None
+    exact_candidates = {"customer_id", "cust_id", "client_id", "account_id", "application_id", "id"}
+    for column in columns:
+        lowered = column.lower()
+        if lowered in exact_candidates or lowered.endswith("_id"):
+            return column
+    for column in columns:
+        lowered = column.lower()
+        if "id" in lowered or "musteri" in lowered or "customer" in lowered:
+            return column
+    return columns[0]
+
+
+def find_row_position_by_id_value(df: pd.DataFrame, id_column: str, raw_value: Any) -> int | None:
+    if id_column not in df.columns:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    series = df[id_column]
+    mask = series.astype("string").str.strip().eq(text).fillna(False)
+    if not bool(mask.any()):
+        numeric_value = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+        if pd.notna(numeric_value):
+            mask = pd.to_numeric(series, errors="coerce").eq(float(numeric_value)).fillna(False)
+    positions = np.flatnonzero(mask.to_numpy(dtype=bool))
+    if len(positions) == 0:
+        return None
+    return int(positions[0])
 
 
 def render_model_summary(state: dict[str, Any], df: pd.DataFrame, features: list[str]) -> None:
@@ -211,6 +258,10 @@ def render_shap_workspace(
     result = st.session_state.get(SHAP_RESULT_KEY)
     if not isinstance(result, dict):
         return
+    if list(result.get("feature_names", [])) != feature_names:
+        st.session_state.pop(SHAP_RESULT_KEY, None)
+        st.info("Existing SHAP result was cleared because model input columns changed.")
+        return
     importance = shap_global_importance(result)
     st.bar_chart(importance.set_index("feature")["mean_abs_shap"])
     st.dataframe(importance, hide_index=True, width="stretch")
@@ -311,15 +362,50 @@ def render_what_if_workspace(
         st.error(f"Active data is missing model input column(s): {', '.join(missing)}")
         return
 
-    row_position = st.number_input(
-        "Row position",
-        min_value=0,
-        max_value=max(0, len(df) - 1),
-        value=0,
-        step=1,
-        format="%d",
-        key="what_if_row_position",
+    lookup_options = ["ID value", "Row position"]
+    lookup_mode = st.radio(
+        "Customer lookup",
+        options=lookup_options,
+        index=0,
+        horizontal=True,
+        key="what_if_lookup_mode",
     )
+    if "what_if_row_position" not in st.session_state:
+        st.session_state["what_if_row_position"] = 0
+    if lookup_mode == "ID value":
+        id_columns = what_if_id_columns(df, target)
+        if not id_columns:
+            st.warning("No non-target ID column is available. Use row position lookup.")
+            row_position = int(st.session_state.get("what_if_row_position", 0))
+            row_position = min(max(row_position, 0), max(0, len(df) - 1))
+        else:
+            default_column = default_id_column(id_columns)
+            id_column = st.selectbox(
+                "ID column",
+                options=id_columns,
+                index=id_columns.index(default_column) if default_column in id_columns else 0,
+                key="what_if_id_column",
+            )
+            id_value = st.text_input("ID value", key="what_if_id_value")
+            if st.button("Load customer", width="stretch"):
+                resolved_position = find_row_position_by_id_value(df, id_column, id_value)
+                if resolved_position is None:
+                    st.error(f"No row found for {id_column} = {id_value}.")
+                else:
+                    st.session_state["what_if_row_position"] = resolved_position
+                    st.success(f"Loaded row position {resolved_position:,}.")
+            row_position = int(st.session_state.get("what_if_row_position", 0))
+            row_position = min(max(row_position, 0), max(0, len(df) - 1))
+    else:
+        row_position = st.number_input(
+            "Row position",
+            min_value=0,
+            max_value=max(0, len(df) - 1),
+            value=min(int(st.session_state.get("what_if_row_position", 0)), max(0, len(df) - 1)),
+            step=1,
+            format="%d",
+            key="what_if_row_position",
+        )
     actual_target = df.iloc[int(row_position)][target] if target in df.columns else None
     row_cols = st.columns(3)
     row_cols[0].metric("Source row", str(df.index[int(row_position)]))

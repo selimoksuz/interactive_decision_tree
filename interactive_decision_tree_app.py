@@ -3456,6 +3456,9 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "shap_plot_top_features",
         "shap_interaction_main_feature",
         "shap_interaction_color_feature",
+        "what_if_lookup_mode",
+        "what_if_id_column",
+        "what_if_id_value",
         "what_if_row_position",
         "_interactive_tree_woe_active_variable",
     }

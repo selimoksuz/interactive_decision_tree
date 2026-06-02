@@ -36,24 +36,34 @@ def is_tree_payload(payload: Any) -> bool:
 
 
 def tree_payload_feature_names(payload: dict[str, Any]) -> list[str]:
-    features = payload.get("features")
-    if isinstance(features, list) and features:
-        return [str(feature) for feature in features]
     collected: list[str] = []
+
+    def add_feature(raw_feature: Any) -> None:
+        if raw_feature is None:
+            return
+        feature = str(raw_feature)
+        if feature and feature not in collected:
+            collected.append(feature)
 
     def visit(node: dict[str, Any]) -> None:
         split = node.get("split")
-        if isinstance(split, dict) and split.get("feature") is not None:
-            feature = str(split["feature"])
-            if feature not in collected:
-                collected.append(feature)
+        if isinstance(split, dict):
+            add_feature(split.get("feature"))
         for branch in node.get("branches", []) or []:
+            condition = branch.get("condition") if isinstance(branch, dict) else None
+            if isinstance(condition, dict):
+                add_feature(condition.get("feature"))
             child = branch.get("child") if isinstance(branch, dict) else None
             if isinstance(child, dict):
                 visit(child)
 
     visit(payload["tree"])
-    return collected
+    if collected:
+        return collected
+    features = payload.get("features")
+    if isinstance(features, list):
+        return [str(feature) for feature in features]
+    return []
 
 
 def tree_payload_class_labels(payload: dict[str, Any]) -> list[Any]:
@@ -124,6 +134,9 @@ def coerce_loaded_model(model: Any) -> Any:
 
 
 def model_feature_names(model: Any) -> list[str]:
+    payload = getattr(model, "payload", None)
+    if is_tree_payload(payload):
+        return tree_payload_feature_names(payload)
     names = getattr(model, "feature_names_in_", None)
     if names is None and hasattr(model, "named_steps"):
         for step in getattr(model, "named_steps", {}).values():
