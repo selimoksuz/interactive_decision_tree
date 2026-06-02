@@ -688,6 +688,13 @@ def numeric_bin_branch_labels(
     return tuple(labels)
 
 
+def numeric_multiway_branch_count(bin_count: int, missing_policy: str, has_missing: bool) -> int:
+    branch_count = int(bin_count)
+    if has_missing and missing_policy == "separate":
+        branch_count += 1
+    return branch_count
+
+
 def score_binary_numeric_le_candidates(
     feature: str,
     thresholds: list[float],
@@ -1537,6 +1544,8 @@ def candidate_splits_for_feature(
                 if len(bin_thresholds) != bin_count - 1:
                     continue
                 for missing_policy in policies:
+                    if numeric_multiway_branch_count(bin_count, missing_policy, missing_n > 0) > max_numeric_bins:
+                        continue
                     candidate = score_binary_numeric_multiway_candidate(
                         feature=feature,
                         thresholds=bin_thresholds,
@@ -1553,6 +1562,7 @@ def candidate_splits_for_feature(
                     if candidate is not None:
                         candidates.append(candidate)
         else:
+            has_missing = bool(numeric.isna().any())
             for threshold in thresholds:
                 for missing_policy in policies:
                     candidate = score_prepared_numeric_le_split(
@@ -1570,6 +1580,8 @@ def candidate_splits_for_feature(
                         candidates.append(candidate)
             for bin_count in range(3, max_numeric_bins + 1):
                 for missing_policy in policies:
+                    if numeric_multiway_branch_count(bin_count, missing_policy, has_missing) > max_numeric_bins:
+                        continue
                     candidate = score_prepared_numeric_multiway_split(
                         frame=frame,
                         target=target,
@@ -6853,6 +6865,7 @@ def main() -> None:
         value=safe_int(saved_parameters.get("max_numeric_bins"), default=4, minimum=2),
         step=1,
         format="%d",
+        help="Maximum total branch count for numeric multiway candidates. If missing is kept separate, that missing branch counts too.",
     )
     max_categories_input = st.sidebar.number_input(
         "Categorical candidate levels",

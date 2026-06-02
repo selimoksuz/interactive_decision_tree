@@ -470,6 +470,52 @@ def test_candidate_splits_scores_all_numeric_missing_policies():
     assert {"left", "right", "separate"}.issubset(policies)
 
 
+def test_numeric_multiway_max_bins_counts_separate_missing_branch():
+    df = pd.DataFrame(
+        {
+            "x": [float(i) for i in range(1, 81)] + [None] * 10,
+            "risk_flag": (["low", "high"] * 40) + (["low", "high"] * 5),
+        }
+    )
+
+    capped = candidate_splits(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        features=["x"],
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=4,
+        max_category_groups=2,
+        min_leaf=1,
+        parallel_workers=1,
+    )
+    capped_multiway = [candidate for candidate in capped if candidate.split_type == "numeric_bins"]
+
+    assert capped_multiway
+    assert max(candidate.branch_count for candidate in capped_multiway) <= 4
+
+    uncapped = candidate_splits(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        features=["x"],
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=5,
+        max_category_groups=2,
+        min_leaf=1,
+        parallel_workers=1,
+    )
+
+    assert any(
+        candidate.split_type == "numeric_bins"
+        and candidate.missing_policy == "separate"
+        and candidate.branch_count == 5
+        for candidate in uncapped
+    )
+
+
 def test_evaluation_model_metrics_scores_test_dataframe():
     st.session_state.clear()
     train = pd.DataFrame(
