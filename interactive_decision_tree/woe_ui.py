@@ -291,7 +291,7 @@ def run_initial_binning(
                 {
                     "time": datetime.now(timezone.utc).isoformat(),
                     "action": "initial_binning",
-                    "engine_used": spec.get("config", {}).get("engine_used", "fallback"),
+                    "engine_used": spec.get("config", {}).get("engine_used", "unknown"),
                 }
             ],
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -545,17 +545,14 @@ def build_config_from_sidebar(
         index=0,
         key="woe_monotonic_trend",
     )
-    engine = st.selectbox("Binning engine", ["auto", "fallback", "optbinning"], index=0, key="woe_engine")
-    if engine in {"auto", "optbinning"}:
-        status = optbinning_status()
-        version_text = status.get("optbinning_version") or "not installed"
-        sklearn_text = status.get("sklearn_version") or "unknown"
-        if status.get("available"):
-            st.caption(f"optbinning ready: optbinning {version_text}, scikit-learn {sklearn_text}.")
-        elif engine == "optbinning":
-            st.error(f"optbinning cannot run: {status.get('error')}")
-        else:
-            st.caption(f"Auto will use fallback: {status.get('error')}")
+    engine = "optbinning"
+    status = optbinning_status()
+    version_text = status.get("optbinning_version") or "not installed"
+    sklearn_text = status.get("sklearn_version") or "unknown"
+    if status.get("available"):
+        st.caption(f"Binning engine: optbinning {version_text}, scikit-learn {sklearn_text}.")
+    else:
+        st.error(f"optbinning cannot run: {status.get('error')}")
     missing_separate = st.checkbox("Missing as separate bin", value=True, key="woe_missing_separate")
     blank_as_missing = st.checkbox("Blank string as missing", value=True, key="woe_blank_as_missing")
     config = WoeBuildConfig(

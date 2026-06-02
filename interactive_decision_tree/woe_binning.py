@@ -25,7 +25,7 @@ class WoeBuildConfig:
     blank_as_missing: bool = True
     special_values: tuple[str, ...] = ()
     protected_special: bool = True
-    engine: str = "auto"
+    engine: str = "optbinning"
 
 
 def parse_special_values(text: str | None) -> list[str]:
@@ -238,9 +238,7 @@ def optbinning_numeric_splits(
         OptimalBinning = _load_optimal_binning_class()
     except Exception as exc:
         message = str(exc)
-        if config.engine == "optbinning":
-            raise RuntimeError(message) from exc
-        return None, message
+        raise RuntimeError(message) from exc
 
     x = pd.to_numeric(values, errors="coerce")
     valid = x.notna() & y_event.notna()
@@ -272,9 +270,7 @@ def optbinning_numeric_splits(
         ), None
     except Exception as exc:
         message = f"optbinning failed for {feature}: {type(exc).__name__}: {exc}"
-        if config.engine == "optbinning":
-            raise RuntimeError(message) from exc
-        return None, message
+        raise RuntimeError(message) from exc
 
 
 def numeric_bins_from_splits(splits: list[float], start_index: int = 1) -> list[dict[str, Any]]:
@@ -342,6 +338,80 @@ def categorical_bins_from_profile(profile: pd.DataFrame, max_bins: int, start_in
             }
         )
     return bins
+
+
+def categorical_bins_from_groups(groups: list[list[str]], start_index: int = 1) -> list[dict[str, Any]]:
+    bins: list[dict[str, Any]] = []
+    for offset, group in enumerate(groups, start=start_index):
+        clean_group = [str(value) for value in group if str(value) != ""]
+        if not clean_group:
+            continue
+        label = ", ".join(clean_group[:4]) + (" ..." if len(clean_group) > 4 else "")
+        bins.append(
+            {
+                "bin_id": make_bin_id(offset),
+                "kind": "normal",
+                "label": label,
+                "lower": None,
+                "upper": None,
+                "values": clean_group,
+                "assigned_woe": None,
+                "protected": False,
+                "note": "",
+            }
+        )
+    return bins
+
+
+def optbinning_categorical_groups(
+    values: pd.Series,
+    y_event: pd.Series,
+    feature: str,
+    config: WoeBuildConfig,
+) -> tuple[list[list[str]] | None, str | None]:
+    if config.engine not in {"auto", "optbinning"}:
+        return None, None
+    try:
+        OptimalBinning = _load_optimal_binning_class()
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    x = values.astype("string")
+    valid = x.notna() & y_event.notna()
+    valid_values = x[valid]
+    if valid.sum() == 0:
+        return [], None
+    if valid_values.nunique() <= 1:
+        return [[str(value) for value in valid_values.dropna().unique().tolist()]], None
+
+    try:
+        optb = OptimalBinning(
+            name=str(feature),
+            dtype="categorical",
+            max_n_bins=max(2, int(config.max_bins)),
+            min_bin_size=float(config.min_bin_size),
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="'force_all_finite' was renamed to 'ensure_all_finite'.*",
+                category=FutureWarning,
+            )
+            optb.fit(valid_values.to_numpy(), y_event[valid].astype(int).to_numpy())
+        groups: list[list[str]] = []
+        for raw_group in getattr(optb, "splits", []) or []:
+            if isinstance(raw_group, (str, bytes)):
+                group_values = [str(raw_group)]
+            else:
+                group_values = [str(value) for value in list(raw_group)]
+            if group_values:
+                groups.append(group_values)
+        if not groups:
+            groups = [[str(value) for value in valid_values.drop_duplicates().tolist()]]
+        return groups, None
+    except Exception as exc:
+        message = f"optbinning failed for {feature}: {type(exc).__name__}: {exc}"
+        raise RuntimeError(message) from exc
 
 
 def special_bin(values: list[str], protected: bool = True) -> dict[str, Any]:
@@ -478,8 +548,19 @@ def build_initial_spec(
             splits = quantile_splits(normal_frame[feature], config.max_bins, config.min_bin_size)
         bins.extend(numeric_bins_from_splits(splits, start_index=1))
     else:
-        profile = category_event_profile(normal_frame, feature, target, positive_class)
-        bins.extend(categorical_bins_from_profile(profile, config.max_bins, start_index=1))
+        opt_groups, engine_fallback_reason = optbinning_categorical_groups(
+            normal_frame[feature],
+            y_event.loc[normal_frame.index],
+            feature,
+            config,
+        )
+        if opt_groups is not None:
+            engine_used = "optbinning"
+            engine_fallback_reason = None
+            bins.extend(categorical_bins_from_groups(opt_groups, start_index=1))
+        else:
+            profile = category_event_profile(normal_frame, feature, target, positive_class)
+            bins.extend(categorical_bins_from_profile(profile, config.max_bins, start_index=1))
 
     return {
         "schema_version": WOE_SCHEMA_VERSION,
@@ -817,7 +898,7 @@ def evaluate_spec(
         "is_monotonic": bool(monotonicity["is_monotonic"]),
         "monotonic_violation_count": int(monotonicity["violation_count"]),
         "manual_woe_bins": int(table["assigned_woe"].notna().sum()),
-        "engine_used": str(spec.get("config", {}).get("engine_used", "fallback")),
+        "engine_used": str(spec.get("config", {}).get("engine_used", "unknown")),
     }
     return {"table": table, "metrics": metrics}
 

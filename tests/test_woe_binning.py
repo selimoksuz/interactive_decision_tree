@@ -105,16 +105,14 @@ def test_numeric_woe_supports_special_missing_and_manual_woe():
     assert updated_report["metrics"]["manual_woe_bins"] == 1
 
 
-def test_auto_optbinning_records_fallback_reason_when_engine_unavailable(monkeypatch):
+def test_auto_optbinning_raises_when_engine_unavailable(monkeypatch):
     def fail_loader():
         raise RuntimeError("missing optbinning package")
 
     monkeypatch.setattr(woe_binning, "_load_optimal_binning_class", fail_loader)
 
-    spec = build_initial_spec(woe_df(), "target", "age", 1, WoeBuildConfig(engine="auto"))
-
-    assert spec["config"]["engine_used"] == "fallback"
-    assert "missing optbinning package" in spec["config"]["engine_fallback_reason"]
+    with pytest.raises(RuntimeError, match="missing optbinning package"):
+        build_initial_spec(woe_df(), "target", "age", 1, WoeBuildConfig(engine="auto"))
 
 
 def test_forced_optbinning_raises_when_engine_unavailable(monkeypatch):
@@ -142,6 +140,37 @@ def test_forced_optbinning_uses_optbinning_when_available():
 
     assert spec["config"]["engine_used"] == "optbinning"
     assert spec["config"]["engine_fallback_reason"] is None
+
+
+def test_forced_optbinning_groups_categorical_by_event_profile_when_available():
+    pytest.importorskip("optbinning")
+    status = woe_binning.optbinning_status()
+    if not status["available"]:
+        pytest.skip(str(status["error"]))
+
+    df = pd.DataFrame(
+        {
+            "segment": list("AAAAABBBBBCCCCCDDDDDEEEEEFFFFFGGGGGHHHHH"),
+            "target": [
+                0, 0, 0, 0, 1,
+                0, 0, 1, 1, 1,
+                0, 1, 1, 1, 1,
+                0, 0, 0, 1, 1,
+                1, 1, 1, 1, 1,
+                0, 0, 0, 0, 0,
+                1, 1, 0, 0, 1,
+                0, 1, 0, 1, 0,
+            ],
+        }
+    )
+
+    spec = build_initial_spec(df, "target", "segment", 1, WoeBuildConfig(max_bins=4, engine="optbinning"))
+    groups = [bin_spec["values"] for bin_spec in spec["bins"] if bin_spec["kind"] == "normal"]
+
+    assert spec["config"]["engine_used"] == "optbinning"
+    assert len(groups) == 4
+    assert any(set(group) == {"F", "A"} for group in groups)
+    assert any(set(group) == {"C", "E"} for group in groups)
 
 
 def test_apply_numeric_cutpoints_rebuilds_normal_bins():
