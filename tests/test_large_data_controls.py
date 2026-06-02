@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 import streamlit as st
 
 from interactive_decision_tree.session_store import save_dataframe_session
@@ -8,12 +9,14 @@ from interactive_decision_tree_app import (
     DEFAULT_DEMO_ROWS,
     analysis_row_idx,
     apply_feature_manager_edits,
+    build_binary_validation_state,
     build_optimal_tree,
     cached_ranking_ready_message,
     candidate_cache_key,
     get_cached_candidates,
     candidate_splits,
     candidate_validation_stats,
+    candidate_validation_stats_from_state,
     checkpoint_ui_state,
     default_model_feature_selection,
     demo_data_key,
@@ -635,6 +638,69 @@ def test_candidate_validation_stats_blocks_test_gini_drop():
     assert stats is not None
     assert stats["test_gini_delta"] < 0
     assert stats["validation_safe"] is False
+
+
+def test_fast_candidate_validation_matches_prediction_path():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "risk_flag": ["low", "low", "high", "high", "high", "low"],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x": [1.5, 2.5, 3.5, 4.5, 5.5],
+            "risk_flag": ["low", "high", "high", "low", "high"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=3.0,
+        min_leaf=1,
+    )
+    assert candidate is not None
+
+    slow_stats = candidate_validation_stats(
+        train_df=train,
+        test_df=test,
+        target="risk_flag",
+        node_id=0,
+        candidate=candidate,
+        max_gini_gap=0.1,
+    )
+    state = build_binary_validation_state(
+        train,
+        test,
+        "risk_flag",
+        {0: test.index.tolist()},
+    )
+    fast_stats = candidate_validation_stats_from_state(
+        state=state,
+        node_id=0,
+        candidate=candidate,
+        max_gini_gap=0.1,
+    )
+
+    assert fast_stats is not None
+    assert slow_stats is not None
+    for key in [
+        "train_gini_before",
+        "test_gini_before",
+        "train_gini_after",
+        "test_gini_after",
+        "train_gini_delta",
+        "test_gini_delta",
+        "gini_gap_before",
+        "gini_gap_after",
+    ]:
+        assert fast_stats[key] == pytest.approx(slow_stats[key])
+    assert fast_stats["validation_safe"] == slow_stats["validation_safe"]
 
 
 def test_build_optimal_tree_penalizes_but_allows_validation_unsafe_split():

@@ -67,7 +67,7 @@ DEFAULT_DEMO_ROWS = 5_000
 DEFAULT_MAX_VALIDATION_GINI_GAP = 0.10
 VALIDATION_CANDIDATE_LIMIT = 100
 AUTO_TREE_VALIDATION_CANDIDATE_LIMIT = 40
-VALIDATION_GAP_PENALTY_WEIGHT = 0.50
+VALIDATION_GAP_PENALTY_WEIGHT = 0.05
 VALIDATION_TEST_DROP_PENALTY_WEIGHT = 2.00
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
@@ -97,6 +97,19 @@ class SplitCandidate:
     branch_entropies: tuple[float, ...]
     label: str
     missing_policy: str = "right"
+
+
+@dataclass
+class BinaryValidationState:
+    train_df: pd.DataFrame
+    test_df: pd.DataFrame
+    target: str
+    positive_class: Any
+    test_leaf_idx: dict[int, list[Any]]
+    train_leaf_bins: dict[int, tuple[float, int, int]]
+    test_leaf_bins: dict[int, tuple[float, int, int]]
+    train_gini: float | None
+    test_gini: float | None
 
 
 @dataclass(frozen=True)
@@ -641,6 +654,35 @@ def numeric_le_branch_labels(threshold: float, missing_policy: str, has_missing:
     return (left_label, right_label)
 
 
+def numeric_bin_branch_labels(
+    thresholds: list[float],
+    missing_policy: str,
+    has_missing: bool,
+) -> tuple[str, ...]:
+    sorted_thresholds = sorted({float(threshold) for threshold in thresholds})
+    if not sorted_thresholds:
+        return tuple()
+
+    labels: list[str] = []
+    previous_threshold: float | None = None
+    for threshold in sorted_thresholds:
+        if previous_threshold is None:
+            labels.append(f"<= {threshold:.6g}")
+        else:
+            labels.append(f"> {previous_threshold:.6g} and <= {threshold:.6g}")
+        previous_threshold = threshold
+    labels.append(f"> {sorted_thresholds[-1]:.6g}")
+
+    if has_missing:
+        if missing_policy == "left":
+            labels[0] = f"{labels[0]} or missing"
+        elif missing_policy == "separate":
+            labels.append("missing")
+        else:
+            labels[-1] = f"{labels[-1]} or missing"
+    return tuple(labels)
+
+
 def score_binary_numeric_le_candidates(
     feature: str,
     thresholds: list[float],
@@ -723,6 +765,83 @@ def score_binary_numeric_le_candidates(
                 )
             )
     return candidates
+
+
+def score_binary_numeric_multiway_candidate(
+    feature: str,
+    thresholds: list[float],
+    sorted_numeric: np.ndarray,
+    cumulative_events: np.ndarray,
+    total_n: int,
+    total_events: int,
+    missing_n: int,
+    missing_events: int,
+    min_leaf: int,
+    missing_policy: str,
+    parent_impurity: float,
+) -> SplitCandidate | None:
+    if not thresholds:
+        return None
+    non_missing_n = int(len(sorted_numeric))
+    if non_missing_n <= 1:
+        return None
+
+    boundaries = [
+        int(np.searchsorted(sorted_numeric, float(threshold), side="right"))
+        for threshold in thresholds
+    ]
+    if any(right <= left for left, right in zip([0, *boundaries[:-1]], boundaries)):
+        return None
+
+    branch_counts: list[int] = []
+    branch_events: list[int] = []
+    previous = 0
+    for boundary in [*boundaries, non_missing_n]:
+        count = int(boundary - previous)
+        events = 0 if count <= 0 else int(cumulative_events[boundary - 1]) - (
+            int(cumulative_events[previous - 1]) if previous > 0 else 0
+        )
+        branch_counts.append(count)
+        branch_events.append(events)
+        previous = boundary
+
+    has_missing = missing_n > 0
+    if has_missing:
+        if missing_policy == "left":
+            branch_counts[0] += missing_n
+            branch_events[0] += missing_events
+        elif missing_policy == "separate":
+            branch_counts.append(missing_n)
+            branch_events.append(missing_events)
+        else:
+            branch_counts[-1] += missing_n
+            branch_events[-1] += missing_events
+
+    if any(count < min_leaf for count in branch_counts) or sum(branch_counts) != total_n:
+        return None
+
+    branch_entropies = [
+        binary_entropy_from_counts(event_count, count)
+        for event_count, count in zip(branch_events, branch_counts)
+    ]
+    weighted_entropy = sum(
+        (count / total_n) * impurity
+        for count, impurity in zip(branch_counts, branch_entropies)
+    )
+    return SplitCandidate(
+        feature=feature,
+        split_type="numeric_bins",
+        value=tuple(float(threshold) for threshold in thresholds),
+        parent_entropy=parent_impurity,
+        weighted_entropy=float(weighted_entropy),
+        information_gain=float(parent_impurity - weighted_entropy),
+        branch_count=len(branch_counts),
+        branch_labels=numeric_bin_branch_labels(thresholds, missing_policy, has_missing),
+        branch_ns=tuple(int(count) for count in branch_counts),
+        branch_entropies=tuple(float(value) for value in branch_entropies),
+        label=numeric_split_label(feature, thresholds, missing_policy, has_missing=has_missing),
+        missing_policy=missing_policy,
+    )
 
 
 def score_split(
@@ -1378,6 +1497,21 @@ def candidate_splits_for_feature(
         numeric = pd.to_numeric(s, errors="coerce")
         thresholds = numeric_thresholds(s, max_thresholds)
         if target_kind == "binary" and positive_class is not None:
+            numeric_values = numeric.to_numpy(dtype=float)
+            event_values = (frame[target] == positive_class).to_numpy(dtype=np.int8)
+            valid_numeric = ~np.isnan(numeric_values)
+            valid_numeric_values = numeric_values[valid_numeric]
+            valid_event_values = event_values[valid_numeric]
+            sorted_order = np.argsort(valid_numeric_values, kind="mergesort")
+            sorted_numeric = valid_numeric_values[sorted_order]
+            sorted_events = valid_event_values[sorted_order]
+            cumulative_events = np.cumsum(sorted_events, dtype=np.int64)
+            total_n = int(len(numeric_values))
+            total_events = int(event_values.sum())
+            non_missing_n = int(len(sorted_numeric))
+            missing_n = int(total_n - non_missing_n)
+            missing_events = int(total_events - int(cumulative_events[-1])) if non_missing_n else total_events
+            unique_non_missing = int(len(np.unique(sorted_numeric))) if non_missing_n else 0
             candidates.extend(
                 score_binary_numeric_le_candidates(
                     feature=feature,
@@ -1390,6 +1524,29 @@ def candidate_splits_for_feature(
                     parent_impurity=parent_impurity,
                 )
             )
+            for bin_count in range(3, max_numeric_bins + 1):
+                if unique_non_missing < bin_count:
+                    continue
+                quantile_positions = np.linspace(0, 1, bin_count + 1)[1:-1]
+                bin_thresholds = sorted({float(x) for x in np.quantile(sorted_numeric, quantile_positions)})
+                if len(bin_thresholds) != bin_count - 1:
+                    continue
+                for missing_policy in policies:
+                    candidate = score_binary_numeric_multiway_candidate(
+                        feature=feature,
+                        thresholds=bin_thresholds,
+                        sorted_numeric=sorted_numeric,
+                        cumulative_events=cumulative_events,
+                        total_n=total_n,
+                        total_events=total_events,
+                        missing_n=missing_n,
+                        missing_events=missing_events,
+                        min_leaf=min_leaf,
+                        missing_policy=missing_policy,
+                        parent_impurity=parent_impurity,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
         else:
             for threshold in thresholds:
                 for missing_policy in policies:
@@ -1406,21 +1563,21 @@ def candidate_splits_for_feature(
                     )
                     if candidate is not None:
                         candidates.append(candidate)
-        for bin_count in range(3, max_numeric_bins + 1):
-            for missing_policy in policies:
-                candidate = score_prepared_numeric_multiway_split(
-                    frame=frame,
-                    target=target,
-                    feature=feature,
-                    numeric=numeric,
-                    bin_count=bin_count,
-                    min_leaf=min_leaf,
-                    target_kind=target_kind,
-                    missing_policy=missing_policy,
-                    parent_impurity=parent_impurity,
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
+            for bin_count in range(3, max_numeric_bins + 1):
+                for missing_policy in policies:
+                    candidate = score_prepared_numeric_multiway_split(
+                        frame=frame,
+                        target=target,
+                        feature=feature,
+                        numeric=numeric,
+                        bin_count=bin_count,
+                        min_leaf=min_leaf,
+                        target_kind=target_kind,
+                        missing_policy=missing_policy,
+                        parent_impurity=parent_impurity,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
     else:
         values = (
             s.astype("object")
@@ -2104,6 +2261,19 @@ def build_optimal_tree(
     action_node_ids: list[int] = []
     validation_enabled = test_df is not None and infer_target_kind(df[target]) == "binary"
     candidate_cache: dict[int, list[SplitCandidate]] = {}
+    validation_test_leaf_idx: dict[int, list[Any]] | None = None
+    if validation_enabled and test_df is not None:
+        root_only = (
+            len(st.session_state.get("tree", {})) == 1
+            and 0 in st.session_state.tree
+            and st.session_state.tree[0].get("split") is None
+        )
+        if root_only:
+            validation_test_leaf_idx = {0: test_df.index.tolist()}
+        else:
+            validation_test_leaf_idx = test_leaf_indices_from_predictions(
+                tree_predictions_for_dataframe(df, test_df, target)
+            )
 
     def cached_leaf_candidates(leaf: dict[str, Any]) -> list[SplitCandidate]:
         leaf_id = int(leaf["id"])
@@ -2180,27 +2350,29 @@ def build_optimal_tree(
         if not eligible_candidates:
             st.session_state.auto_tree_diagnostics["stop_reason"] = "no_eligible_candidate"
         elif validation_enabled and test_df is not None:
-            baseline_train_predictions = tree_predictions_for_dataframe(df, df, target)
-            baseline_test_predictions = tree_predictions_for_dataframe(df, test_df, target)
-            baseline_train_gini = binary_gini_from_predictions(df, df, target, baseline_train_predictions)
-            baseline_test_gini = binary_gini_from_predictions(df, test_df, target, baseline_test_predictions)
+            if validation_test_leaf_idx is None:
+                validation_test_leaf_idx = test_leaf_indices_from_predictions(
+                    tree_predictions_for_dataframe(df, test_df, target)
+                )
+            validation_state = build_binary_validation_state(
+                df,
+                test_df,
+                target,
+                validation_test_leaf_idx,
+            )
             baseline_validation_score = validation_tree_objective_score(
-                baseline_test_gini,
-                gini_gap(baseline_train_gini, baseline_test_gini),
+                validation_state.test_gini,
+                gini_gap(validation_state.train_gini, validation_state.test_gini),
                 max_validation_gini_gap,
             )
             best_validation_score = -np.inf
             ordered_eligible = sorted(eligible_candidates, key=lambda item: item[0], reverse=True)
             for raw_score, node_id, candidate in ordered_eligible[:AUTO_TREE_VALIDATION_CANDIDATE_LIMIT]:
-                stats = candidate_validation_stats(
-                    train_df=df,
-                    test_df=test_df,
-                    target=target,
+                stats = candidate_validation_stats_from_state(
+                    state=validation_state,
                     node_id=node_id,
                     candidate=candidate,
                     max_gini_gap=max_validation_gini_gap,
-                    baseline_train_predictions=baseline_train_predictions,
-                    baseline_test_predictions=baseline_test_predictions,
                 )
                 st.session_state.auto_tree_diagnostics["validated_candidate_count"] += 1
                 if not stats:
@@ -2208,8 +2380,8 @@ def build_optimal_tree(
 
                 candidate_validation_score = validation_adjusted_gini_score(stats)
                 candidate_score = (
-                    candidate_validation_score,
                     numeric_sort_value(stats.get("test_gini_after"), -np.inf),
+                    candidate_validation_score,
                     -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
                     numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
                     *raw_score,
@@ -2237,7 +2409,22 @@ def build_optimal_tree(
             break
 
         st.session_state.auto_tree_diagnostics["stop_reason"] = None
+        child_test_branches: list[tuple[str, list[int]]] | None = None
+        child_test_ids: list[int] | None = None
+        if validation_enabled and test_df is not None and validation_test_leaf_idx is not None:
+            child_test_ids = list(
+                range(st.session_state.next_node_id, st.session_state.next_node_id + best_candidate.branch_count)
+            )
+            child_test_branches = split_branch_indices(
+                test_df,
+                validation_test_leaf_idx.get(best_node_id, []),
+                best_candidate,
+            )
         split_node(df, best_node_id, best_candidate, select_first_child=False, record_action=False)
+        if child_test_ids is not None and child_test_branches is not None and validation_test_leaf_idx is not None:
+            validation_test_leaf_idx.pop(best_node_id, None)
+            for child_id, (_, child_idx) in zip(child_test_ids, child_test_branches):
+                validation_test_leaf_idx[int(child_id)] = child_idx
         action_node_ids.append(best_node_id)
         split_count += 1
 
@@ -4487,8 +4674,8 @@ def ordered_features_by_gain(features: list[str], feature_stats: dict[str, dict[
         return sorted(
             eligible,
             key=lambda feature: (
-                numeric_sort_value(feature_stats.get(feature, {}).get("validation_score"), -np.inf),
                 numeric_sort_value(feature_stats.get(feature, {}).get("test_gini_after"), -np.inf),
+                numeric_sort_value(feature_stats.get(feature, {}).get("validation_score"), -np.inf),
                 -numeric_sort_value(feature_stats.get(feature, {}).get("gini_gap_after"), np.inf),
                 numeric_sort_value(feature_stats.get(feature, {}).get("test_gini_delta"), -np.inf),
                 feature_stats.get(feature, {}).get("best_information_gain", 0.0),
@@ -5049,6 +5236,38 @@ def binary_auc(y_true: pd.Series, scores: pd.Series) -> float | None:
     return float((pos_ranks.sum() - positives * (positives + 1) / 2) / (positives * negatives))
 
 
+def binary_auc_from_score_bins(score_bins: list[tuple[float, int, int]]) -> float | None:
+    compact: dict[float, list[int]] = {}
+    for score, positives, negatives in score_bins:
+        if not np.isfinite(score):
+            continue
+        pos = int(positives)
+        neg = int(negatives)
+        if pos <= 0 and neg <= 0:
+            continue
+        bucket = compact.setdefault(float(score), [0, 0])
+        bucket[0] += max(0, pos)
+        bucket[1] += max(0, neg)
+
+    total_pos = sum(pos for pos, _ in compact.values())
+    total_neg = sum(neg for _, neg in compact.values())
+    if total_pos <= 0 or total_neg <= 0:
+        return None
+
+    cumulative_neg = 0
+    concordant = 0.0
+    for score in sorted(compact):
+        pos, neg = compact[score]
+        concordant += pos * (cumulative_neg + 0.5 * neg)
+        cumulative_neg += neg
+    return float(concordant / (total_pos * total_neg))
+
+
+def binary_gini_from_score_bins(score_bins: list[tuple[float, int, int]]) -> float | None:
+    auc = binary_auc_from_score_bins(score_bins)
+    return None if auc is None else float(2 * auc - 1)
+
+
 def tree_predictions(df: pd.DataFrame, target: str) -> pd.DataFrame:
     target_kind = infer_target_kind(df[target])
     positive_class = choose_positive_class(df[target]) if target_kind == "binary" else None
@@ -5241,6 +5460,237 @@ def binary_gini_from_predictions(
     return None if auc is None else float(2 * auc - 1)
 
 
+def positive_negative_counts(
+    df: pd.DataFrame,
+    target: str,
+    row_idx: list[Any],
+    positive_class: Any,
+) -> tuple[int, int]:
+    if not row_idx:
+        return 0, 0
+    y = df.loc[row_idx, target]
+    valid = y.notna()
+    positives = int((y[valid] == positive_class).sum())
+    negatives = int(valid.sum()) - positives
+    return positives, negatives
+
+
+def positive_rate_for_rows(
+    df: pd.DataFrame,
+    target: str,
+    row_idx: list[Any],
+    positive_class: Any,
+) -> float:
+    if not row_idx:
+        return np.nan
+    y = df.loc[row_idx, target]
+    return float((y == positive_class).mean())
+
+
+def score_bin_for_rows(
+    df: pd.DataFrame,
+    target: str,
+    row_idx: list[Any],
+    positive_class: Any,
+    score: float,
+) -> tuple[float, int, int]:
+    positives, negatives = positive_negative_counts(df, target, row_idx, positive_class)
+    return float(score), positives, negatives
+
+
+def split_branch_bins_and_indices(
+    df: pd.DataFrame,
+    row_idx: list[Any],
+    candidate: SplitCandidate,
+    target: str,
+    positive_class: Any,
+    score_values: list[float] | None = None,
+) -> list[tuple[str, list[Any], tuple[float, int, int]]]:
+    if not row_idx:
+        return [
+            (
+                label,
+                [],
+                (float(score_values[i]) if score_values and i < len(score_values) else np.nan, 0, 0),
+            )
+            for i, label in enumerate(candidate.branch_labels)
+        ]
+
+    frame = df.loc[row_idx, [candidate.feature, target]]
+    if candidate.split_type == "numeric_le":
+        numeric = pd.to_numeric(frame[candidate.feature], errors="coerce")
+        masks_and_labels = numeric_masks_and_labels(numeric, [float(candidate.value)], candidate.missing_policy)
+    elif candidate.split_type == "category_eq":
+        values = frame[candidate.feature].astype("object").where(frame[candidate.feature].notna(), "__MISSING__")
+        masks_and_labels = [
+            (values == candidate.value, candidate.branch_labels[0]),
+            (values != candidate.value, candidate.branch_labels[1]),
+        ]
+    elif candidate.split_type in ("numeric_bins", "numeric_manual_bins"):
+        numeric = pd.to_numeric(frame[candidate.feature], errors="coerce")
+        masks_and_labels = numeric_masks_and_labels(numeric, list(candidate.value), candidate.missing_policy)
+    elif candidate.split_type == "category_multi":
+        values = frame[candidate.feature].astype("object").where(frame[candidate.feature].notna(), "__MISSING__")
+        kept_values = list(candidate.value)
+        masks_and_labels = [
+            (values == value, candidate.branch_labels[i])
+            for i, value in enumerate(kept_values)
+        ]
+        if len(candidate.branch_labels) > len(kept_values):
+            masks_and_labels.append((~values.isin(kept_values), candidate.branch_labels[-1]))
+    elif candidate.split_type == "category_group":
+        values = frame[candidate.feature].astype("object").where(frame[candidate.feature].notna(), "__MISSING__")
+        selected = set(candidate.value)
+        masks_and_labels = [
+            (values.isin(selected), candidate.branch_labels[0]),
+            (~values.isin(selected), candidate.branch_labels[1]),
+        ]
+    elif candidate.split_type in ("category_profile_groups", "category_manual_groups"):
+        values = frame[candidate.feature].astype("object").where(frame[candidate.feature].notna(), "__MISSING__")
+        masks_and_labels = [
+            (values.isin(set(group)), label)
+            for label, group in zip(candidate.branch_labels, candidate.value)
+        ]
+    else:
+        raise ValueError(f"Unknown split_type: {candidate.split_type}")
+
+    out: list[tuple[str, list[Any], tuple[float, int, int]]] = []
+    for i, (mask, fallback_label) in enumerate(masks_and_labels):
+        label = candidate.branch_labels[i] if i < len(candidate.branch_labels) else fallback_label
+        child_idx = frame.index[mask].tolist()
+        y = frame.loc[mask, target]
+        valid = y.notna()
+        positives = int((y[valid] == positive_class).sum())
+        negatives = int(valid.sum()) - positives
+        score = (
+            float(score_values[i])
+            if score_values is not None and i < len(score_values)
+            else float((y == positive_class).mean()) if len(y) else np.nan
+        )
+        out.append((label, child_idx, (score, positives, negatives)))
+    return out
+
+
+def test_leaf_indices_from_predictions(predictions: pd.DataFrame) -> dict[int, list[Any]]:
+    out: dict[int, list[Any]] = {}
+    if "leaf_id" not in predictions.columns:
+        return out
+    for leaf_id, group in predictions[predictions["leaf_id"].notna()].groupby("leaf_id", sort=False):
+        try:
+            out[int(leaf_id)] = group.index.tolist()
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def build_binary_validation_state(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target: str,
+    test_leaf_idx: dict[int, list[Any]],
+) -> BinaryValidationState:
+    positive_class = choose_positive_class(train_df[target])
+    train_leaf_bins: dict[int, tuple[float, int, int]] = {}
+    test_leaf_bins: dict[int, tuple[float, int, int]] = {}
+    for leaf in current_leaves():
+        leaf_id = int(leaf["id"])
+        train_idx = leaf.get("row_idx") or []
+        score = positive_rate_for_rows(train_df, target, train_idx, positive_class)
+        train_leaf_bins[leaf_id] = score_bin_for_rows(train_df, target, train_idx, positive_class, score)
+        test_leaf_bins[leaf_id] = score_bin_for_rows(
+            test_df,
+            target,
+            test_leaf_idx.get(leaf_id, []),
+            positive_class,
+            score,
+        )
+
+    return BinaryValidationState(
+        train_df=train_df,
+        test_df=test_df,
+        target=target,
+        positive_class=positive_class,
+        test_leaf_idx=test_leaf_idx,
+        train_leaf_bins=train_leaf_bins,
+        test_leaf_bins=test_leaf_bins,
+        train_gini=binary_gini_from_score_bins(list(train_leaf_bins.values())),
+        test_gini=binary_gini_from_score_bins(list(test_leaf_bins.values())),
+    )
+
+
+def candidate_validation_stats_from_state(
+    state: BinaryValidationState,
+    node_id: int,
+    candidate: SplitCandidate,
+    max_gini_gap: float,
+) -> dict[str, Any] | None:
+    if node_id not in st.session_state.tree:
+        return None
+
+    train_node_idx = st.session_state.tree[node_id].get("row_idx") or []
+    test_node_idx = state.test_leaf_idx.get(node_id, [])
+    train_branches = split_branch_bins_and_indices(
+        state.train_df,
+        train_node_idx,
+        candidate,
+        state.target,
+        state.positive_class,
+    )
+    train_scores = [score_bin[0] for _, _, score_bin in train_branches]
+    test_branches = split_branch_bins_and_indices(
+        state.test_df,
+        test_node_idx,
+        candidate,
+        state.target,
+        state.positive_class,
+        score_values=train_scores,
+    )
+
+    child_train_bins: list[tuple[float, int, int]] = []
+    child_test_bins: list[tuple[float, int, int]] = []
+    for (_, _, train_score_bin), (_, _, test_score_bin) in zip(train_branches, test_branches):
+        child_train_bins.append(train_score_bin)
+        child_test_bins.append(test_score_bin)
+
+    train_after_bins = [
+        score_bin for leaf_id, score_bin in state.train_leaf_bins.items() if leaf_id != node_id
+    ] + child_train_bins
+    test_after_bins = [
+        score_bin for leaf_id, score_bin in state.test_leaf_bins.items() if leaf_id != node_id
+    ] + child_test_bins
+
+    train_gini_before = state.train_gini
+    test_gini_before = state.test_gini
+    train_gini_after = binary_gini_from_score_bins(train_after_bins)
+    test_gini_after = binary_gini_from_score_bins(test_after_bins)
+    gap_before = gini_gap(train_gini_before, test_gini_before)
+    gap_after = gini_gap(train_gini_after, test_gini_after)
+    test_delta = None if test_gini_before is None or test_gini_after is None else test_gini_after - test_gini_before
+    train_delta = None if train_gini_before is None or train_gini_after is None else train_gini_after - train_gini_before
+
+    if gap_after is None or test_delta is None:
+        validation_safe = True
+    else:
+        allowed_gap = max(float(max_gini_gap), float(gap_before or 0.0))
+        validation_safe = (
+            test_delta >= -MIN_INFORMATION_GAIN_EPSILON
+            and gap_after <= allowed_gap + MIN_INFORMATION_GAIN_EPSILON
+        )
+
+    return {
+        "train_gini_before": train_gini_before,
+        "test_gini_before": test_gini_before,
+        "train_gini_after": train_gini_after,
+        "test_gini_after": test_gini_after,
+        "train_gini_delta": train_delta,
+        "test_gini_delta": test_delta,
+        "gini_gap_before": gap_before,
+        "gini_gap_after": gap_after,
+        "max_gini_gap": max_gini_gap,
+        "validation_safe": bool(validation_safe),
+    }
+
+
 def tree_predictions_with_candidate(
     train_df: pd.DataFrame,
     eval_df: pd.DataFrame,
@@ -5411,8 +5861,8 @@ def candidate_validation_sort_key(
             candidate.information_gain,
         )
     return (
-        validation_adjusted_gini_score(stats),
         numeric_sort_value(stats.get("test_gini_after"), -np.inf),
+        validation_adjusted_gini_score(stats),
         -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
         numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
         candidate.information_gain,
