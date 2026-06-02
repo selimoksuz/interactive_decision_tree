@@ -59,6 +59,7 @@ def render_model_summary(state: dict[str, Any], df: pd.DataFrame, features: list
                 {"setting": "decision_function", "value": bool(capabilities.get("decision_function"))},
                 {"setting": "predict", "value": bool(capabilities.get("predict"))},
                 {"setting": "positive_class", "value": str(state.get("positive_class"))},
+                {"setting": "artifact_type", "value": str(state.get("artifact_type") or "pipeline")},
             ]
         ),
         hide_index=True,
@@ -78,7 +79,7 @@ def render_model_setup_workspace(
 ) -> None:
     st.subheader("Pipeline model")
     st.warning("Pickle/joblib files execute Python object loading. Use only trusted local model artifacts.")
-    uploaded = st.file_uploader("Model pickle/joblib", type=["pkl", "pickle", "joblib"])
+    uploaded = st.file_uploader("Model or interactive tree pickle/joblib", type=["pkl", "pickle", "joblib"])
     if st.button("Load model pipeline", width="stretch", type="primary", disabled=uploaded is None):
         try:
             model = load_model_from_bytes(uploaded.getvalue())
@@ -102,6 +103,7 @@ def render_model_setup_workspace(
                 "positive_index": prediction.positive_index,
                 "score_output": prediction.output_name,
                 "capabilities": model_capabilities(model),
+                "artifact_type": getattr(model, "artifact_type_", "pipeline"),
             }
             st.session_state.pop(SHAP_RESULT_KEY, None)
             st.success("Model pipeline loaded.")

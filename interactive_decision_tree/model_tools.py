@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .scoring import score_tree_payload
+
 
 @dataclass(frozen=True)
 class ModelPrediction:
@@ -20,9 +22,105 @@ def load_model_from_bytes(payload: bytes) -> Any:
     try:
         import joblib
 
-        return joblib.load(io.BytesIO(payload))
+        return coerce_loaded_model(joblib.load(io.BytesIO(payload)))
     except Exception:
-        return pickle.loads(payload)
+        return coerce_loaded_model(pickle.loads(payload))
+
+
+def is_tree_payload(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("format") == "interactive_entropy_decision_tree"
+        and isinstance(payload.get("tree"), dict)
+    )
+
+
+def tree_payload_feature_names(payload: dict[str, Any]) -> list[str]:
+    features = payload.get("features")
+    if isinstance(features, list) and features:
+        return [str(feature) for feature in features]
+    collected: list[str] = []
+
+    def visit(node: dict[str, Any]) -> None:
+        split = node.get("split")
+        if isinstance(split, dict) and split.get("feature") is not None:
+            feature = str(split["feature"])
+            if feature not in collected:
+                collected.append(feature)
+        for branch in node.get("branches", []) or []:
+            child = branch.get("child") if isinstance(branch, dict) else None
+            if isinstance(child, dict):
+                visit(child)
+
+    visit(payload["tree"])
+    return collected
+
+
+def tree_payload_class_labels(payload: dict[str, Any]) -> list[Any]:
+    labels: list[Any] = []
+
+    def add(label: Any) -> None:
+        if label is None:
+            return
+        if not any(str(existing) == str(label) for existing in labels):
+            labels.append(label)
+
+    def visit(node: dict[str, Any]) -> None:
+        summary = node.get("target_summary") if isinstance(node.get("target_summary"), dict) else {}
+        for item in summary.get("class_distribution", []) or []:
+            if isinstance(item, dict):
+                add(item.get("value"))
+        leaf = node.get("leaf") if isinstance(node.get("leaf"), dict) else {}
+        add(leaf.get("prediction", summary.get("prediction")))
+        for branch in node.get("branches", []) or []:
+            child = branch.get("child") if isinstance(branch, dict) else None
+            if isinstance(child, dict):
+                visit(child)
+
+    visit(payload["tree"])
+    positive_class = payload.get("positive_class")
+    add(positive_class)
+    if positive_class is not None and len(labels) > 1:
+        non_positive = [label for label in labels if str(label) != str(positive_class)]
+        labels = non_positive + [positive_class]
+    return labels
+
+
+class TreePayloadModel:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.feature_names_in_ = np.asarray(tree_payload_feature_names(payload), dtype=object)
+        self.classes_ = np.asarray(tree_payload_class_labels(payload), dtype=object)
+        self.artifact_type_ = "interactive_tree"
+
+    def _score_frame(self, frame: pd.DataFrame) -> list[dict[str, Any]]:
+        return [score_tree_payload(self.payload, row) for _, row in frame.iterrows()]
+
+    def predict(self, frame: pd.DataFrame) -> np.ndarray:
+        return np.asarray([result.get("prediction") for result in self._score_frame(frame)], dtype=object)
+
+    def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
+        if len(self.classes_) == 0:
+            raise ValueError("Tree artifact does not contain class labels for predict_proba.")
+        rows: list[list[float]] = []
+        positive_class = self.payload.get("positive_class")
+        for result in self._score_frame(frame):
+            probabilities = result.get("class_probabilities") or {}
+            row = [float(probabilities.get(str(label), probabilities.get(label, 0.0)) or 0.0) for label in self.classes_]
+            if not any(row) and len(self.classes_) == 2 and result.get("positive_class_probability") is not None:
+                positive_index = choose_positive_index(list(self.classes_), positive_class)
+                positive_probability = float(result["positive_class_probability"])
+                if positive_index is not None:
+                    row[int(positive_index)] = positive_probability
+                    row[1 - int(positive_index)] = 1.0 - positive_probability
+            rows.append(row)
+        return np.asarray(rows, dtype=float)
+
+
+def coerce_loaded_model(model: Any) -> Any:
+    if is_tree_payload(model):
+        return TreePayloadModel(model)
+    return model
 
 
 def model_feature_names(model: Any) -> list[str]:

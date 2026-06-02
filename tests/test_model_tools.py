@@ -41,6 +41,69 @@ def raw_pipeline() -> tuple[Pipeline, pd.DataFrame]:
     return model, df
 
 
+def tree_payload() -> dict:
+    return {
+        "format": "interactive_entropy_decision_tree",
+        "target": "risk_flag",
+        "positive_class": "high_risk",
+        "features": ["income"],
+        "tree": {
+            "node_id": 0,
+            "is_leaf": False,
+            "target_summary": {
+                "prediction": "low_risk",
+                "positive_class": "high_risk",
+                "default_rate": 0.5,
+                "class_distribution": [
+                    {"value": "high_risk", "count": 2},
+                    {"value": "low_risk", "count": 2},
+                ],
+            },
+            "split": {"label": "income <= 42000"},
+            "branches": [
+                {
+                    "label": "<= 42000",
+                    "condition": {"feature": "income", "operator": "<=", "threshold": 42000},
+                    "child": {
+                        "node_id": 1,
+                        "is_leaf": True,
+                        "leaf": {"prediction": "high_risk"},
+                        "target_summary": {
+                            "prediction": "high_risk",
+                            "positive_class": "high_risk",
+                            "default_rate": 0.8,
+                            "class_distribution": [
+                                {"value": "high_risk", "count": 8},
+                                {"value": "low_risk", "count": 2},
+                            ],
+                        },
+                        "branches": [],
+                    },
+                },
+                {
+                    "label": "> 42000",
+                    "condition": {"feature": "income", "operator": ">", "threshold": 42000, "includes_missing": True},
+                    "child": {
+                        "node_id": 2,
+                        "is_leaf": True,
+                        "leaf": {"prediction": "low_risk"},
+                        "target_summary": {
+                            "prediction": "low_risk",
+                            "positive_class": "high_risk",
+                            "default_rate": 0.2,
+                            "class_distribution": [
+                                {"value": "high_risk", "count": 2},
+                                {"value": "low_risk", "count": 8},
+                            ],
+                        },
+                        "branches": [],
+                    },
+                },
+            ],
+        },
+    }
+
+
 def test_loaded_raw_pipeline_predicts_with_feature_alignment():
     model, df = raw_pipeline()
     loaded = load_model_from_bytes(pickle.dumps(model))
@@ -57,6 +120,22 @@ def test_loaded_raw_pipeline_predicts_with_feature_alignment():
     assert prediction.output_name == "predict_proba"
     assert prediction.scores.shape == (3,)
     assert set(alignment["status"]) == {"available", "unused_extra"}
+
+
+def test_interactive_tree_pickle_loads_as_raw_feature_model_adapter():
+    model = load_model_from_bytes(pickle.dumps(tree_payload()))
+    df = pd.DataFrame({"income": [30_000, 50_000]})
+
+    assert model_feature_names(model) == ["income"]
+    assert model_class_labels(model) == ["low_risk", "high_risk"]
+    assert model_capabilities(model)["predict_proba"] is True
+
+    prediction = predict_model_scores(model, df, positive_class="high_risk")
+
+    assert prediction.output_name == "predict_proba"
+    assert prediction.positive_index == 1
+    assert prediction.scores.tolist() == [0.8, 0.2]
+    assert model.predict(df).tolist() == ["high_risk", "low_risk"]
 
 
 def test_kernel_shap_contributions_are_real_shap_values():
