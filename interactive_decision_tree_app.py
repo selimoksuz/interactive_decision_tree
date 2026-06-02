@@ -64,10 +64,13 @@ CHECKPOINT_EMBED_MAX_ROWS = 50_000
 CPU_COUNT = max(1, os.cpu_count() or 1)
 DEFAULT_PARALLEL_WORKERS = max(1, min(8, CPU_COUNT))
 DEFAULT_DEMO_ROWS = 5_000
-DEFAULT_MAX_VALIDATION_GINI_GAP = 0.10
+AUTO_GENERALIZATION_GINI_GAP_TARGET = 0.01
+AUTO_GENERALIZATION_TEST_GINI_TOLERANCE = 0.01
+DEFAULT_MAX_VALIDATION_GINI_GAP = AUTO_GENERALIZATION_GINI_GAP_TARGET
 VALIDATION_CANDIDATE_LIMIT = 100
 AUTO_TREE_VALIDATION_CANDIDATE_LIMIT = 40
 VALIDATION_GAP_PENALTY_WEIGHT = 0.05
+AUTO_GENERALIZATION_SPLIT_GAP_PENALTY_WEIGHT = 0.40
 VALIDATION_TEST_DROP_PENALTY_WEIGHT = 2.00
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
@@ -2239,7 +2242,7 @@ def build_optimal_tree(
     min_information_gain: float,
     candidate_rows: int,
     parallel_workers: int,
-    max_validation_gini_gap: float,
+    max_validation_gini_gap: float = AUTO_GENERALIZATION_GINI_GAP_TARGET,
     reset_tree: bool = True,
 ) -> int:
     if reset_tree or not st.session_state.get("tree"):
@@ -2261,6 +2264,7 @@ def build_optimal_tree(
     action_node_ids: list[int] = []
     validation_enabled = test_df is not None and infer_target_kind(df[target]) == "binary"
     candidate_cache: dict[int, list[SplitCandidate]] = {}
+    validation_snapshots: list[dict[str, Any]] = []
     validation_test_leaf_idx: dict[int, list[Any]] | None = None
     if validation_enabled and test_df is not None:
         root_only = (
@@ -2365,7 +2369,7 @@ def build_optimal_tree(
                 gini_gap(validation_state.train_gini, validation_state.test_gini),
                 max_validation_gini_gap,
             )
-            best_validation_score = -np.inf
+            validated_choices: list[dict[str, Any]] = []
             ordered_eligible = sorted(eligible_candidates, key=lambda item: item[0], reverse=True)
             for raw_score, node_id, candidate in ordered_eligible[:AUTO_TREE_VALIDATION_CANDIDATE_LIMIT]:
                 stats = candidate_validation_stats_from_state(
@@ -2379,21 +2383,34 @@ def build_optimal_tree(
                     continue
 
                 candidate_validation_score = validation_adjusted_gini_score(stats)
-                candidate_score = (
-                    numeric_sort_value(stats.get("test_gini_after"), -np.inf),
-                    candidate_validation_score,
-                    -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
-                    numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
-                    *raw_score,
+                validated_choices.append(
+                    {
+                        "node_id": node_id,
+                        "candidate": candidate,
+                        "raw_score": raw_score,
+                        "validation_score": candidate_validation_score,
+                        "test_gini_after": stats.get("test_gini_after"),
+                        "gini_gap_after": stats.get("gini_gap_after"),
+                        "test_gini_delta": stats.get("test_gini_delta"),
+                    }
                 )
-                if best_score is None or candidate_score > best_score:
-                    best_score = candidate_score
-                    best_validation_score = candidate_validation_score
-                    best_candidate = candidate
-                    best_node_id = node_id
-            if best_node_id is None:
+            selected_choice = choose_generalized_split_candidate(
+                validated_choices,
+                gap_target=max_validation_gini_gap,
+            )
+            if selected_choice is not None:
+                best_candidate = selected_choice.get("candidate")
+                best_node_id = selected_choice.get("node_id")
+                best_score = (
+                    numeric_sort_value(selected_choice.get("test_gini_after"), -np.inf),
+                    numeric_sort_value(selected_choice.get("validation_score"), -np.inf),
+                    -numeric_sort_value(selected_choice.get("gini_gap_after"), np.inf),
+                    numeric_sort_value(selected_choice.get("test_gini_delta"), -np.inf),
+                    *selected_choice.get("raw_score", ()),
+                )
+            if best_node_id is None or best_candidate is None:
                 st.session_state.auto_tree_diagnostics["stop_reason"] = "no_validation_candidate"
-            elif best_validation_score <= baseline_validation_score + MIN_INFORMATION_GAIN_EPSILON:
+            elif numeric_sort_value(selected_choice.get("validation_score"), -np.inf) <= baseline_validation_score + MIN_INFORMATION_GAIN_EPSILON:
                 best_node_id = None
                 best_candidate = None
                 st.session_state.auto_tree_diagnostics["stop_reason"] = "no_validation_improvement"
@@ -2427,6 +2444,50 @@ def build_optimal_tree(
                 validation_test_leaf_idx[int(child_id)] = child_idx
         action_node_ids.append(best_node_id)
         split_count += 1
+        if validation_enabled and test_df is not None and validation_test_leaf_idx is not None:
+            snapshot_state = build_binary_validation_state(df, test_df, target, validation_test_leaf_idx)
+            snapshot_gap = gini_gap(snapshot_state.train_gini, snapshot_state.test_gini)
+            validation_snapshots.append(
+                {
+                    "split_count": int(split_count),
+                    "leaf_count": int(len(current_leaves())),
+                    "train_gini": snapshot_state.train_gini,
+                    "test_gini": snapshot_state.test_gini,
+                    "gini_gap": snapshot_gap,
+                    "validation_score": validation_tree_objective_score(
+                        snapshot_state.test_gini,
+                        snapshot_gap,
+                        max_validation_gini_gap,
+                    ),
+                }
+            )
+
+    selected_snapshot = choose_generalized_tree_snapshot(
+        validation_snapshots,
+        gap_target=max_validation_gini_gap,
+    ) if validation_enabled else None
+    if selected_snapshot is not None:
+        selected_split_count = safe_int(selected_snapshot.get("split_count"), default=split_count, minimum=0)
+        if selected_split_count < split_count:
+            for node_id in reversed(action_node_ids[selected_split_count:]):
+                node = st.session_state.get("tree", {}).get(node_id)
+                if node is not None and node.get("split") is not None:
+                    prune_node(node_id)
+            action_node_ids = action_node_ids[:selected_split_count]
+            split_count = selected_split_count
+            st.session_state.auto_tree_diagnostics["stop_reason"] = "auto_generalization"
+        st.session_state.auto_tree_diagnostics["generalization"] = {
+            "split_count": int(selected_split_count),
+            "leaf_count": int(selected_snapshot.get("leaf_count") or len(current_leaves())),
+            "train_gini": selected_snapshot.get("train_gini"),
+            "test_gini": selected_snapshot.get("test_gini"),
+            "gini_gap": selected_snapshot.get("gini_gap"),
+            "peak_test_gini": selected_snapshot.get("peak_test_gini"),
+            "performance_floor": selected_snapshot.get("performance_floor"),
+            "gap_target": float(max_validation_gini_gap),
+            "within_gap_target": bool(selected_snapshot.get("within_gap_target")),
+            "candidate_snapshots": int(len(validation_snapshots)),
+        }
 
     if action_node_ids:
         st.session_state.setdefault("split_action_history", []).append(action_node_ids)
@@ -2457,6 +2518,13 @@ def auto_tree_stop_detail(diagnostics: dict[str, Any]) -> str:
         return f"Stopped at {leaf_text}: no remaining candidate could be scored on validation data."
     if reason == "no_validation_improvement":
         return f"Stopped at {leaf_text}: no remaining candidate improved the validation score."
+    if reason == "auto_generalization":
+        generalization = diagnostics.get("generalization") if isinstance(diagnostics.get("generalization"), dict) else {}
+        gap = numeric_sort_value(generalization.get("gini_gap"), np.nan)
+        test_gini = numeric_sort_value(generalization.get("test_gini"), np.nan)
+        if np.isfinite(gap) and np.isfinite(test_gini):
+            return f"Selected {leaf_text} by auto generalization: Test Gini {test_gini:.6f}, Train/Test gap {gap:.6f}."
+        return f"Selected {leaf_text} by auto generalization."
     if reason == "no_eligible_candidate":
         return f"Stopped at {leaf_text}: no remaining candidate met min gain, min leaf, depth, and leaf-limit constraints."
     return f"Stopped at {leaf_text}."
@@ -5445,6 +5513,79 @@ def validation_tree_objective_score(
     return float(test_gini_value - VALIDATION_GAP_PENALTY_WEIGHT * gap_excess)
 
 
+def choose_generalized_tree_snapshot(
+    snapshots: list[dict[str, Any]],
+    gap_target: float = AUTO_GENERALIZATION_GINI_GAP_TARGET,
+    test_tolerance: float = AUTO_GENERALIZATION_TEST_GINI_TOLERANCE,
+) -> dict[str, Any] | None:
+    valid = [
+        snapshot
+        for snapshot in snapshots
+        if np.isfinite(numeric_sort_value(snapshot.get("test_gini"), -np.inf))
+    ]
+    if not valid:
+        return None
+
+    peak_test_gini = max(numeric_sort_value(snapshot.get("test_gini"), -np.inf) for snapshot in valid)
+    performance_floor = peak_test_gini - float(test_tolerance)
+    high_performance = [
+        snapshot
+        for snapshot in valid
+        if numeric_sort_value(snapshot.get("test_gini"), -np.inf) >= performance_floor
+    ]
+    if not high_performance:
+        high_performance = valid
+
+    within_gap = [
+        snapshot
+        for snapshot in high_performance
+        if numeric_sort_value(snapshot.get("gini_gap"), np.inf) <= float(gap_target) + MIN_INFORMATION_GAIN_EPSILON
+    ]
+    pool = within_gap or high_performance
+    selected = max(
+        pool,
+        key=lambda snapshot: (
+            -numeric_sort_value(snapshot.get("gini_gap"), np.inf),
+            numeric_sort_value(snapshot.get("test_gini"), -np.inf),
+            numeric_sort_value(snapshot.get("train_gini"), -np.inf),
+            -safe_int(snapshot.get("split_count"), default=0, minimum=0),
+        ),
+    )
+    selected["peak_test_gini"] = peak_test_gini
+    selected["performance_floor"] = performance_floor
+    selected["within_gap_target"] = bool(
+        numeric_sort_value(selected.get("gini_gap"), np.inf) <= float(gap_target) + MIN_INFORMATION_GAIN_EPSILON
+    )
+    return selected
+
+
+def choose_generalized_split_candidate(
+    choices: list[dict[str, Any]],
+    gap_target: float = AUTO_GENERALIZATION_GINI_GAP_TARGET,
+    test_tolerance: float = AUTO_GENERALIZATION_TEST_GINI_TOLERANCE,
+) -> dict[str, Any] | None:
+    valid = [
+        choice
+        for choice in choices
+        if np.isfinite(numeric_sort_value(choice.get("test_gini_after"), -np.inf))
+    ]
+    if not valid:
+        return None
+
+    return max(
+        valid,
+        key=lambda choice: (
+            numeric_sort_value(choice.get("test_gini_after"), -np.inf)
+            - AUTO_GENERALIZATION_SPLIT_GAP_PENALTY_WEIGHT
+            * max(0.0, numeric_sort_value(choice.get("gini_gap_after"), np.inf) - float(gap_target)),
+            numeric_sort_value(choice.get("test_gini_after"), -np.inf),
+            -numeric_sort_value(choice.get("gini_gap_after"), np.inf),
+            numeric_sort_value(choice.get("validation_score"), -np.inf),
+            *choice.get("raw_score", ()),
+        ),
+    )
+
+
 def binary_gini_from_predictions(
     train_df: pd.DataFrame,
     eval_df: pd.DataFrame,
@@ -6748,38 +6889,21 @@ def main() -> None:
                 "Manual split preview and selected-leaf ranking are not filtered by this value."
             ),
         )
+        max_validation_gini_gap = AUTO_GENERALIZATION_GINI_GAP_TARGET
         if validation_scoring_enabled:
-            max_validation_gini_gap_input = st.number_input(
-                "Gini gap penalty target",
-                value=safe_float(
-                    saved_auto_parameters.get("max_validation_gini_gap"),
-                    default=DEFAULT_MAX_VALIDATION_GINI_GAP,
-                ),
-                min_value=0.0,
-                step=0.01,
-                format="%.4f",
-                help=(
-                    "When Test data exists, auto split ranking primarily maximizes Test Gini and penalizes "
-                    "Train/Test Gini gap above this target. This is not a hard cutoff; auto build stops when "
-                    "the combined validation score no longer improves."
-                ),
+            st.caption(
+                "Auto generalization is active: split search uses Test Gini and automatically keeps the "
+                "Train/Test Gini gap under control in the background."
             )
-        else:
-            max_validation_gini_gap_input = DEFAULT_MAX_VALIDATION_GINI_GAP
         auto_max_depth = safe_int(auto_max_depth_input, default=3, minimum=1)
         auto_max_leaves = safe_int(auto_max_leaves_input, default=12, minimum=2)
         auto_min_gain = safe_float(auto_min_gain_input, default=0.005)
         auto_candidate_rows = len(df)
-        max_validation_gini_gap = safe_float(
-            max_validation_gini_gap_input,
-            default=DEFAULT_MAX_VALIDATION_GINI_GAP,
-        )
         auto_parameters = {
             "max_depth": auto_max_depth,
             "max_leaves": auto_max_leaves,
             "min_information_gain": auto_min_gain,
             "parallel_workers": parallel_workers,
-            "max_validation_gini_gap": max_validation_gini_gap,
         }
 
         build_from_root_requested = st.button(
@@ -7232,7 +7356,7 @@ def main() -> None:
                 if validation_lookup:
                     st.caption(
                         f"Validation scoring: {len(validation_lookup):,} evaluated split(s) ranked by Test Gini "
-                        f"with Train/Test Gini gap above {max_validation_gini_gap:.4f} penalized."
+                        "with Train/Test Gini gap controlled automatically."
                     )
 
                 feature_rows = feature_summary_rows(
@@ -7649,7 +7773,7 @@ def main() -> None:
                     if manual_validation_stats is not None and not bool(manual_validation_stats.get("validation_safe")):
                         st.warning(
                             "Manual split is below the validation target because it would reduce Test Gini "
-                            "or increase the Train/Test Gini gap beyond the penalty target."
+                            "or increase the Train/Test Gini gap beyond the automatic generalization target."
                         )
                     st.caption("Manual split summary")
                     st.dataframe(
