@@ -316,6 +316,22 @@ def shap_result_data_frame(shap_result: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(data, columns=feature_names)
 
 
+def shap_plot_data_frame(shap_result: dict[str, Any]) -> pd.DataFrame:
+    data = shap_result_data_frame(shap_result)
+    out = pd.DataFrame(index=data.index)
+    for feature in data.columns:
+        series = data[feature]
+        numeric = pd.to_numeric(series, errors="coerce")
+        if pd.api.types.is_numeric_dtype(series) or numeric.notna().sum() == series.notna().sum():
+            out[feature] = numeric.astype(float)
+            continue
+        codes, _ = pd.factorize(series.astype("object").where(series.notna(), None), sort=True)
+        encoded = pd.Series(codes, index=series.index, dtype="float")
+        encoded[codes < 0] = np.nan
+        out[feature] = encoded
+    return out.loc[:, list(shap_result["feature_names"])]
+
+
 def shap_explanation(shap_result: dict[str, Any]) -> Any:
     shap = require_shap()
     values = np.asarray(shap_result["values"], dtype=float)

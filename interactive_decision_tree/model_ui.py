@@ -19,7 +19,7 @@ from .model_tools import (
     shap_explanation,
     shap_global_importance,
     shap_local_contributions,
-    shap_result_data_frame,
+    shap_plot_data_frame,
     load_model_from_bytes,
 )
 
@@ -275,7 +275,7 @@ def render_shap_workspace(
 def render_shap_plots(result: dict[str, Any]) -> None:
     shap = require_shap()
     values = result["values"]
-    data = shap_result_data_frame(result)
+    plot_data = shap_plot_data_frame(result)
     feature_names = list(result["feature_names"])
     top_display = st.number_input(
         "Plot top features",
@@ -302,7 +302,7 @@ def render_shap_plots(result: dict[str, Any]) -> None:
 
             shap.summary_plot(
                 values,
-                data,
+                plot_data,
                 feature_names=feature_names,
                 plot_type="violin",
                 max_display=int(top_display),
@@ -333,7 +333,7 @@ def render_shap_plots(result: dict[str, Any]) -> None:
             shap.dependence_plot(
                 main_feature,
                 values,
-                data,
+                plot_data,
                 feature_names=feature_names,
                 interaction_index=interaction_feature,
                 show=False,

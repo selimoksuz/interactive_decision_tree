@@ -21,6 +21,7 @@ from interactive_decision_tree.model_tools import (
     shap_explanation,
     shap_global_importance,
     shap_local_contributions,
+    shap_plot_data_frame,
     shap_result_data_frame,
 )
 
@@ -234,6 +235,37 @@ def test_kernel_shap_contributions_are_real_shap_values():
     assert shap_explanation(result).values.shape == (2, 2)
     assert shap_global_importance(result)["feature"].tolist()
     assert shap_local_contributions(result, 0)["feature"].tolist()
+
+
+def test_shap_plot_data_frame_encodes_categoricals_for_violin_plot():
+    pytest.importorskip("shap")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import shap
+
+    result = {
+        "values": np.array([[0.1, -0.2], [0.3, 0.4], [-0.1, 0.2]], dtype=float),
+        "expected_value": 0.5,
+        "feature_names": ["segment", "income"],
+        "row_index": [0, 1, 2],
+        "data": pd.DataFrame({"segment": ["A", "B", None], "income": [10_000, 20_000, 30_000]}),
+    }
+
+    plot_data = shap_plot_data_frame(result)
+
+    assert plot_data.shape == (3, 2)
+    assert pd.api.types.is_numeric_dtype(plot_data["segment"])
+    assert pd.api.types.is_numeric_dtype(plot_data["income"])
+    shap.summary_plot(
+        result["values"],
+        plot_data,
+        feature_names=result["feature_names"],
+        plot_type="violin",
+        show=False,
+    )
+    plt.close(plt.gcf())
 
 
 def test_kernel_shap_handles_tree_pickle_unseen_category_default():
