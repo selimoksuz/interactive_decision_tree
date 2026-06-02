@@ -66,7 +66,9 @@ DEFAULT_PARALLEL_WORKERS = max(1, min(8, CPU_COUNT))
 DEFAULT_DEMO_ROWS = 5_000
 DEFAULT_MAX_VALIDATION_GINI_GAP = 0.10
 VALIDATION_CANDIDATE_LIMIT = 100
-AUTO_TREE_VALIDATION_CANDIDATE_LIMIT = 24
+AUTO_TREE_VALIDATION_CANDIDATE_LIMIT = 40
+VALIDATION_GAP_PENALTY_WEIGHT = 0.50
+VALIDATION_TEST_DROP_PENALTY_WEIGHT = 2.00
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
 TARGET_META_CACHE_KEY = "_interactive_tree_target_meta_cache"
@@ -2180,6 +2182,14 @@ def build_optimal_tree(
         elif validation_enabled and test_df is not None:
             baseline_train_predictions = tree_predictions_for_dataframe(df, df, target)
             baseline_test_predictions = tree_predictions_for_dataframe(df, test_df, target)
+            baseline_train_gini = binary_gini_from_predictions(df, df, target, baseline_train_predictions)
+            baseline_test_gini = binary_gini_from_predictions(df, test_df, target, baseline_test_predictions)
+            baseline_validation_score = validation_tree_objective_score(
+                baseline_test_gini,
+                gini_gap(baseline_train_gini, baseline_test_gini),
+                max_validation_gini_gap,
+            )
+            best_validation_score = -np.inf
             ordered_eligible = sorted(eligible_candidates, key=lambda item: item[0], reverse=True)
             for raw_score, node_id, candidate in ordered_eligible[:AUTO_TREE_VALIDATION_CANDIDATE_LIMIT]:
                 stats = candidate_validation_stats(
@@ -2193,21 +2203,28 @@ def build_optimal_tree(
                     baseline_test_predictions=baseline_test_predictions,
                 )
                 st.session_state.auto_tree_diagnostics["validated_candidate_count"] += 1
-                if not stats or not stats.get("validation_safe"):
+                if not stats:
                     continue
 
+                candidate_validation_score = validation_adjusted_gini_score(stats)
                 candidate_score = (
+                    candidate_validation_score,
                     numeric_sort_value(stats.get("test_gini_after"), -np.inf),
-                    numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
                     -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
+                    numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
                     *raw_score,
                 )
                 if best_score is None or candidate_score > best_score:
                     best_score = candidate_score
+                    best_validation_score = candidate_validation_score
                     best_candidate = candidate
                     best_node_id = node_id
             if best_node_id is None:
-                st.session_state.auto_tree_diagnostics["stop_reason"] = "validation_guard"
+                st.session_state.auto_tree_diagnostics["stop_reason"] = "no_validation_candidate"
+            elif best_validation_score <= baseline_validation_score + MIN_INFORMATION_GAIN_EPSILON:
+                best_node_id = None
+                best_candidate = None
+                st.session_state.auto_tree_diagnostics["stop_reason"] = "no_validation_improvement"
         else:
             for raw_score, node_id, candidate in eligible_candidates:
                 candidate_score = raw_score
@@ -2248,7 +2265,11 @@ def auto_tree_stop_detail(diagnostics: dict[str, Any]) -> str:
     if reason == "max_depth":
         return f"Stopped at {leaf_text}: max depth limit reached."
     if reason == "validation_guard":
-        return f"Stopped at {leaf_text}: no remaining candidate passed the test validation guard."
+        return f"Stopped at {leaf_text}: no remaining candidate passed the legacy validation guard."
+    if reason == "no_validation_candidate":
+        return f"Stopped at {leaf_text}: no remaining candidate could be scored on validation data."
+    if reason == "no_validation_improvement":
+        return f"Stopped at {leaf_text}: no remaining candidate improved the validation score."
     if reason == "no_eligible_candidate":
         return f"Stopped at {leaf_text}: no remaining candidate met min gain, min leaf, depth, and leaf-limit constraints."
     return f"Stopped at {leaf_text}."
@@ -4463,19 +4484,13 @@ def ordered_features_by_gain(features: list[str], feature_stats: dict[str, dict[
     ]
     validation_mode = any("validation_safe" in stats for stats in feature_stats.values())
     if validation_mode:
-        safe_features = [
-            feature
-            for feature in eligible
-            if feature_stats.get(feature, {}).get("validation_safe") == "yes"
-        ]
-        sort_features = safe_features or eligible
         return sorted(
-            sort_features,
+            eligible,
             key=lambda feature: (
-                feature_stats.get(feature, {}).get("validation_safe") == "yes",
+                numeric_sort_value(feature_stats.get(feature, {}).get("validation_score"), -np.inf),
                 numeric_sort_value(feature_stats.get(feature, {}).get("test_gini_after"), -np.inf),
-                numeric_sort_value(feature_stats.get(feature, {}).get("test_gini_delta"), -np.inf),
                 -numeric_sort_value(feature_stats.get(feature, {}).get("gini_gap_after"), np.inf),
+                numeric_sort_value(feature_stats.get(feature, {}).get("test_gini_delta"), -np.inf),
                 feature_stats.get(feature, {}).get("best_information_gain", 0.0),
             ),
             reverse=True,
@@ -4893,6 +4908,7 @@ def candidate_split_summary_column_config(score_name: str) -> dict[str, Any]:
         score_name: st.column_config.NumberColumn(format="%.6f"),
         "weighted_tree_delta": st.column_config.NumberColumn(format="%.6f"),
         "child_weighted_impurity": st.column_config.NumberColumn(format="%.6f"),
+        "validation_score": st.column_config.NumberColumn(format="%.6f"),
         "train_gini_after": st.column_config.NumberColumn(format="%.6f"),
         "test_gini_after": st.column_config.NumberColumn(format="%.6f"),
         "test_gini_delta": st.column_config.NumberColumn(format="%.6f"),
@@ -5197,6 +5213,19 @@ def gini_gap(train_gini: float | None, test_gini: float | None) -> float | None:
     return abs(float(train_gini) - float(test_gini))
 
 
+def validation_tree_objective_score(
+    test_gini: float | None,
+    gini_gap_value: float | None,
+    max_gini_gap: float,
+) -> float:
+    test_gini_value = numeric_sort_value(test_gini, -np.inf)
+    if not np.isfinite(test_gini_value):
+        return -np.inf
+    gap_value = numeric_sort_value(gini_gap_value, 0.0)
+    gap_excess = max(0.0, gap_value - float(max_gini_gap))
+    return float(test_gini_value - VALIDATION_GAP_PENALTY_WEIGHT * gap_excess)
+
+
 def binary_gini_from_predictions(
     train_df: pd.DataFrame,
     eval_df: pd.DataFrame,
@@ -5337,6 +5366,7 @@ def candidate_validation_row_values(stats: dict[str, Any] | None) -> dict[str, A
     if not stats:
         return {
             "validation_safe": "",
+            "validation_score": None,
             "train_gini_after": None,
             "test_gini_after": None,
             "test_gini_delta": None,
@@ -5344,11 +5374,27 @@ def candidate_validation_row_values(stats: dict[str, Any] | None) -> dict[str, A
         }
     return {
         "validation_safe": "yes" if stats.get("validation_safe") else "no",
+        "validation_score": validation_adjusted_gini_score(stats),
         "train_gini_after": stats.get("train_gini_after"),
         "test_gini_after": stats.get("test_gini_after"),
         "test_gini_delta": stats.get("test_gini_delta"),
         "gini_gap_after": stats.get("gini_gap_after"),
     }
+
+
+def validation_adjusted_gini_score(stats: dict[str, Any] | None) -> float:
+    if not stats:
+        return -np.inf
+    objective_score = validation_tree_objective_score(
+        stats.get("test_gini_after"),
+        stats.get("gini_gap_after"),
+        numeric_sort_value(stats.get("max_gini_gap"), DEFAULT_MAX_VALIDATION_GINI_GAP),
+    )
+    if not np.isfinite(objective_score):
+        return -np.inf
+    test_delta = numeric_sort_value(stats.get("test_gini_delta"), 0.0)
+    test_drop = max(0.0, -test_delta)
+    return float(objective_score - VALIDATION_TEST_DROP_PENALTY_WEIGHT * test_drop)
 
 
 def candidate_validation_sort_key(
@@ -5358,29 +5404,19 @@ def candidate_validation_sort_key(
     stats = validation_lookup.get(id(candidate)) if validation_lookup else None
     if not stats:
         return (
-            0,
+            -np.inf,
             -np.inf,
             -np.inf,
             -np.inf,
             candidate.information_gain,
         )
     return (
-        1 if stats.get("validation_safe") else 0,
+        validation_adjusted_gini_score(stats),
         numeric_sort_value(stats.get("test_gini_after"), -np.inf),
-        numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
         -numeric_sort_value(stats.get("gini_gap_after"), np.inf),
+        numeric_sort_value(stats.get("test_gini_delta"), -np.inf),
         candidate.information_gain,
     )
-
-
-def candidate_passes_validation(
-    candidate: SplitCandidate,
-    validation_lookup: dict[int, dict[str, Any]] | None,
-) -> bool:
-    if not validation_lookup:
-        return True
-    stats = validation_lookup.get(id(candidate))
-    return bool(stats and stats.get("validation_safe"))
 
 
 def candidates_selected_for_validation(
@@ -6044,7 +6080,7 @@ def main() -> None:
     if test_df is not None:
         active_caption += f" | Test rows: {len(test_df):,}"
     train_panel.caption(active_caption)
-    validation_guard_enabled = test_df is not None and target_kind == "binary"
+    validation_scoring_enabled = test_df is not None and target_kind == "binary"
 
     if workspace_mode == "Data Setup":
         st.subheader("Active dataset")
@@ -6262,9 +6298,9 @@ def main() -> None:
                 "Manual split preview and selected-leaf ranking are not filtered by this value."
             ),
         )
-        if validation_guard_enabled:
+        if validation_scoring_enabled:
             max_validation_gini_gap_input = st.number_input(
-                "Max Gini gap",
+                "Gini gap penalty target",
                 value=safe_float(
                     saved_auto_parameters.get("max_validation_gini_gap"),
                     default=DEFAULT_MAX_VALIDATION_GINI_GAP,
@@ -6273,8 +6309,9 @@ def main() -> None:
                 step=0.01,
                 format="%.4f",
                 help=(
-                    "When Test data exists, auto split choices must keep Test Gini from falling and must not move "
-                    "Train/Test Gini gap above this value."
+                    "When Test data exists, auto split ranking primarily maximizes Test Gini and penalizes "
+                    "Train/Test Gini gap above this target. This is not a hard cutoff; auto build stops when "
+                    "the combined validation score no longer improves."
                 ),
             )
         else:
@@ -6741,12 +6778,11 @@ def main() -> None:
                     candidates=all_candidates,
                     max_gini_gap=max_validation_gini_gap,
                     candidate_limit=VALIDATION_CANDIDATE_LIMIT,
-                ) if validation_guard_enabled else {}
+                ) if validation_scoring_enabled else {}
                 if validation_lookup:
-                    safe_count = sum(1 for stats in validation_lookup.values() if stats.get("validation_safe"))
                     st.caption(
-                        f"Validation guard: {safe_count:,} / {len(validation_lookup):,} evaluated split(s) keep Test Gini stable "
-                        f"and Train/Test Gini gap within {max_validation_gini_gap:.4f}."
+                        f"Validation scoring: {len(validation_lookup):,} evaluated split(s) ranked by Test Gini "
+                        f"with Train/Test Gini gap above {max_validation_gini_gap:.4f} penalized."
                     )
 
                 feature_rows = feature_summary_rows(
@@ -6761,16 +6797,8 @@ def main() -> None:
                     for candidate in all_candidates
                     if candidate.information_gain > MIN_INFORMATION_GAIN_EPSILON
                 ]
-                if validation_lookup:
-                    positive_candidates = [
-                        candidate for candidate in positive_candidates if candidate_passes_validation(candidate, validation_lookup)
-                    ]
                 if not leaf_feature_options or not positive_candidates:
-                    st.warning(
-                        "No validation-safe split with positive information gain found for this leaf."
-                        if validation_lookup
-                        else "No split with positive information gain found for this leaf."
-                    )
+                    st.warning("No split with positive information gain found for this leaf.")
                     st.dataframe(
                         arrow_safe_dataframe(
                             pd.DataFrame(
@@ -6787,6 +6815,7 @@ def main() -> None:
                         column_config={
                             "total_information_gain": st.column_config.NumberColumn(format="%.6f"),
                             "best_information_gain": st.column_config.NumberColumn(format="%.6f"),
+                            "validation_score": st.column_config.NumberColumn(format="%.6f"),
                             "train_gini_after": st.column_config.NumberColumn(format="%.6f"),
                             "test_gini_after": st.column_config.NumberColumn(format="%.6f"),
                             "test_gini_delta": st.column_config.NumberColumn(format="%.6f"),
@@ -6838,6 +6867,7 @@ def main() -> None:
                     column_config={
                         "total_information_gain": st.column_config.NumberColumn(format="%.6f"),
                         "best_information_gain": st.column_config.NumberColumn(format="%.6f"),
+                        "validation_score": st.column_config.NumberColumn(format="%.6f"),
                         "train_gini_after": st.column_config.NumberColumn(format="%.6f"),
                         "test_gini_after": st.column_config.NumberColumn(format="%.6f"),
                         "test_gini_delta": st.column_config.NumberColumn(format="%.6f"),
@@ -6909,7 +6939,6 @@ def main() -> None:
                         key=f"apply_split_{current['id']}_{selected_feature}",
                         type="primary",
                         width="stretch",
-                        disabled=bool(validation_lookup) and not candidate_passes_validation(selected_candidate, validation_lookup),
                     ):
                         apply_split(df, selected_candidate)
                         save_and_rerun()
@@ -7154,7 +7183,7 @@ def main() -> None:
                     )
 
                 manual_validation_stats = None
-                if manual_candidate is not None and validation_guard_enabled:
+                if manual_candidate is not None and validation_scoring_enabled:
                     manual_validation_stats = candidate_validation_stats(
                         train_df=df,
                         test_df=test_df,
@@ -7167,14 +7196,10 @@ def main() -> None:
                 if manual_candidate is None:
                     st.caption("Enter a valid manual split to preview its impact.")
                 else:
-                    manual_validation_safe = (
-                        manual_validation_stats is None
-                        or bool(manual_validation_stats.get("validation_safe"))
-                    )
-                    if not manual_validation_safe:
+                    if manual_validation_stats is not None and not bool(manual_validation_stats.get("validation_safe")):
                         st.warning(
-                            "Manual split is blocked by validation guard because it would reduce Test Gini "
-                            "or increase the Train/Test Gini gap beyond the allowed limit."
+                            "Manual split is below the validation target because it would reduce Test Gini "
+                            "or increase the Train/Test Gini gap beyond the penalty target."
                         )
                     st.caption("Manual split summary")
                     st.dataframe(
@@ -7224,7 +7249,6 @@ def main() -> None:
                         key=f"apply_manual_split_{current['id']}_{selected_feature}",
                         type="primary",
                         width="stretch",
-                        disabled=not manual_validation_safe,
                     ):
                         apply_split(df, manual_candidate)
                         save_and_rerun()
