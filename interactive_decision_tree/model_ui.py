@@ -15,8 +15,10 @@ from .model_tools import (
     predict_model_scores,
     prepare_model_frame,
     require_shap,
+    shap_explanation,
     shap_global_importance,
     shap_local_contributions,
+    shap_result_data_frame,
     load_model_from_bytes,
 )
 
@@ -216,12 +218,86 @@ def render_shap_workspace(
     selected_row = st.selectbox("Local SHAP row", options=list(range(len(row_labels))), format_func=lambda i: row_labels[i])
     local = shap_local_contributions(result, int(selected_row))
     st.dataframe(local, hide_index=True, width="stretch")
+    render_shap_plots(result)
+
+
+def render_shap_plots(result: dict[str, Any]) -> None:
+    shap = require_shap()
+    values = result["values"]
+    data = shap_result_data_frame(result)
+    feature_names = list(result["feature_names"])
+    top_display = st.number_input(
+        "Plot top features",
+        min_value=1,
+        max_value=max(1, len(feature_names)),
+        value=min(20, len(feature_names)),
+        step=1,
+        format="%d",
+        key="shap_plot_top_features",
+    )
+    beeswarm_tab, violin_tab, interaction_tab = st.tabs(["Beeswarm", "Violin", "Interaction"])
+    with beeswarm_tab:
+        try:
+            import matplotlib.pyplot as plt
+
+            shap.plots.beeswarm(shap_explanation(result), max_display=int(top_display), show=False)
+            st.pyplot(plt.gcf(), clear_figure=True)
+            plt.close(plt.gcf())
+        except Exception as exc:
+            st.error(f"Beeswarm plot failed: {exc}")
+    with violin_tab:
+        try:
+            import matplotlib.pyplot as plt
+
+            shap.summary_plot(
+                values,
+                data,
+                feature_names=feature_names,
+                plot_type="violin",
+                max_display=int(top_display),
+                show=False,
+            )
+            st.pyplot(plt.gcf(), clear_figure=True)
+            plt.close(plt.gcf())
+        except Exception as exc:
+            st.error(f"Violin plot failed: {exc}")
+    with interaction_tab:
+        try:
+            import matplotlib.pyplot as plt
+
+            importance = shap_global_importance(result)
+            default_feature = str(importance.iloc[0]["feature"]) if not importance.empty else feature_names[0]
+            main_feature = st.selectbox(
+                "SHAP feature",
+                options=feature_names,
+                index=feature_names.index(default_feature) if default_feature in feature_names else 0,
+                key="shap_interaction_main_feature",
+            )
+            interaction_options = ["auto"] + feature_names
+            interaction_feature = st.selectbox(
+                "Interaction color",
+                options=interaction_options,
+                key="shap_interaction_color_feature",
+            )
+            shap.dependence_plot(
+                main_feature,
+                values,
+                data,
+                feature_names=feature_names,
+                interaction_index=interaction_feature,
+                show=False,
+            )
+            st.pyplot(plt.gcf(), clear_figure=True)
+            plt.close(plt.gcf())
+        except Exception as exc:
+            st.error(f"Interaction plot failed: {exc}")
 
 
 def render_what_if_workspace(
     *,
     df: pd.DataFrame,
     features: list[str],
+    target: str,
     data_key: str,
 ) -> None:
     st.subheader("What-if Simulator")
@@ -244,6 +320,11 @@ def render_what_if_workspace(
         format="%d",
         key="what_if_row_position",
     )
+    actual_target = df.iloc[int(row_position)][target] if target in df.columns else None
+    row_cols = st.columns(3)
+    row_cols[0].metric("Source row", str(df.index[int(row_position)]))
+    row_cols[1].metric("Actual target", str(actual_target))
+    row_cols[2].metric("Model input columns", f"{len(feature_names):,}")
     base_row = prepare_model_frame(df.iloc[[int(row_position)]], feature_names)
     edited = st.data_editor(
         base_row,

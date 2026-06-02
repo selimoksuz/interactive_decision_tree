@@ -291,7 +291,29 @@ def kernel_shap_contributions(
         "expected_value": expected,
         "feature_names": list(feature_names),
         "row_index": explain_frame.index.tolist(),
+        "data": explain_frame.copy(),
     }
+
+
+def shap_result_data_frame(shap_result: dict[str, Any]) -> pd.DataFrame:
+    data = shap_result.get("data")
+    feature_names = list(shap_result["feature_names"])
+    if isinstance(data, pd.DataFrame):
+        return data.loc[:, feature_names].copy()
+    return pd.DataFrame(data, columns=feature_names)
+
+
+def shap_explanation(shap_result: dict[str, Any]) -> Any:
+    shap = require_shap()
+    values = np.asarray(shap_result["values"], dtype=float)
+    data = shap_result_data_frame(shap_result)
+    expected = float(shap_result.get("expected_value", 0.0))
+    return shap.Explanation(
+        values=values,
+        base_values=np.repeat(expected, values.shape[0]),
+        data=data.to_numpy(dtype=object),
+        feature_names=list(shap_result["feature_names"]),
+    )
 
 
 def shap_global_importance(shap_result: dict[str, Any]) -> pd.DataFrame:

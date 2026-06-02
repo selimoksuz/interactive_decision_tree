@@ -18,8 +18,10 @@ from interactive_decision_tree.model_tools import (
     model_feature_names,
     predict_model_scores,
     prepare_model_frame,
+    shap_explanation,
     shap_global_importance,
     shap_local_contributions,
+    shap_result_data_frame,
 )
 
 
@@ -153,5 +155,7 @@ def test_kernel_shap_contributions_are_real_shap_values():
     )
 
     assert result["values"].shape == (2, 2)
+    assert shap_result_data_frame(result).shape == (2, 2)
+    assert shap_explanation(result).values.shape == (2, 2)
     assert shap_global_importance(result)["feature"].tolist()
     assert shap_local_contributions(result, 0)["feature"].tolist()

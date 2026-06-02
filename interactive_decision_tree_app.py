@@ -3453,6 +3453,9 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "shap_explain_rows",
         "shap_kernel_samples",
         "shap_sample_seed",
+        "shap_plot_top_features",
+        "shap_interaction_main_feature",
+        "shap_interaction_color_feature",
         "what_if_row_position",
         "_interactive_tree_woe_active_variable",
     }
@@ -5750,6 +5753,7 @@ def main() -> None:
         render_what_if_workspace(
             df=df,
             features=features,
+            target=target,
             data_key=data_key,
         )
         finish_workspace_render(effective_workspace_mode)
