@@ -144,17 +144,64 @@ def shap_strata_labels(
     target: str,
     extra_columns: list[str],
     score_bins: int = DEFAULT_SHAP_SCORE_BINS,
+    include_target: bool = True,
 ) -> pd.Series:
     parts = [shap_score_band_labels(scores, bins=score_bins).astype(str)]
-    if target in df.columns:
-        parts.append(df[target].astype("object").where(df[target].notna(), "__MISSING__").astype(str))
+    if include_target and target in df.columns:
+        parts.append(shap_stratify_column_labels(df[target], prefix=str(target), force_categorical=True))
     for column in extra_columns:
         if column in df.columns:
-            parts.append(df[column].astype("object").where(df[column].notna(), "__MISSING__").astype(str))
+            parts.append(shap_stratify_column_labels(df[column], prefix=str(column)))
     labels = parts[0].copy()
     for part in parts[1:]:
         labels = labels + "|" + part
     return labels
+
+
+def shap_stratify_column_labels(
+    series: pd.Series,
+    prefix: str,
+    bins: int = DEFAULT_SHAP_SCORE_BINS,
+    force_categorical: bool = False,
+) -> pd.Series:
+    missing_label = f"{prefix}=__MISSING__"
+    if force_categorical:
+        values = series.astype("object").where(series.notna(), "__MISSING__").astype(str)
+        return prefix + "=" + values.astype(str)
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        periods = series.dt.to_period("M").astype("object")
+        return pd.Series(
+            [missing_label if pd.isna(value) else f"{prefix}={value}" for value in periods],
+            index=series.index,
+            dtype="object",
+        )
+
+    if pd.api.types.is_numeric_dtype(series):
+        labels = shap_score_band_labels(pd.to_numeric(series, errors="coerce"), bins=bins)
+        return labels.map(lambda value: missing_label if value == "score_missing" else f"{prefix}_{value}")
+
+    lowered_prefix = prefix.lower()
+    looks_like_date = any(token in lowered_prefix for token in ("date", "dt", "time", "month", "tarih"))
+    if looks_like_date:
+        try:
+            parsed_dates = pd.to_datetime(series, errors="coerce", format="mixed")
+        except TypeError:
+            parsed_dates = pd.to_datetime(series, errors="coerce")
+        if parsed_dates.notna().sum() >= max(3, int(series.notna().sum() * 0.8)):
+            periods = parsed_dates.dt.to_period("M").astype("object")
+            return pd.Series(
+                [missing_label if pd.isna(value) else f"{prefix}={value}" for value in periods],
+                index=series.index,
+                dtype="object",
+            )
+
+    values = series.astype("object").where(series.notna(), "__MISSING__").astype(str)
+    counts = values.value_counts(dropna=False)
+    if len(counts) > 50:
+        kept = set(counts.head(50).index)
+        values = values.where(values.isin(kept), "__OTHER__")
+    return prefix + "=" + values.astype(str)
 
 
 def stratified_sample_by_labels(
@@ -399,6 +446,13 @@ def render_shap_workspace(
         help="Rows scored before stratified background/explain selection. Larger pools represent the active data better but add one scoring pass.",
     )
     seed = st.number_input("SHAP sample seed", value=20260514, step=1, key="shap_sample_seed")
+    target_stratify = st.checkbox(
+        "Stratify by target",
+        value=target in df.columns,
+        disabled=target not in df.columns,
+        key="shap_stratify_target",
+        help="Keeps event/non-event or target-class balance in SHAP background and explain samples.",
+    )
     candidate_strata_columns = [
         str(column)
         for column in df.columns
@@ -433,6 +487,7 @@ def render_shap_workspace(
                     target=target,
                     extra_columns=list(stratify_columns),
                     score_bins=DEFAULT_SHAP_SCORE_BINS,
+                    include_target=bool(target_stratify),
                 )
                 background = stratified_sample_by_labels(
                     pool,
@@ -451,7 +506,12 @@ def render_shap_workspace(
                 explain_scores = pool_scores.reindex(explain.index)
                 status.write(f"Background rows: {len(background):,}")
                 status.write(f"Explain rows: {len(explain):,}")
-                status.write(f"Strata columns: score_band, {target}" + (f", {', '.join(stratify_columns)}" if stratify_columns else ""))
+                strata_column_text = "score_band"
+                if target_stratify and target in pool.columns:
+                    strata_column_text += f", {target}"
+                if stratify_columns:
+                    strata_column_text += f", {', '.join(stratify_columns)}"
+                status.write(f"Strata columns: {strata_column_text}")
                 result = kernel_shap_contributions(
                     state["model"],
                     background,
@@ -465,7 +525,7 @@ def render_shap_workspace(
                     "mode": "score_band_stratified",
                     "pool_rows": int(len(pool)),
                     "score_bins": int(DEFAULT_SHAP_SCORE_BINS),
-                    "target": target if target in pool.columns else None,
+                    "target": target if target_stratify and target in pool.columns else None,
                     "stratify_columns": list(stratify_columns),
                     "background_rows": int(len(background)),
                     "explain_rows": int(len(explain)),

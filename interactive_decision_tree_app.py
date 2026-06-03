@@ -4140,6 +4140,7 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "shap_kernel_samples",
         "shap_sampling_pool_rows",
         "shap_sample_seed",
+        "shap_stratify_target",
         "shap_stratify_columns",
         "shap_plot_top_features",
         "shap_interaction_main_feature",

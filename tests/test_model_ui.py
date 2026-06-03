@@ -7,6 +7,7 @@ from interactive_decision_tree.model_ui import (
     find_row_position_by_id_value,
     shap_default_stratify_columns,
     shap_score_band_labels,
+    shap_stratify_column_labels,
     shap_strata_labels,
     stratified_sample_by_labels,
     what_if_id_columns,
@@ -79,3 +80,43 @@ def test_shap_default_stratify_columns_prefers_business_columns_outside_model_fe
     )
 
     assert shap_default_stratify_columns(df, "risk_flag", ["income"]) == ["segment", "product"]
+
+
+def test_shap_strata_labels_keep_numeric_target_as_class_label():
+    df = pd.DataFrame(
+        {
+            "risk_flag": [0, 1, 0, 1],
+            "application_date": pd.to_datetime(["2026-01-01", "2026-01-15", "2026-02-01", "2026-02-15"]),
+        }
+    )
+    scores = pd.Series([0.1, 0.2, 0.8, 0.9], index=df.index)
+
+    strata = shap_strata_labels(
+        df,
+        scores,
+        target="risk_flag",
+        extra_columns=["application_date"],
+        score_bins=2,
+        include_target=True,
+    )
+
+    assert any("|risk_flag=0|" in value for value in strata)
+    assert any("|risk_flag=1|" in value for value in strata)
+    assert any("application_date=2026-01" in value for value in strata)
+    assert any("application_date=2026-02" in value for value in strata)
+
+
+def test_shap_stratify_column_labels_bin_numeric_and_month_bucket_dates():
+    numeric = pd.Series([10, 20, 30, 40], name="score")
+    date = pd.Series(pd.to_datetime(["2026-01-01", "2026-01-20", "2026-02-01", None]), name="as_of_date")
+
+    numeric_labels = shap_stratify_column_labels(numeric, prefix="score", bins=2)
+    date_labels = shap_stratify_column_labels(date, prefix="as_of_date")
+
+    assert set(numeric_labels) == {"score_score_01", "score_score_02"}
+    assert date_labels.tolist() == [
+        "as_of_date=2026-01",
+        "as_of_date=2026-01",
+        "as_of_date=2026-02",
+        "as_of_date=__MISSING__",
+    ]
