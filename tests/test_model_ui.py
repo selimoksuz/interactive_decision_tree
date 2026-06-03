@@ -10,8 +10,24 @@ from interactive_decision_tree.model_ui import (
     shap_stratify_column_labels,
     shap_strata_labels,
     stratified_sample_by_labels,
+    what_if_candidate_values,
     what_if_id_columns,
+    what_if_local_sensitivity,
 )
+
+
+class LocalSensitivityModel:
+    feature_names_in_ = ["strong_num", "cat_driver", "weak_num"]
+    classes_ = [0, 1]
+
+    def predict_proba(self, frame: pd.DataFrame):
+        score = (
+            0.05
+            + 0.08 * pd.to_numeric(frame["strong_num"], errors="coerce").fillna(0)
+            + 0.45 * frame["cat_driver"].astype(str).eq("B").astype(float)
+            + 0.01 * pd.to_numeric(frame["weak_num"], errors="coerce").fillna(0)
+        ).clip(0, 1)
+        return pd.concat([1 - score, score], axis=1).to_numpy(dtype=float)
 
 
 def test_what_if_id_lookup_helpers_find_string_and_numeric_ids():
@@ -30,6 +46,35 @@ def test_what_if_id_lookup_helpers_find_string_and_numeric_ids():
     assert find_row_position_by_id_value(df, "customer_id", "C002") == 1
     assert find_row_position_by_id_value(df, "account_no", "1003") == 2
     assert find_row_position_by_id_value(df, "customer_id", "missing") is None
+
+
+def test_what_if_candidate_values_exclude_current_value():
+    values = what_if_candidate_values(pd.Series([1, 2, 3, 4, 5]), current_value=3, max_values=4)
+
+    assert len(values) <= 4
+    assert 3 not in values
+
+
+def test_what_if_local_sensitivity_orders_numeric_and_categorical_drivers():
+    df = pd.DataFrame(
+        {
+            "strong_num": [0, 2, 4, 6, 8, 10],
+            "cat_driver": ["A", "B", "A", "C", "B", "A"],
+            "weak_num": [0, 1, 2, 3, 4, 5],
+        }
+    )
+
+    ranking = what_if_local_sensitivity(
+        model=LocalSensitivityModel(),
+        df=df,
+        row_position=0,
+        feature_names=["strong_num", "cat_driver", "weak_num"],
+        positive_class=1,
+    )
+
+    assert ranking["feature"].tolist() == ["strong_num", "cat_driver", "weak_num"]
+    assert ranking.iloc[0]["sensitivity"] > ranking.iloc[1]["sensitivity"] > ranking.iloc[2]["sensitivity"]
+    assert ranking.iloc[1]["candidate_value"] == "B"
 
 
 def test_shap_score_band_labels_create_ordered_score_bands():

@@ -26,7 +26,9 @@ from .model_tools import (
 
 MODEL_STATE_KEY = "_interactive_tree_model_pipeline_state"
 SHAP_RESULT_KEY = "_interactive_tree_shap_result"
+WHAT_IF_SENSITIVITY_CACHE_KEY = "_interactive_tree_what_if_sensitivity_cache"
 DEFAULT_SHAP_SCORE_BINS = 10
+WHAT_IF_SENSITIVITY_MAX_VALUES = 8
 DEFAULT_SHAP_STRATIFY_CANDIDATES = (
     "segment",
     "product",
@@ -101,6 +103,134 @@ def find_row_position_by_id_value(df: pd.DataFrame, id_column: str, raw_value: A
     if len(positions) == 0:
         return None
     return int(positions[0])
+
+
+def same_raw_value(left: Any, right: Any) -> bool:
+    left_missing = pd.isna(left)
+    right_missing = pd.isna(right)
+    if bool(left_missing) and bool(right_missing):
+        return True
+    if bool(left_missing) != bool(right_missing):
+        return False
+    try:
+        return bool(left == right)
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+def what_if_candidate_values(series: pd.Series, current_value: Any, max_values: int = WHAT_IF_SENSITIVITY_MAX_VALUES) -> list[Any]:
+    max_values = max(1, int(max_values))
+    candidates: list[Any] = []
+
+    def add(value: Any) -> None:
+        if same_raw_value(value, current_value):
+            return
+        if any(same_raw_value(value, existing) for existing in candidates):
+            return
+        candidates.append(value)
+
+    if pd.api.types.is_numeric_dtype(series):
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        if numeric.empty:
+            return []
+        quantiles = np.linspace(0.05, 0.95, min(max_values, 7))
+        for value in numeric.quantile(quantiles).tolist():
+            add(float(value))
+        add(float(numeric.min()))
+        add(float(numeric.max()))
+    else:
+        values = series.dropna().value_counts(dropna=True).head(max_values).index.tolist()
+        for value in values:
+            add(value)
+        if not pd.isna(current_value) and series.isna().any() and len(candidates) < max_values:
+            add(np.nan)
+
+    return candidates[:max_values]
+
+
+def what_if_local_sensitivity(
+    *,
+    model: Any,
+    df: pd.DataFrame,
+    row_position: int,
+    feature_names: list[str],
+    positive_class: Any | None = None,
+    positive_index: int | None = None,
+    max_values: int = WHAT_IF_SENSITIVITY_MAX_VALUES,
+) -> pd.DataFrame:
+    base_row = prepare_model_frame(df.iloc[[int(row_position)]], feature_names)
+    base_values = base_row.iloc[0].to_dict()
+    base_prediction = predict_model_scores(
+        model,
+        base_row,
+        positive_class=positive_class,
+        positive_index=positive_index,
+    )
+    base_score = float(base_prediction.scores[0])
+
+    variant_rows: list[dict[str, Any]] = []
+    variant_meta: list[dict[str, Any]] = []
+    for feature in feature_names:
+        for candidate_value in what_if_candidate_values(df[feature], base_values[feature], max_values=max_values):
+            row = dict(base_values)
+            row[feature] = candidate_value
+            variant_rows.append(row)
+            variant_meta.append({"feature": feature, "candidate_value": candidate_value})
+
+    if not variant_rows:
+        return pd.DataFrame(
+            [
+                {
+                    "feature": feature,
+                    "sensitivity": 0.0,
+                    "delta": 0.0,
+                    "base_score": base_score,
+                    "scenario_score": base_score,
+                    "candidate_value": base_values[feature],
+                    "candidate_count": 0,
+                }
+                for feature in feature_names
+            ]
+        )
+
+    variant_frame = pd.DataFrame(variant_rows, columns=feature_names)
+    variant_prediction = predict_model_scores(
+        model,
+        prepare_model_frame(variant_frame, feature_names),
+        positive_class=positive_class,
+        positive_index=positive_index,
+    )
+    rows_by_feature: dict[str, dict[str, Any]] = {
+        feature: {
+            "feature": feature,
+            "sensitivity": 0.0,
+            "delta": 0.0,
+            "base_score": base_score,
+            "scenario_score": base_score,
+            "candidate_value": base_values[feature],
+            "candidate_count": 0,
+        }
+        for feature in feature_names
+    }
+    for meta, score in zip(variant_meta, variant_prediction.scores):
+        feature = str(meta["feature"])
+        delta = float(score) - base_score
+        row = rows_by_feature[feature]
+        row["candidate_count"] = int(row["candidate_count"]) + 1
+        if abs(delta) > float(row["sensitivity"]):
+            row.update(
+                {
+                    "sensitivity": abs(delta),
+                    "delta": delta,
+                    "scenario_score": float(score),
+                    "candidate_value": meta["candidate_value"],
+                }
+            )
+
+    return pd.DataFrame(rows_by_feature.values()).sort_values(
+        ["sensitivity", "feature"],
+        ascending=[False, True],
+    )
 
 
 def shap_default_stratify_columns(df: pd.DataFrame, target: str, feature_names: list[str]) -> list[str]:
@@ -704,11 +834,76 @@ def render_what_if_workspace(
     row_cols[1].metric("Actual target", str(actual_target))
     row_cols[2].metric("Model input columns", f"{len(feature_names):,}")
     base_row = prepare_model_frame(df.iloc[[int(row_position)]], feature_names)
+    order_mode = st.selectbox(
+        "Editable variable order",
+        options=["Local sensitivity", "Model input order"],
+        index=0,
+        help=(
+            "Local sensitivity scores one-at-a-time alternatives for this customer and places the "
+            "variables with the largest absolute score impact first."
+        ),
+    )
+    editor_features = list(feature_names)
+    sensitivity_frame: pd.DataFrame | None = None
+    if order_mode == "Local sensitivity":
+        cache = st.session_state.setdefault(WHAT_IF_SENSITIVITY_CACHE_KEY, {})
+        if not isinstance(cache, dict):
+            st.session_state[WHAT_IF_SENSITIVITY_CACHE_KEY] = {}
+            cache = st.session_state[WHAT_IF_SENSITIVITY_CACHE_KEY]
+        cache_key = (
+            data_key,
+            id(state.get("model")),
+            int(row_position),
+            tuple(feature_names),
+            str(df.index[int(row_position)]),
+            int(len(df)),
+        )
+        try:
+            if cache_key not in cache:
+                with st.spinner("Ranking editable variables by local sensitivity..."):
+                    cache[cache_key] = what_if_local_sensitivity(
+                        model=state["model"],
+                        df=df,
+                        row_position=int(row_position),
+                        feature_names=feature_names,
+                        positive_class=state.get("positive_class"),
+                        positive_index=state.get("positive_index"),
+                    )
+            sensitivity_frame = cache[cache_key].copy()
+            editor_features = [
+                feature for feature in sensitivity_frame["feature"].astype(str).tolist() if feature in feature_names
+            ]
+            editor_features.extend([feature for feature in feature_names if feature not in editor_features])
+        except Exception as exc:
+            st.warning(f"Local sensitivity ranking failed; using model input order. Detail: {exc}")
+            sensitivity_frame = None
+            editor_features = list(feature_names)
+
+    if sensitivity_frame is not None:
+        with st.expander("Local sensitivity ranking", expanded=False):
+            st.caption(
+                "Sensitivity is the largest absolute score delta found by replacing one variable at a time "
+                "with representative values from the active data."
+            )
+            st.dataframe(
+                sensitivity_frame.head(50),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "sensitivity": st.column_config.NumberColumn(format="%.6f"),
+                    "delta": st.column_config.NumberColumn(format="%+.6f"),
+                    "base_score": st.column_config.NumberColumn(format="%.6f"),
+                    "scenario_score": st.column_config.NumberColumn(format="%.6f"),
+                },
+            )
+
+    editor_base_row = base_row.loc[:, editor_features]
+    editor_order_signature = str(abs(hash(tuple(editor_features))))
     edited = st.data_editor(
-        base_row,
+        editor_base_row,
         hide_index=True,
         width="stretch",
-        key=f"what_if_editor::{data_key}::{int(row_position)}",
+        key=f"what_if_editor::{data_key}::{int(row_position)}::{editor_order_signature}",
     )
     if st.button("Score scenario", width="stretch", type="primary"):
         try:
