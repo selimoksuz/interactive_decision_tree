@@ -4138,7 +4138,9 @@ def is_checkpoint_ui_state_key(key: Any) -> bool:
         "shap_background_rows",
         "shap_explain_rows",
         "shap_kernel_samples",
+        "shap_sampling_pool_rows",
         "shap_sample_seed",
+        "shap_stratify_columns",
         "shap_plot_top_features",
         "shap_interaction_main_feature",
         "shap_interaction_color_feature",
@@ -6792,6 +6794,7 @@ def main() -> None:
         render_shap_workspace(
             df=df,
             features=features,
+            target=target,
             positive_class=st.session_state.get(POSITIVE_CLASS_SESSION_KEY),
             data_key=data_key,
         )

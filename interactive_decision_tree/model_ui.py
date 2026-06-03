@@ -26,6 +26,16 @@ from .model_tools import (
 
 MODEL_STATE_KEY = "_interactive_tree_model_pipeline_state"
 SHAP_RESULT_KEY = "_interactive_tree_shap_result"
+DEFAULT_SHAP_SCORE_BINS = 10
+DEFAULT_SHAP_STRATIFY_CANDIDATES = (
+    "segment",
+    "product",
+    "channel",
+    "region",
+    "risk_band_hint",
+    "collection_status",
+    "employment_type",
+)
 
 
 def model_state() -> dict[str, Any] | None:
@@ -91,6 +101,150 @@ def find_row_position_by_id_value(df: pd.DataFrame, id_column: str, raw_value: A
     if len(positions) == 0:
         return None
     return int(positions[0])
+
+
+def shap_default_stratify_columns(df: pd.DataFrame, target: str, feature_names: list[str]) -> list[str]:
+    out: list[str] = []
+    for column in DEFAULT_SHAP_STRATIFY_CANDIDATES:
+        if column in df.columns and column != target:
+            out.append(column)
+        if len(out) >= 2:
+            break
+    if len(out) < 2:
+        for column in df.columns:
+            name = str(column)
+            if name == target or name in out:
+                continue
+            if pd.api.types.is_object_dtype(df[column]) or isinstance(df[column].dtype, pd.CategoricalDtype):
+                out.append(name)
+            if len(out) >= 2:
+                break
+    return out
+
+
+def shap_score_band_labels(scores: pd.Series, bins: int = DEFAULT_SHAP_SCORE_BINS) -> pd.Series:
+    numeric = pd.to_numeric(scores, errors="coerce")
+    out = pd.Series("score_missing", index=scores.index, dtype="object")
+    valid = numeric[numeric.notna()]
+    if valid.empty:
+        return out
+    band_count = max(1, min(int(bins), len(valid)))
+    if band_count == 1:
+        out.loc[valid.index] = "score_01"
+        return out
+    ranked = valid.rank(method="first")
+    codes = pd.qcut(ranked, q=band_count, labels=False, duplicates="drop")
+    out.loc[valid.index] = [f"score_{int(code) + 1:02d}" for code in codes]
+    return out
+
+
+def shap_strata_labels(
+    df: pd.DataFrame,
+    scores: pd.Series,
+    target: str,
+    extra_columns: list[str],
+    score_bins: int = DEFAULT_SHAP_SCORE_BINS,
+) -> pd.Series:
+    parts = [shap_score_band_labels(scores, bins=score_bins).astype(str)]
+    if target in df.columns:
+        parts.append(df[target].astype("object").where(df[target].notna(), "__MISSING__").astype(str))
+    for column in extra_columns:
+        if column in df.columns:
+            parts.append(df[column].astype("object").where(df[column].notna(), "__MISSING__").astype(str))
+    labels = parts[0].copy()
+    for part in parts[1:]:
+        labels = labels + "|" + part
+    return labels
+
+
+def stratified_sample_by_labels(
+    df: pd.DataFrame,
+    labels: pd.Series,
+    n: int,
+    random_state: int,
+    exclude_index: pd.Index | None = None,
+) -> pd.DataFrame:
+    if n <= 0 or df.empty:
+        return df.iloc[0:0].copy()
+    available = df
+    available_labels = labels.reindex(df.index)
+    if exclude_index is not None:
+        mask = ~available.index.isin(exclude_index)
+        if int(mask.sum()) >= int(n):
+            available = available.loc[mask]
+            available_labels = available_labels.loc[available.index]
+    if len(available) <= int(n):
+        return available.copy()
+
+    group_sizes = available_labels.groupby(available_labels, dropna=False).size().sort_values(ascending=False)
+    if group_sizes.empty:
+        return available.sample(n=int(n), random_state=int(random_state)).copy()
+
+    if int(n) >= len(group_sizes):
+        quotas = pd.Series(1, index=group_sizes.index, dtype=int)
+        remaining = int(n) - int(quotas.sum())
+    else:
+        quotas = pd.Series(1, index=group_sizes.head(int(n)).index, dtype=int)
+        remaining = 0
+
+    if remaining > 0:
+        raw = (group_sizes / float(group_sizes.sum())) * remaining
+        floors = np.floor(raw).astype(int)
+        quotas = quotas.add(floors, fill_value=0).astype(int)
+        quotas = pd.Series(
+            {label: min(int(quotas.get(label, 0)), int(group_sizes[label])) for label in group_sizes.index},
+            dtype=int,
+        )
+        leftover = int(n) - int(quotas.sum())
+        fractional = (raw - floors).sort_values(ascending=False)
+        for label in fractional.index:
+            if leftover <= 0:
+                break
+            if int(quotas.get(label, 0)) < int(group_sizes[label]):
+                quotas[label] = int(quotas.get(label, 0)) + 1
+                leftover -= 1
+
+    sampled_parts: list[pd.DataFrame] = []
+    for offset, (label, quota) in enumerate(quotas.items()):
+        take = int(quota)
+        if take <= 0:
+            continue
+        group = available.loc[available_labels == label]
+        if group.empty:
+            continue
+        sampled_parts.append(group.sample(n=min(take, len(group)), random_state=int(random_state) + offset))
+
+    sampled = pd.concat(sampled_parts) if sampled_parts else available.iloc[0:0].copy()
+    if len(sampled) < int(n):
+        remaining_frame = available.drop(index=sampled.index, errors="ignore")
+        if not remaining_frame.empty:
+            fill = remaining_frame.sample(
+                n=min(int(n) - len(sampled), len(remaining_frame)),
+                random_state=int(random_state) + 10_000,
+            )
+            sampled = pd.concat([sampled, fill])
+    return sampled.sample(frac=1.0, random_state=int(random_state) + 20_000).copy()
+
+
+def scored_shap_sampling_pool(
+    model: Any,
+    df: pd.DataFrame,
+    feature_names: list[str],
+    *,
+    positive_class: Any | None,
+    positive_index: int | None,
+    pool_rows: int,
+    random_state: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    bounded_rows = max(1, min(int(pool_rows), len(df)))
+    pool = df.sample(n=bounded_rows, random_state=int(random_state)).copy() if len(df) > bounded_rows else df.copy()
+    scores = predict_model_scores(
+        model,
+        prepare_model_frame(pool, feature_names),
+        positive_class=positive_class,
+        positive_index=positive_index,
+    ).scores
+    return pool, pd.Series(scores, index=pool.index, name="model_score")
 
 
 def render_model_summary(state: dict[str, Any], df: pd.DataFrame, features: list[str]) -> None:
@@ -184,6 +338,7 @@ def render_shap_workspace(
     *,
     df: pd.DataFrame,
     features: list[str],
+    target: str,
     positive_class: Any,
     data_key: str,
 ) -> None:
@@ -204,11 +359,11 @@ def render_shap_workspace(
         st.error(f"Active data is missing model input column(s): {', '.join(missing)}")
         return
 
-    settings_col1, settings_col2, settings_col3 = st.columns(3)
+    settings_col1, settings_col2, settings_col3, settings_col4 = st.columns(4)
     background_rows = settings_col1.number_input(
         "Background rows",
         min_value=1,
-        max_value=min(500, len(df)),
+        max_value=min(2_000, len(df)),
         value=min(50, len(df)),
         step=10,
         format="%d",
@@ -217,7 +372,7 @@ def render_shap_workspace(
     explain_rows = settings_col2.number_input(
         "Explain rows",
         min_value=1,
-        max_value=min(100, len(df)),
+        max_value=min(2_000, len(df)),
         value=min(10, len(df)),
         step=1,
         format="%d",
@@ -232,14 +387,71 @@ def render_shap_workspace(
         format="%d",
         key="shap_kernel_samples",
     )
+    default_pool_rows = min(len(df), max(5_000, int(background_rows) + int(explain_rows) * 20))
+    pool_rows = settings_col4.number_input(
+        "Sampling pool rows",
+        min_value=min(len(df), max(1, int(background_rows), int(explain_rows))),
+        max_value=min(200_000, len(df)),
+        value=default_pool_rows,
+        step=1_000,
+        format="%d",
+        key="shap_sampling_pool_rows",
+        help="Rows scored before stratified background/explain selection. Larger pools represent the active data better but add one scoring pass.",
+    )
     seed = st.number_input("SHAP sample seed", value=20260514, step=1, key="shap_sample_seed")
+    candidate_strata_columns = [
+        str(column)
+        for column in df.columns
+        if str(column) != target
+    ]
+    default_strata_columns = [
+        column for column in shap_default_stratify_columns(df, target, feature_names) if column in candidate_strata_columns
+    ]
+    stratify_columns = st.multiselect(
+        "Additional stratify columns",
+        options=candidate_strata_columns,
+        default=default_strata_columns,
+        key="shap_stratify_columns",
+        help="Score band and target are always used when available. These columns add business segment balance.",
+    )
     if st.button("Run SHAP analysis", width="stretch", type="primary"):
         try:
-            background = df.sample(n=int(background_rows), random_state=int(seed)) if len(df) > int(background_rows) else df
-            explain = df.sample(n=int(explain_rows), random_state=int(seed) + 1) if len(df) > int(explain_rows) else df
             with st.status("Running Kernel SHAP", expanded=True) as status:
+                status.write(f"Sampling pool rows: {int(pool_rows):,}")
+                pool, pool_scores = scored_shap_sampling_pool(
+                    state["model"],
+                    df,
+                    feature_names,
+                    positive_class=positive_class,
+                    positive_index=state.get("positive_index"),
+                    pool_rows=int(pool_rows),
+                    random_state=int(seed),
+                )
+                strata = shap_strata_labels(
+                    pool,
+                    pool_scores,
+                    target=target,
+                    extra_columns=list(stratify_columns),
+                    score_bins=DEFAULT_SHAP_SCORE_BINS,
+                )
+                background = stratified_sample_by_labels(
+                    pool,
+                    strata,
+                    int(background_rows),
+                    random_state=int(seed) + 1,
+                )
+                explain = stratified_sample_by_labels(
+                    pool,
+                    strata,
+                    int(explain_rows),
+                    random_state=int(seed) + 2,
+                    exclude_index=background.index,
+                )
+                background_scores = pool_scores.reindex(background.index)
+                explain_scores = pool_scores.reindex(explain.index)
                 status.write(f"Background rows: {len(background):,}")
                 status.write(f"Explain rows: {len(explain):,}")
+                status.write(f"Strata columns: score_band, {target}" + (f", {', '.join(stratify_columns)}" if stratify_columns else ""))
                 result = kernel_shap_contributions(
                     state["model"],
                     background,
@@ -249,6 +461,18 @@ def render_shap_workspace(
                     positive_index=state.get("positive_index"),
                     nsamples=int(nsamples),
                 )
+                result["sampling"] = {
+                    "mode": "score_band_stratified",
+                    "pool_rows": int(len(pool)),
+                    "score_bins": int(DEFAULT_SHAP_SCORE_BINS),
+                    "target": target if target in pool.columns else None,
+                    "stratify_columns": list(stratify_columns),
+                    "background_rows": int(len(background)),
+                    "explain_rows": int(len(explain)),
+                    "background_score_mean": float(background_scores.mean()) if background_scores.notna().any() else None,
+                    "explain_score_mean": float(explain_scores.mean()) if explain_scores.notna().any() else None,
+                    "strata_count": int(strata.nunique(dropna=False)),
+                }
                 status.update(label="SHAP analysis complete", state="complete", expanded=False)
         except Exception as exc:
             st.error(f"SHAP failed: {exc}")
@@ -262,6 +486,14 @@ def render_shap_workspace(
         st.session_state.pop(SHAP_RESULT_KEY, None)
         st.info("Existing SHAP result was cleared because model input columns changed.")
         return
+    sampling = result.get("sampling")
+    if isinstance(sampling, dict):
+        with st.expander("SHAP sampling", expanded=False):
+            st.dataframe(
+                pd.DataFrame([sampling]),
+                hide_index=True,
+                width="stretch",
+            )
     importance = shap_global_importance(result)
     st.bar_chart(importance.set_index("feature")["mean_abs_shap"])
     st.dataframe(importance, hide_index=True, width="stretch")
