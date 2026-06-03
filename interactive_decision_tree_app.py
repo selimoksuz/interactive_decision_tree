@@ -1935,6 +1935,7 @@ def cached_candidate_meta(data_key: str, target: str, node_id: int) -> dict[str,
 def split_ranking_scope_caption(
     candidate_feature_count: int,
     total_feature_count: int,
+    ranked_feature_limit: int,
     selected_node_rows: int,
     active_train_rows: int,
 ) -> str:
@@ -1945,10 +1946,16 @@ def split_ranking_scope_caption(
             f"{selected_node_rows:,} row(s) in the selected leaf "
             f"out of {active_train_rows:,} active train row(s)"
         )
+    limit_text = (
+        f"and keep the top {ranked_feature_limit:,} variable(s)"
+        if ranked_feature_limit < total_feature_count
+        else "and keep all ranked variable(s)"
+    )
     return (
-        f"Split search will rank the first {candidate_feature_count:,} of {total_feature_count:,} "
-        f"active split variable(s) on {row_scope}. Select or reset the root node to rank on the "
-        "full active train data. Use Data Setup > Sample to reduce the active train data before building the tree."
+        f"Split search will scan {candidate_feature_count:,} of {total_feature_count:,} "
+        f"active split variable(s) on {row_scope}, {limit_text} for this leaf. "
+        "Select or reset the root node to rank on the full active train data. "
+        "Use Data Setup > Sample to reduce the active train data before building the tree."
     )
 
 
@@ -2245,6 +2252,7 @@ def build_optimal_tree(
     df: pd.DataFrame,
     target: str,
     features: list[str],
+    ranked_feature_limit: int,
     test_df: pd.DataFrame | None,
     min_leaf: int,
     max_thresholds: int,
@@ -2267,6 +2275,7 @@ def build_optimal_tree(
         "candidate_count": 0,
         "validated_candidate_count": 0,
         "evaluated_features": list(features),
+        "ranked_feature_limit": int(ranked_feature_limit),
         "best_candidate": None,
         "min_information_gain": float(min_information_gain),
         "stop_reason": None,
@@ -2321,6 +2330,12 @@ def build_optimal_tree(
             max_category_groups=max_category_groups,
             parallel_workers=parallel_workers,
         )
+        ranked_features, _ = top_ranked_features_for_leaf(
+            candidates,
+            features,
+            ranked_feature_limit,
+        )
+        candidates = candidates_for_ranked_features(candidates, ranked_features)
         st.session_state.auto_tree_diagnostics["candidate_count"] += len(candidates)
         if candidates:
             best_seen = candidates[0]
@@ -3199,8 +3214,8 @@ def render_feature_manager_fragment(
         disabled=not draft_features,
         key=split_limit_key,
         help=(
-            "Only the first N active split variables are evaluated for split ranking and optimal tree. "
-            "Set this here, then apply data setup before computing rankings."
+            "All active split variables are scanned in the selected leaf; only the top N ranked "
+            "variables are kept for that leaf's split ranking and optimal-tree search."
         ),
     )
     draft_split_variable_limit = min(
@@ -4841,6 +4856,36 @@ def ordered_features_by_gain(features: list[str], feature_stats: dict[str, dict[
         ),
         reverse=True,
     )
+
+
+def top_ranked_features_for_leaf(
+    candidates: list[SplitCandidate],
+    features: list[str],
+    ranked_feature_limit: int,
+    validation_lookup: dict[int, dict[str, Any]] | None = None,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    feature_rows = feature_summary_rows(
+        candidates,
+        features,
+        validation_lookup=validation_lookup,
+    )
+    feature_stats = {row["variable"]: row for row in feature_rows}
+    ordered = ordered_features_by_gain(features, feature_stats)
+    if ranked_feature_limit > 0:
+        ordered = ordered[:ranked_feature_limit]
+    return ordered, feature_stats
+
+
+def candidates_for_ranked_features(
+    candidates: list[SplitCandidate],
+    ranked_features: list[str],
+) -> list[SplitCandidate]:
+    ranked_feature_set = set(ranked_features)
+    return [candidate for candidate in candidates if candidate.feature in ranked_feature_set]
+
+
+def candidate_scoring_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in parameters.items() if key != "split_variable_limit"}
 
 
 def node_feature_key(data_key: str, target: str, node_id: int) -> str:
@@ -6903,7 +6948,7 @@ def main() -> None:
         len(features),
         safe_int(applied_context.get("split_variable_limit"), default=min(50, max(1, len(features))), minimum=1),
     ) if features else 0
-    ranking_features = features[:split_variable_limit]
+    ranking_features = features
 
     state_key = (data_key, target, TREE_SCHEMA_VERSION)
     if "state_key" not in st.session_state or st.session_state.state_key != state_key:
@@ -6923,6 +6968,7 @@ def main() -> None:
         "parallel_workers": parallel_workers,
         "split_variable_limit": split_variable_limit,
     }
+    scoring_parameters = candidate_scoring_parameters(parameters)
     saved_auto_parameters = (
         checkpoint.get("auto_parameters")
         if isinstance(checkpoint, dict) and checkpoint_data_key == data_key
@@ -7010,7 +7056,8 @@ def main() -> None:
             split_count = build_optimal_tree(
                 df=df,
                 target=target,
-                features=ranking_features,
+                features=features,
+                ranked_feature_limit=split_variable_limit,
                 test_df=test_df,
                 min_leaf=min_leaf,
                 max_thresholds=max_thresholds,
@@ -7136,7 +7183,7 @@ def main() -> None:
             node_id=current["id"],
             features=candidate_features,
             row_count=current_row_count,
-            parameters=parameters,
+            parameters=scoring_parameters,
             max_rows=current_row_count,
         )
         preflight_cached_meta = cached_candidate_meta(data_key, target, current["id"])
@@ -7154,6 +7201,7 @@ def main() -> None:
                 split_ranking_scope_caption(
                     candidate_feature_count=len(candidate_features),
                     total_feature_count=len(features),
+                    ranked_feature_limit=split_variable_limit,
                     selected_node_rows=current_row_count,
                     active_train_rows=len(df),
                 )
@@ -7183,7 +7231,8 @@ def main() -> None:
                 sampled_row_idx = analysis_row_idx(current["row_idx"], candidate_max_rows, df=df, target=target)
                 compute_caption = (
                     f"Compute split ranking on all {current_row_count:,} rows "
-                    f"across {len(candidate_features):,} variable(s)."
+                    f"across {len(candidate_features):,} variable(s); "
+                    f"showing top {split_variable_limit:,} variable(s) for this leaf."
                 )
                 with st.spinner(compute_caption):
                     all_candidates = candidate_splits(
@@ -7216,7 +7265,7 @@ def main() -> None:
         overview_cols = st.columns(4)
         overview_cols[0].metric("Active train rows", f"{len(df):,}")
         overview_cols[1].metric("Split variables", f"{len(features):,}")
-        overview_cols[2].metric("Ranking variables", f"{len(candidate_features):,}")
+        overview_cols[2].metric("Leaf ranking limit", f"{split_variable_limit:,}")
         overview_cols[3].metric("Tree nodes", f"{len(tree):,}")
         st.info("Tree details, graph, model performance, and node tables stay idle until you compute ranking or open details.")
         if st.button("Open tree detail workspace", width="stretch"):
@@ -7268,6 +7317,7 @@ def main() -> None:
             split_ranking_scope_caption(
                 candidate_feature_count=len(candidate_features),
                 total_feature_count=len(features),
+                ranked_feature_limit=split_variable_limit,
                 selected_node_rows=current_row_count,
                 active_train_rows=len(df),
             )
@@ -7278,7 +7328,7 @@ def main() -> None:
             node_id=current["id"],
             features=candidate_features,
             row_count=current_row_count,
-            parameters=parameters,
+            parameters=scoring_parameters,
             max_rows=current_row_count,
         )
         sidebar_cached_meta = cached_candidate_meta(data_key, target, current["id"])
@@ -7374,7 +7424,7 @@ def main() -> None:
                     node_id=current["id"],
                     features=candidate_features,
                     row_count=current_row_count,
-                    parameters=parameters,
+                    parameters=scoring_parameters,
                     max_rows=candidate_max_rows,
                 )
                 cached_meta = cached_candidate_meta(data_key, target, current["id"])
@@ -7383,7 +7433,8 @@ def main() -> None:
                 all_candidates = cached_candidates if cached_candidates is not None else []
                 compute_caption = (
                     f"Compute split ranking on all {current_row_count:,} rows "
-                    f"across {len(candidate_features):,} variable(s)."
+                    f"across {len(candidate_features):,} variable(s); "
+                    f"showing top {split_variable_limit:,} variable(s) for this leaf."
                 )
                 if large_leaf and not cached_meta:
                     st.warning(
@@ -7446,17 +7497,18 @@ def main() -> None:
                         "with Train/Test Gini gap controlled automatically."
                     )
 
-                feature_rows = feature_summary_rows(
+                leaf_feature_options, feature_stats = top_ranked_features_for_leaf(
                     all_candidates,
                     candidate_features,
+                    split_variable_limit,
                     validation_lookup=validation_lookup,
                 )
-                feature_stats = {row["variable"]: row for row in feature_rows}
-                leaf_feature_options = ordered_features_by_gain(candidate_features, feature_stats)
+                ranked_feature_set = set(leaf_feature_options)
                 positive_candidates = [
                     candidate
                     for candidate in all_candidates
-                    if candidate.information_gain > MIN_INFORMATION_GAIN_EPSILON
+                    if candidate.feature in ranked_feature_set
+                    and candidate.information_gain > MIN_INFORMATION_GAIN_EPSILON
                 ]
                 if not leaf_feature_options or not positive_candidates:
                     st.warning("No split with positive information gain found for this leaf.")

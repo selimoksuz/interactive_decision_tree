@@ -65,6 +65,7 @@ def test_split_ranking_scope_caption_distinguishes_leaf_from_active_train():
     message = split_ranking_scope_caption(
         candidate_feature_count=6,
         total_feature_count=6,
+        ranked_feature_limit=3,
         selected_node_rows=500,
         active_train_rows=5_000,
     )
@@ -72,6 +73,7 @@ def test_split_ranking_scope_caption_distinguishes_leaf_from_active_train():
     assert "500 row(s) in the selected leaf" in message
     assert "5,000 active train row(s)" in message
     assert "full active train data" in message
+    assert "top 3 variable(s)" in message
 
 
 def test_cached_ranking_message_distinguishes_leaf_from_active_train():
@@ -771,6 +773,7 @@ def test_build_optimal_tree_penalizes_but_allows_validation_unsafe_split():
         df=train,
         target="risk_flag",
         features=["x"],
+        ranked_feature_limit=1,
         test_df=test,
         min_leaf=1,
         max_thresholds=3,
@@ -810,6 +813,7 @@ def test_build_optimal_tree_stops_when_validation_score_would_fall():
         df=train,
         target="risk_flag",
         features=["x"],
+        ranked_feature_limit=1,
         test_df=test,
         min_leaf=1,
         max_thresholds=3,
@@ -843,6 +847,7 @@ def test_build_optimal_tree_records_zero_split_diagnostics_when_gain_is_too_low(
         df=train,
         target="risk_flag",
         features=["x"],
+        ranked_feature_limit=1,
         test_df=None,
         min_leaf=1,
         max_thresholds=5,
@@ -862,6 +867,44 @@ def test_build_optimal_tree_records_zero_split_diagnostics_when_gain_is_too_low(
     assert diagnostics["candidate_count"] > 0
     assert diagnostics["best_candidate"]["feature"] == "x"
     assert diagnostics["best_candidate"]["information_gain"] < 1.0
+
+
+def test_build_optimal_tree_reranks_limited_features_per_leaf():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x_root": [0, 0, 0, 0, 1, 1, 1, 1],
+            "y_child": [0, 0, 1, 1, 0, 0, 1, 1],
+            "risk_flag": ["low", "low", "high", "high", "high", "high", "high", "high"],
+        }
+    )
+
+    split_count = build_optimal_tree(
+        df=train,
+        target="risk_flag",
+        features=["x_root", "y_child"],
+        ranked_feature_limit=1,
+        test_df=None,
+        min_leaf=1,
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=2,
+        max_category_groups=2,
+        max_depth=2,
+        max_leaves=4,
+        min_information_gain=0.0,
+        candidate_rows=len(train),
+        parallel_workers=1,
+        max_validation_gini_gap=0.1,
+    )
+
+    assert split_count == 2
+    assert st.session_state.tree[0]["split"]["feature"] == "x_root"
+    assert any(
+        node.get("split", {}).get("feature") == "y_child"
+        for node in st.session_state.tree.values()
+        if node["id"] != 0
+    )
 
 
 def test_build_optimal_tree_can_continue_from_existing_tree():
@@ -890,6 +933,7 @@ def test_build_optimal_tree_can_continue_from_existing_tree():
         df=train,
         target="risk_flag",
         features=["x"],
+        ranked_feature_limit=1,
         test_df=None,
         min_leaf=1,
         max_thresholds=3,
@@ -945,6 +989,7 @@ def test_build_optimal_tree_reset_true_rebuilds_from_root():
         df=train,
         target="risk_flag",
         features=["x"],
+        ranked_feature_limit=1,
         test_df=None,
         min_leaf=1,
         max_thresholds=3,
