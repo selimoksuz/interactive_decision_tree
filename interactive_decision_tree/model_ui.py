@@ -252,6 +252,10 @@ def shap_default_stratify_columns(df: pd.DataFrame, target: str, feature_names: 
     return out
 
 
+def shap_interaction_color_options(feature_names: list[str], main_feature: str) -> list[str]:
+    return ["auto"] + [feature for feature in feature_names if feature != main_feature]
+
+
 def shap_score_band_labels(scores: pd.Series, bins: int = DEFAULT_SHAP_SCORE_BINS) -> pd.Series:
     numeric = pd.to_numeric(scores, errors="coerce")
     out = pd.Series("score_missing", index=scores.index, dtype="object")
@@ -746,18 +750,27 @@ def render_shap_plots(result: dict[str, Any]) -> None:
                 index=feature_names.index(default_feature) if default_feature in feature_names else 0,
                 key="shap_interaction_main_feature",
             )
-            interaction_options = ["auto"] + feature_names
+            st.caption(
+                "X-axis is the raw value of the selected feature. Y-axis is that same feature's SHAP "
+                "contribution. Pair interaction is represented by color."
+            )
+            interaction_options = shap_interaction_color_options(feature_names, main_feature)
+            interaction_key = "shap_interaction_color_feature"
+            if st.session_state.get(interaction_key) not in interaction_options:
+                st.session_state[interaction_key] = "auto"
             interaction_feature = st.selectbox(
                 "Interaction color",
                 options=interaction_options,
-                key="shap_interaction_color_feature",
+                key=interaction_key,
             )
+            if len(interaction_options) == 1:
+                st.info("Only one model feature is available, so a pairwise interaction color cannot be shown.")
             shap.dependence_plot(
                 main_feature,
                 values,
                 plot_data,
                 feature_names=feature_names,
-                interaction_index=interaction_feature,
+                interaction_index=interaction_feature if len(interaction_options) > 1 else None,
                 show=False,
             )
             st.pyplot(plt.gcf(), clear_figure=True)

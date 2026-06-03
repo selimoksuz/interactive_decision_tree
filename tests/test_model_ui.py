@@ -6,6 +6,7 @@ from interactive_decision_tree.model_ui import (
     default_id_column,
     find_row_position_by_id_value,
     shap_default_stratify_columns,
+    shap_interaction_color_options,
     shap_score_band_labels,
     shap_stratify_column_labels,
     shap_strata_labels,
@@ -125,6 +126,12 @@ def test_shap_default_stratify_columns_prefers_business_columns_outside_model_fe
     )
 
     assert shap_default_stratify_columns(df, "risk_flag", ["income"]) == ["segment", "product"]
+
+
+def test_shap_interaction_color_options_exclude_main_feature():
+    options = shap_interaction_color_options(["income", "age", "segment"], "income")
+
+    assert options == ["auto", "age", "segment"]
 
 
 def test_shap_strata_labels_keep_numeric_target_as_class_label():
