@@ -92,6 +92,7 @@ IDENTIFIER_COLUMN_NAMES = {
 PREDICTION_THRESHOLD_FIXED = "fixed_0_5"
 PREDICTION_THRESHOLD_F1 = "max_f1"
 PREDICTION_THRESHOLD_MANUAL = "manual"
+PREDICTION_THRESHOLD_EPSILON = 1e-12
 PREDICTION_THRESHOLD_LABELS = {
     PREDICTION_THRESHOLD_FIXED: "Fixed 0.50",
     PREDICTION_THRESHOLD_F1: "Max F1 on Train",
@@ -500,7 +501,7 @@ def binary_prediction_from_rate(
         return None
     if not np.isfinite(rate):
         return None
-    return positive_class if rate >= float(threshold) else negative_class
+    return positive_class if rate + PREDICTION_THRESHOLD_EPSILON >= float(threshold) else negative_class
 
 
 def best_f1_threshold_from_scores(y_true: pd.Series, scores: pd.Series) -> dict[str, Any]:
@@ -6501,6 +6502,14 @@ def leaf_performance_rows(
         if target_kind == "binary":
             row["positive_class"] = summary["positive_class"]
             row["default_rate"] = summary.get("default_rate", 0.0)
+            row["measurement_default_rate"] = summary.get("default_rate", 0.0)
+            row["train_default_rate"] = train_summary.get("default_rate", np.nan)
+            row["prediction_threshold"] = train_summary.get("prediction_threshold", np.nan)
+            row["prediction_margin"] = (
+                float(row["train_default_rate"]) - float(row["prediction_threshold"])
+                if pd.notna(row["train_default_rate"]) and pd.notna(row["prediction_threshold"])
+                else np.nan
+            )
             row["event_count"] = summary.get("event_count", 0)
         elif target_kind == "regression":
             row["target_mean"] = summary.get("target_mean")
@@ -7273,12 +7282,12 @@ def main() -> None:
     if threshold_status_slot is not None:
         threshold_summary = resolved_prediction_threshold_summary(df, target)
         threshold_value = threshold_summary.get("threshold")
-        threshold_text = f"{float(threshold_value):.4f}" if threshold_value is not None else "-"
+        threshold_text = f"{float(threshold_value):.6f}" if threshold_value is not None else "-"
         if threshold_summary.get("mode") == PREDICTION_THRESHOLD_F1 and threshold_summary.get("f1") is not None:
             threshold_status_slot.caption(
-                f"Active cutoff: {threshold_text} | Train F1={float(threshold_summary['f1']):.4f} "
-                f"| precision={float(threshold_summary['precision']):.4f} "
-                f"| recall={float(threshold_summary['recall']):.4f}"
+                f"Active cutoff: {threshold_text} | Train F1={float(threshold_summary['f1']):.6f} "
+                f"| precision={float(threshold_summary['precision']):.6f} "
+                f"| recall={float(threshold_summary['recall']):.6f}"
             )
         else:
             threshold_status_slot.caption(f"Active cutoff: {threshold_text}")
@@ -7618,7 +7627,8 @@ def main() -> None:
         )
         if leaf_rows:
             st.caption(
-                f"Leaf performance is measured on {leaf_dataset_name}. Splits and predictions are fitted on Train."
+                f"Leaf performance is measured on {leaf_dataset_name}. Predict uses Train default rate "
+                "against the active threshold; default_rate is the measured dataset rate."
             )
             st.dataframe(
                 arrow_safe_dataframe(pd.DataFrame(leaf_rows)),
@@ -7626,6 +7636,10 @@ def main() -> None:
                 width="stretch",
                 column_config={
                     "default_rate": st.column_config.NumberColumn(format="%.6f"),
+                    "measurement_default_rate": st.column_config.NumberColumn(format="%.6f"),
+                    "train_default_rate": st.column_config.NumberColumn(format="%.6f"),
+                    "prediction_threshold": st.column_config.NumberColumn(format="%.6f"),
+                    "prediction_margin": st.column_config.NumberColumn(format="%+.6f"),
                     "impurity": st.column_config.NumberColumn(format="%.6f"),
                     "target_mean": st.column_config.NumberColumn(format="%.6f"),
                     "target_std": st.column_config.NumberColumn(format="%.6f"),
@@ -7709,7 +7723,11 @@ def main() -> None:
         st.metric("Rows", f"{summary['n']:,}")
         st.metric(summary["impurity_label"], f"{summary['impurity']:.4f}")
         if summary["target_kind"] == "binary":
-            st.metric("Default rate", f"{summary.get('default_rate', 0.0):.4f}")
+            default_rate = float(summary.get("default_rate", 0.0) or 0.0)
+            prediction_threshold = float(summary.get("prediction_threshold", 0.5) or 0.5)
+            st.metric("Default rate", f"{default_rate:.6f}")
+            st.metric("Prediction threshold", f"{prediction_threshold:.6f}")
+            st.metric("Prediction margin", f"{default_rate - prediction_threshold:+.6f}")
         elif summary["target_kind"] == "regression":
             st.metric("Target mean", f"{summary.get('target_mean', 0.0):.4f}")
         st.write("Prediction:", summary["prediction"])

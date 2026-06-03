@@ -7,6 +7,7 @@ import streamlit as st
 from interactive_decision_tree.session_store import save_dataframe_session
 from interactive_decision_tree_app import (
     DEFAULT_DEMO_ROWS,
+    PREDICTION_THRESHOLD_F1,
     PREDICTION_THRESHOLD_MANUAL,
     PREDICTION_THRESHOLD_MANUAL_KEY,
     PREDICTION_THRESHOLD_MODE_KEY,
@@ -703,7 +704,44 @@ def test_leaf_performance_rows_measure_test_when_eval_dataframe_is_present():
     assert by_leaf[1]["n"] == 1
     assert by_leaf[1]["predict"] == "low"
     assert by_leaf[1]["default_rate"] == 1.0
+    assert by_leaf[1]["measurement_default_rate"] == 1.0
+    assert by_leaf[1]["train_default_rate"] == 0.0
+    assert by_leaf[1]["prediction_threshold"] == pytest.approx(0.5)
+    assert by_leaf[1]["prediction_margin"] == pytest.approx(-0.5)
     assert by_leaf[2]["n"] == 1
+    assert by_leaf[2]["predict"] == "high"
+
+
+def test_max_f1_prediction_threshold_assigns_positive_at_cutoff():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0],
+            "risk_flag": ["high", "low", "high", "high"],
+        }
+    )
+    init_tree(train)
+    candidate = score_split(
+        df=train,
+        target="risk_flag",
+        row_idx=train.index.tolist(),
+        feature="x",
+        split_type="numeric_le",
+        value=2.5,
+        min_leaf=1,
+    )
+    assert candidate is not None
+    split_node(train, 0, candidate, select_first_child=False)
+    st.session_state[PREDICTION_THRESHOLD_MODE_KEY] = PREDICTION_THRESHOLD_F1
+
+    rows = leaf_performance_rows(train, "risk_flag", "data")
+    by_leaf = {row["leaf"]: row for row in rows}
+
+    assert by_leaf[1]["train_default_rate"] == pytest.approx(0.5)
+    assert by_leaf[1]["prediction_threshold"] == pytest.approx(0.5)
+    assert by_leaf[1]["prediction_margin"] == pytest.approx(0.0)
+    assert by_leaf[1]["predict"] == "high"
+    assert by_leaf[2]["train_default_rate"] == pytest.approx(1.0)
     assert by_leaf[2]["predict"] == "high"
 
 
