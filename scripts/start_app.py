@@ -25,6 +25,9 @@ APP_IMPORTS = [
     "openpyxl",
     "xlrd",
     "streamlit_agraph",
+    "sklearn",
+    "shap",
+    "optbinning",
 ]
 NOTEBOOK_IMPORTS = ["ipykernel", "notebook"]
 KERNEL_NAME = "interactive_decision_tree_env"

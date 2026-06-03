@@ -259,7 +259,7 @@ def require_shap() -> Any:
     try:
         import shap
     except Exception as exc:
-        raise RuntimeError("The shap package is required for SHAP Analysis. Install shap>=0.52.") from exc
+        raise RuntimeError("The shap package is required for SHAP Analysis. Install shap>=0.47,<0.52 on Python 3.11.") from exc
     return shap
 
 

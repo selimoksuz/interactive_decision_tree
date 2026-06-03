@@ -15,9 +15,11 @@ Ilk kurulum gerekiyorsa:
 
 ```powershell
 cd C:\Users\Acer\interactive_decision_tree
-py -3 -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```
+
+Python 3.11 icin SHAP `>=0.47,<0.52`, scikit-learn `>=1.3,<1.8` araliginda pinlenir. `shap>=0.52` Python 3.12+ ister; `scikit-learn 1.8` ise mevcut `optbinning==0.20.0` kurgusu ile uyumlu degildir.
 
 Notebook icinden kullanmak icin editable kurulum:
 

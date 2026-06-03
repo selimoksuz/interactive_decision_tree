@@ -190,7 +190,7 @@ def optbinning_compatibility_error() -> str | None:
         if optbinning_pair <= (0, 20) and sklearn_pair >= (1, 8):
             return (
                 f"optbinning {optbinning_version} is incompatible with scikit-learn {sklearn_version}. "
-                "Install scikit-learn<1.8 or use a compatible optbinning/OR-Tools/Python combination."
+                "Install scikit-learn>=1.3,<1.8 or use a compatible optbinning/OR-Tools/Python combination."
             )
     return None
 
