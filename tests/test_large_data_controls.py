@@ -7,8 +7,12 @@ import streamlit as st
 from interactive_decision_tree.session_store import save_dataframe_session
 from interactive_decision_tree_app import (
     DEFAULT_DEMO_ROWS,
+    PREDICTION_THRESHOLD_MANUAL,
+    PREDICTION_THRESHOLD_MANUAL_KEY,
+    PREDICTION_THRESHOLD_MODE_KEY,
     analysis_row_idx,
     apply_feature_manager_edits,
+    best_f1_threshold_from_scores,
     build_binary_validation_state,
     build_optimal_tree,
     cached_ranking_ready_message,
@@ -39,6 +43,8 @@ from interactive_decision_tree_app import (
     split_node,
     store_cached_candidates,
     train_test_split_indices,
+    tree_export,
+    tree_predictions,
     update_feature_selection_for_filtered,
     undo_last_split,
     validate_test_dataframe,
@@ -566,6 +572,56 @@ def test_model_metrics_includes_train_rows_and_scored_rows():
     values = metrics.set_index("metric")["value"].to_dict()
     assert values["rows"] == 4
     assert values["scored_rows"] == 4
+
+
+def test_manual_prediction_threshold_changes_binary_leaf_prediction():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1, 2, 3, 4, 5],
+            "risk_flag": ["high", "high", "high", "low", "low"],
+        }
+    )
+    init_tree(train)
+    st.session_state[PREDICTION_THRESHOLD_MODE_KEY] = PREDICTION_THRESHOLD_MANUAL
+    st.session_state[PREDICTION_THRESHOLD_MANUAL_KEY] = 0.7
+
+    predictions = tree_predictions(train, "risk_flag")
+
+    assert set(predictions["positive_rate"]) == {0.6}
+    assert set(predictions["prediction"]) == {"low"}
+
+
+def test_best_f1_threshold_from_scores_selects_cutoff():
+    summary = best_f1_threshold_from_scores(
+        pd.Series([0, 1, 1, 1]),
+        pd.Series([0.2, 0.4, 0.8, 0.9]),
+    )
+
+    assert summary["threshold"] == pytest.approx(0.4)
+    assert summary["f1"] == pytest.approx(1.0)
+    assert summary["precision"] == pytest.approx(1.0)
+    assert summary["recall"] == pytest.approx(1.0)
+
+
+def test_tree_export_records_prediction_threshold():
+    st.session_state.clear()
+    train = pd.DataFrame(
+        {
+            "x": [1, 2, 3, 4, 5],
+            "risk_flag": ["high", "high", "high", "low", "low"],
+        }
+    )
+    init_tree(train)
+    st.session_state[PREDICTION_THRESHOLD_MODE_KEY] = PREDICTION_THRESHOLD_MANUAL
+    st.session_state[PREDICTION_THRESHOLD_MANUAL_KEY] = 0.7
+
+    payload = tree_export(train, "risk_flag", ["x"], parameters={})
+
+    assert payload["prediction_threshold_mode"] == PREDICTION_THRESHOLD_MANUAL
+    assert payload["prediction_threshold"] == pytest.approx(0.7)
+    assert payload["tree"]["target_summary"]["prediction"] == "low"
+    assert payload["tree"]["target_summary"]["default_rate"] == pytest.approx(0.6)
 
 
 def test_model_performance_train_and_test_are_scored_independently():

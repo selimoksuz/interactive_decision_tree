@@ -45,6 +45,8 @@ CHECKPOINT_SCHEMA_VERSION = 1
 WORK_ID_QUERY_PARAM = "work_id"
 CHECKPOINT_DIR = Path(__file__).with_name(".tree_checkpoints")
 POSITIVE_CLASS_SESSION_KEY = "_interactive_tree_positive_class"
+PREDICTION_THRESHOLD_MODE_KEY = "_interactive_tree_prediction_threshold_mode"
+PREDICTION_THRESHOLD_MANUAL_KEY = "_interactive_tree_prediction_threshold_manual"
 APPLIED_DATA_CONTEXT_KEY = "_interactive_tree_applied_data_context"
 WORKSPACE_LAST_RENDERED_KEY = "_interactive_tree_last_rendered_workspace"
 WORKSPACE_TRANSITION_KEY = "_interactive_tree_workspace_transition"
@@ -76,6 +78,7 @@ AUTO_TREE_CANDIDATE_PROPOSAL_ROWS = 500
 AUTO_TREE_GENERALIZATION_VERSION = 4
 NODE_SUMMARY_CACHE_KEY = "_interactive_tree_node_summary_cache"
 TREE_UI_METRIC_CACHE_KEY = "_interactive_tree_ui_metric_cache"
+PREDICTION_THRESHOLD_CACHE_KEY = "_interactive_tree_prediction_threshold_cache"
 TARGET_META_CACHE_KEY = "_interactive_tree_target_meta_cache"
 IDENTIFIER_COLUMN_NAMES = {
     "id",
@@ -85,6 +88,14 @@ IDENTIFIER_COLUMN_NAMES = {
     "account_id",
     "application_id",
     "musteri_id",
+}
+PREDICTION_THRESHOLD_FIXED = "fixed_0_5"
+PREDICTION_THRESHOLD_F1 = "max_f1"
+PREDICTION_THRESHOLD_MANUAL = "manual"
+PREDICTION_THRESHOLD_LABELS = {
+    PREDICTION_THRESHOLD_FIXED: "Fixed 0.50",
+    PREDICTION_THRESHOLD_F1: "Max F1 on Train",
+    PREDICTION_THRESHOLD_MANUAL: "Manual cutoff",
 }
 
 
@@ -443,6 +454,174 @@ def choose_positive_class(y: pd.Series, preferred: Any = None, use_session_defau
         return classes[-1]
 
 
+def clamp_probability(value: Any, default: float = 0.5) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    if not np.isfinite(numeric):
+        numeric = float(default)
+    return float(min(max(numeric, 0.0), 1.0))
+
+
+def prediction_threshold_config() -> tuple[str, float]:
+    mode = str(st.session_state.get(PREDICTION_THRESHOLD_MODE_KEY, PREDICTION_THRESHOLD_FIXED))
+    if mode not in PREDICTION_THRESHOLD_LABELS:
+        mode = PREDICTION_THRESHOLD_FIXED
+    manual = clamp_probability(st.session_state.get(PREDICTION_THRESHOLD_MANUAL_KEY, 0.5))
+    return mode, manual
+
+
+def prediction_threshold_config_signature() -> tuple[str, float]:
+    mode, manual = prediction_threshold_config()
+    return mode, round(manual, 8)
+
+
+def negative_class_for_binary(y: pd.Series, positive_class: Any) -> Any:
+    for cls in y.dropna().unique().tolist():
+        if not class_values_equal(cls, positive_class):
+            return cls
+    counts = y.value_counts(dropna=False)
+    for cls in counts.index.tolist():
+        if not class_values_equal(cls, positive_class):
+            return cls
+    return None
+
+
+def binary_prediction_from_rate(
+    positive_rate: Any,
+    positive_class: Any,
+    negative_class: Any,
+    threshold: float,
+) -> Any:
+    try:
+        rate = float(positive_rate)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(rate):
+        return None
+    return positive_class if rate >= float(threshold) else negative_class
+
+
+def best_f1_threshold_from_scores(y_true: pd.Series, scores: pd.Series) -> dict[str, Any]:
+    y_binary = pd.to_numeric(y_true, errors="coerce")
+    numeric_scores = pd.to_numeric(scores, errors="coerce")
+    valid = y_binary.notna() & numeric_scores.notna()
+    if not valid.any():
+        return {"threshold": 0.5, "f1": None, "precision": None, "recall": None}
+
+    y_values = y_binary[valid].astype(int).to_numpy()
+    score_values = numeric_scores[valid].astype(float).to_numpy()
+    thresholds = sorted({0.0, 1.0, *score_values.tolist()})
+    best: dict[str, Any] = {"threshold": 0.5, "f1": -1.0, "precision": 0.0, "recall": 0.0}
+    best_key: tuple[float, float, float] = (-1.0, -1.0, -1.0)
+
+    for threshold in thresholds:
+        predicted_positive = score_values >= float(threshold)
+        tp = int(((y_values == 1) & predicted_positive).sum())
+        fp = int(((y_values == 0) & predicted_positive).sum())
+        fn = int(((y_values == 1) & ~predicted_positive).sum())
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        sort_key = (float(f1), float(precision), float(threshold))
+        if sort_key > best_key:
+            best_key = sort_key
+            best = {
+                "threshold": float(threshold),
+                "f1": float(f1),
+                "precision": float(precision),
+                "recall": float(recall),
+            }
+    return best
+
+
+def tree_prediction_state_signature(df: pd.DataFrame, target: str) -> tuple[Any, ...]:
+    leaf_signature: list[tuple[Any, ...]] = []
+    tree = st.session_state.get("tree")
+    if isinstance(tree, dict):
+        try:
+            leaves = current_leaves()
+        except Exception:
+            leaves = []
+        for leaf in leaves:
+            row_idx = leaf.get("row_idx") or []
+            leaf_signature.append((int(leaf.get("id", -1)), int(len(row_idx)), id(row_idx)))
+    return (id(df), int(len(df)), str(target), tuple(leaf_signature))
+
+
+def current_tree_positive_rate_scores(df: pd.DataFrame, target: str) -> pd.Series:
+    target_kind = infer_target_kind(df[target])
+    if target_kind != "binary":
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    positive_class = choose_positive_class(df[target])
+    scores = pd.Series(np.nan, index=df.index, dtype=float)
+    try:
+        leaves = current_leaves()
+    except Exception:
+        leaves = []
+    if not leaves:
+        scores.loc[df.index] = float((df[target] == positive_class).mean())
+        return scores
+    for leaf in leaves:
+        row_idx = leaf.get("row_idx") or []
+        if not row_idx:
+            continue
+        rate = float((df.loc[row_idx, target] == positive_class).mean())
+        scores.loc[row_idx] = rate
+    return scores
+
+
+def resolved_prediction_threshold_summary(df: pd.DataFrame, target: str) -> dict[str, Any]:
+    if infer_target_kind(df[target]) != "binary":
+        return {
+            "mode": "not_applicable",
+            "threshold": None,
+            "f1": None,
+            "precision": None,
+            "recall": None,
+        }
+
+    mode, manual = prediction_threshold_config()
+    if mode == PREDICTION_THRESHOLD_MANUAL:
+        return {
+            "mode": mode,
+            "threshold": manual,
+            "f1": None,
+            "precision": None,
+            "recall": None,
+        }
+    if mode == PREDICTION_THRESHOLD_F1:
+        cache = session_cache(PREDICTION_THRESHOLD_CACHE_KEY)
+        cache_key = (
+            "max_f1",
+            prediction_threshold_config_signature(),
+            tree_prediction_state_signature(df, target),
+        )
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            return dict(cached)
+        positive_class = choose_positive_class(df[target])
+        scores = current_tree_positive_rate_scores(df, target)
+        summary = best_f1_threshold_from_scores((df[target] == positive_class).astype(int), scores)
+        summary["mode"] = mode
+        bounded_cache_set(cache, cache_key, summary, max_items=32)
+        return dict(summary)
+
+    return {
+        "mode": PREDICTION_THRESHOLD_FIXED,
+        "threshold": 0.5,
+        "f1": None,
+        "precision": None,
+        "recall": None,
+    }
+
+
+def resolved_prediction_threshold(df: pd.DataFrame, target: str) -> float:
+    summary = resolved_prediction_threshold_summary(df, target)
+    return clamp_probability(summary.get("threshold"), default=0.5)
+
+
 def target_impurity(y: pd.Series, target_kind: str | None = None) -> float:
     if (target_kind or infer_target_kind(y)) == "regression":
         numeric = pd.to_numeric(y, errors="coerce").dropna()
@@ -470,13 +649,27 @@ def impurity_label(y: pd.Series, target_kind: str | None = None) -> str:
 
 def node_summary(df: pd.DataFrame, target: str, row_idx: list[int]) -> dict[str, Any]:
     cache = session_cache(NODE_SUMMARY_CACHE_KEY)
-    cache_key = (id(df), str(target), id(row_idx), int(len(row_idx)))
+    target_kind = infer_target_kind(df[target])
+    prediction_threshold = resolved_prediction_threshold(df, target) if target_kind == "binary" else None
+    cache_key = (
+        id(df),
+        str(target),
+        id(row_idx),
+        int(len(row_idx)),
+        None if prediction_threshold is None else round(float(prediction_threshold), 8),
+    )
     cached = cache.get(cache_key)
     if isinstance(cached, dict):
         return dict(cached)
-    target_kind = infer_target_kind(df[target])
     positive_class = choose_positive_class(df[target]) if target_kind == "binary" else None
-    summary = target_series_summary(df.loc[row_idx, target], target_kind, positive_class)
+    negative_class = negative_class_for_binary(df[target], positive_class) if target_kind == "binary" else None
+    summary = target_series_summary(
+        df.loc[row_idx, target],
+        target_kind,
+        positive_class,
+        prediction_threshold=prediction_threshold,
+        negative_class=negative_class,
+    )
     bounded_cache_set(cache, cache_key, summary, max_items=256)
     return dict(summary)
 
@@ -485,12 +678,25 @@ def target_series_summary(
     y: pd.Series,
     target_kind: str,
     positive_class: Any = None,
+    prediction_threshold: float | None = None,
+    negative_class: Any = None,
 ) -> dict[str, Any]:
     counts = y.value_counts(dropna=False)
     numeric = pd.to_numeric(y, errors="coerce") if target_kind == "regression" else None
     prediction = float(numeric.mean()) if target_kind == "regression" and numeric is not None else (
         counts.index[0] if not counts.empty else None
     )
+    default_rate = None
+    event_count = None
+    if target_kind == "binary" and positive_class is not None:
+        default_rate = float((y == positive_class).mean())
+        event_count = int((y == positive_class).sum())
+        prediction = binary_prediction_from_rate(
+            default_rate,
+            positive_class,
+            negative_class if negative_class is not None else negative_class_for_binary(y, positive_class),
+            prediction_threshold if prediction_threshold is not None else 0.5,
+        )
     out = {
         "n": len(y),
         "entropy": entropy(y),
@@ -503,8 +709,10 @@ def target_series_summary(
         "positive_class": positive_class,
     }
     if target_kind == "binary" and positive_class is not None:
-        out["default_rate"] = float((y == positive_class).mean())
-        out["event_count"] = int((y == positive_class).sum())
+        out["default_rate"] = default_rate
+        out["event_count"] = event_count
+        out["prediction_threshold"] = prediction_threshold if prediction_threshold is not None else 0.5
+        out["negative_class"] = negative_class if negative_class is not None else negative_class_for_binary(y, positive_class)
     if target_kind == "regression" and numeric is not None:
         out["target_mean"] = float(numeric.mean())
         out["target_std"] = float(numeric.std(ddof=0))
@@ -4353,7 +4561,11 @@ def export_target_summary(df: pd.DataFrame, target: str, node: dict[str, Any]) -
         ],
     }
     if summary["target_kind"] == "binary":
+        threshold_summary = resolved_prediction_threshold_summary(df, target)
         out["positive_class"] = json_safe(summary["positive_class"])
+        out["negative_class"] = json_safe(summary.get("negative_class"))
+        out["prediction_threshold_mode"] = threshold_summary.get("mode")
+        out["prediction_threshold"] = json_safe(threshold_summary.get("threshold"))
         out["default_rate"] = json_safe(summary.get("default_rate", 0.0))
         out["event_count"] = int(summary.get("event_count", 0))
     elif summary["target_kind"] == "regression":
@@ -4463,6 +4675,7 @@ def tree_export(
     parameters: dict[str, Any],
 ) -> dict[str, Any]:
     target_kind = infer_target_kind(df[target])
+    threshold_summary = resolved_prediction_threshold_summary(df, target) if target_kind == "binary" else {}
     metrics = arrow_safe_dataframe(model_metrics(df, target)).to_dict("records")
     export_paths = compute_tree_export_paths(root_node_id=0)
     nodes = [
@@ -4483,6 +4696,15 @@ def tree_export(
         "target": target,
         "task": target_kind,
         "positive_class": json_safe(choose_positive_class(df[target])) if target_kind == "binary" else None,
+        "prediction_threshold": json_safe(threshold_summary.get("threshold")) if target_kind == "binary" else None,
+        "prediction_threshold_mode": threshold_summary.get("mode") if target_kind == "binary" else None,
+        "prediction_threshold_metrics": json_safe(
+            {
+                "f1": threshold_summary.get("f1"),
+                "precision": threshold_summary.get("precision"),
+                "recall": threshold_summary.get("recall"),
+            }
+        ) if target_kind == "binary" else None,
         "features": features,
         "parameters": json_safe(parameters),
         "data_rows": int(len(df)),
@@ -4885,7 +5107,12 @@ def candidates_for_ranked_features(
 
 
 def candidate_scoring_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in parameters.items() if key != "split_variable_limit"}
+    ignored = {
+        "split_variable_limit",
+        "prediction_threshold_mode",
+        "prediction_threshold_manual",
+    }
+    return {key: value for key, value in parameters.items() if key not in ignored}
 
 
 def node_feature_key(data_key: str, target: str, node_id: int) -> str:
@@ -5166,7 +5393,7 @@ def render_leaf_buttons(df: pd.DataFrame, target: str, data_key: str) -> None:
             rate_text = f" | mean={summary.get('target_mean', 0.0):.3f}"
         active_text = "ACTIVE | " if node["id"] == st.session_state.current_node_id else ""
         label = (
-            f"{active_text}Leaf {node['id']} | PREDICT={summary['majority']} | "
+            f"{active_text}Leaf {node['id']} | PREDICT={summary['prediction']} | "
             f"n={summary['n']} | {summary['impurity_label']}={summary['impurity']:.3f}"
             f"{rate_text} | var={selected_feature or '-'}"
         )
@@ -5216,6 +5443,7 @@ def tree_ui_signature(data_key: str, target: str) -> str:
         "schema": TREE_SCHEMA_VERSION,
         "data_key": str(data_key),
         "target": str(target),
+        "prediction_threshold": prediction_threshold_config_signature(),
         "nodes": nodes,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -5465,6 +5693,8 @@ def binary_gini_from_score_bins(score_bins: list[tuple[float, int, int]]) -> flo
 def tree_predictions(df: pd.DataFrame, target: str) -> pd.DataFrame:
     target_kind = infer_target_kind(df[target])
     positive_class = choose_positive_class(df[target]) if target_kind == "binary" else None
+    negative_class = negative_class_for_binary(df[target], positive_class) if target_kind == "binary" else None
+    prediction_threshold = resolved_prediction_threshold(df, target) if target_kind == "binary" else 0.5
     out = pd.DataFrame(index=df.index)
     out["leaf_id"] = np.nan
 
@@ -5486,9 +5716,12 @@ def tree_predictions(df: pd.DataFrame, target: str) -> pd.DataFrame:
         elif target_kind == "binary":
             rate = float((y_leaf == positive_class).mean()) if positive_class is not None else np.nan
             out.loc[idx, "positive_rate"] = rate
-            out.loc[idx, "prediction"] = positive_class if rate >= 0.5 else [
-                cls for cls in df[target].dropna().unique() if cls != positive_class
-            ][0]
+            out.loc[idx, "prediction"] = binary_prediction_from_rate(
+                rate,
+                positive_class,
+                negative_class,
+                prediction_threshold,
+            )
         else:
             out.loc[idx, "prediction"] = summary["prediction"]
 
@@ -5498,6 +5731,8 @@ def tree_predictions(df: pd.DataFrame, target: str) -> pd.DataFrame:
 def tree_predictions_for_dataframe(train_df: pd.DataFrame, eval_df: pd.DataFrame, target: str) -> pd.DataFrame:
     target_kind = infer_target_kind(train_df[target])
     positive_class = choose_positive_class(train_df[target]) if target_kind == "binary" else None
+    negative_class = negative_class_for_binary(train_df[target], positive_class) if target_kind == "binary" else None
+    prediction_threshold = resolved_prediction_threshold(train_df, target) if target_kind == "binary" else 0.5
     out = pd.DataFrame(index=eval_df.index)
     out["leaf_id"] = np.nan
 
@@ -5524,11 +5759,11 @@ def tree_predictions_for_dataframe(train_df: pd.DataFrame, eval_df: pd.DataFrame
             elif target_kind == "binary":
                 rate = float(summary.get("default_rate", np.nan))
                 out.loc[idx, "positive_rate"] = rate
-                negative_classes = [
-                    cls for cls in train_df[target].dropna().unique() if not class_values_equal(cls, positive_class)
-                ]
-                out.loc[idx, "prediction"] = positive_class if rate >= 0.5 else (
-                    negative_classes[0] if negative_classes else None
+                out.loc[idx, "prediction"] = binary_prediction_from_rate(
+                    rate,
+                    positive_class,
+                    negative_class,
+                    prediction_threshold,
                 )
             else:
                 out.loc[idx, "prediction"] = summary["prediction"]
@@ -5580,12 +5815,32 @@ def evaluation_model_metrics(
         y_binary = (y == positive_class).astype(int)
         auc = binary_auc(y_binary[valid], preds.loc[valid, "positive_rate"])
         accuracy = float((preds.loc[valid, "prediction"] == y[valid]).mean()) if valid.any() else None
+        threshold_summary = resolved_prediction_threshold_summary(train_df, target)
+        predicted_positive = preds.loc[valid, "prediction"].map(
+            lambda value: class_values_equal(value, positive_class)
+        )
+        actual_positive = y.loc[valid].map(lambda value: class_values_equal(value, positive_class))
+        tp = int((predicted_positive & actual_positive).sum()) if valid.any() else 0
+        fp = int((predicted_positive & ~actual_positive).sum()) if valid.any() else 0
+        fn = int((~predicted_positive & actual_positive).sum()) if valid.any() else 0
+        precision = tp / (tp + fp) if tp + fp else None
+        recall = tp / (tp + fn) if tp + fn else None
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision is not None and recall is not None and precision + recall
+            else None
+        )
         rows.append({"dataset": dataset_name, "metric": "target_type", "value": "binary"})
         rows.append({"dataset": dataset_name, "metric": "positive_class", "value": positive_class})
+        rows.append({"dataset": dataset_name, "metric": "prediction_threshold_mode", "value": threshold_summary.get("mode")})
+        rows.append({"dataset": dataset_name, "metric": "prediction_threshold", "value": threshold_summary.get("threshold")})
         rows.append({"dataset": dataset_name, "metric": "default_rate", "value": float(y_binary.mean())})
         rows.append({"dataset": dataset_name, "metric": "auc", "value": auc})
         rows.append({"dataset": dataset_name, "metric": "gini", "value": None if auc is None else 2 * auc - 1})
         rows.append({"dataset": dataset_name, "metric": "accuracy", "value": accuracy})
+        rows.append({"dataset": dataset_name, "metric": "precision", "value": precision})
+        rows.append({"dataset": dataset_name, "metric": "recall", "value": recall})
+        rows.append({"dataset": dataset_name, "metric": "f1", "value": f1})
     elif target_kind == "regression":
         y_num = pd.to_numeric(y, errors="coerce")
         pred_num = pd.to_numeric(preds["prediction"], errors="coerce")
@@ -5978,10 +6233,8 @@ def tree_predictions_with_candidate(
 
     target_kind = infer_target_kind(train_df[target])
     positive_class = choose_positive_class(train_df[target]) if target_kind == "binary" else None
-    negative_classes = [
-        cls for cls in train_df[target].dropna().unique() if not class_values_equal(cls, positive_class)
-    ]
-    negative_class = negative_classes[0] if negative_classes else None
+    negative_class = negative_class_for_binary(train_df[target], positive_class) if target_kind == "binary" else None
+    prediction_threshold = resolved_prediction_threshold(train_df, target) if target_kind == "binary" else 0.5
     train_node_idx = st.session_state.tree[node_id]["row_idx"]
     train_branches = split_branch_indices(train_df, train_node_idx, candidate)
     eval_branches = split_branch_indices(eval_df, target_idx, candidate)
@@ -6000,7 +6253,12 @@ def tree_predictions_with_candidate(
         elif target_kind == "binary":
             rate = float(summary.get("default_rate", np.nan))
             predictions.loc[eval_child_idx, "positive_rate"] = rate
-            predictions.loc[eval_child_idx, "prediction"] = positive_class if rate >= 0.5 else negative_class
+            predictions.loc[eval_child_idx, "prediction"] = binary_prediction_from_rate(
+                rate,
+                positive_class,
+                negative_class,
+                prediction_threshold,
+            )
         else:
             predictions.loc[eval_child_idx, "prediction"] = summary["prediction"]
 
@@ -6937,6 +7195,59 @@ def main() -> None:
         format="%d",
         help="Split candidates are scored feature-by-feature in parallel. Thread workers avoid copying the full DataFrame.",
     )
+    threshold_status_slot = None
+    if target_kind == "binary":
+        threshold_context_key = (data_key, target)
+        if st.session_state.get("_interactive_tree_prediction_threshold_context") != threshold_context_key:
+            saved_threshold_mode = str(
+                saved_parameters.get("prediction_threshold_mode", PREDICTION_THRESHOLD_FIXED)
+            )
+            if saved_threshold_mode not in PREDICTION_THRESHOLD_LABELS:
+                saved_threshold_mode = PREDICTION_THRESHOLD_FIXED
+            st.session_state[PREDICTION_THRESHOLD_MODE_KEY] = saved_threshold_mode
+            st.session_state[PREDICTION_THRESHOLD_MANUAL_KEY] = clamp_probability(
+                saved_parameters.get("prediction_threshold_manual", 0.5)
+            )
+            st.session_state["_interactive_tree_prediction_threshold_context"] = threshold_context_key
+
+        threshold_panel = st.sidebar.expander("Prediction threshold", expanded=False)
+        threshold_modes = [
+            PREDICTION_THRESHOLD_FIXED,
+            PREDICTION_THRESHOLD_F1,
+            PREDICTION_THRESHOLD_MANUAL,
+        ]
+        current_mode = st.session_state.get(PREDICTION_THRESHOLD_MODE_KEY, PREDICTION_THRESHOLD_FIXED)
+        if current_mode not in threshold_modes:
+            current_mode = PREDICTION_THRESHOLD_FIXED
+        selected_threshold_label = threshold_panel.selectbox(
+            "Binary prediction cutoff",
+            options=[PREDICTION_THRESHOLD_LABELS[mode] for mode in threshold_modes],
+            index=threshold_modes.index(current_mode),
+            key=f"prediction_threshold_mode_widget::{data_key}::{target}",
+            help="Positive prediction is assigned when leaf event rate is greater than or equal to this cutoff.",
+        )
+        selected_threshold_mode = next(
+            mode
+            for mode, label in PREDICTION_THRESHOLD_LABELS.items()
+            if label == selected_threshold_label
+        )
+        st.session_state[PREDICTION_THRESHOLD_MODE_KEY] = selected_threshold_mode
+        manual_threshold_input = threshold_panel.number_input(
+            "Manual cutoff",
+            min_value=0.0,
+            max_value=1.0,
+            value=clamp_probability(st.session_state.get(PREDICTION_THRESHOLD_MANUAL_KEY, 0.5)),
+            step=0.01,
+            format="%.4f",
+            disabled=selected_threshold_mode != PREDICTION_THRESHOLD_MANUAL,
+            key=f"prediction_threshold_manual_widget::{data_key}::{target}",
+            help="Used only when Binary prediction cutoff is Manual cutoff.",
+        )
+        st.session_state[PREDICTION_THRESHOLD_MANUAL_KEY] = clamp_probability(manual_threshold_input)
+        threshold_status_slot = threshold_panel.empty()
+    else:
+        st.session_state[PREDICTION_THRESHOLD_MODE_KEY] = PREDICTION_THRESHOLD_FIXED
+        st.session_state[PREDICTION_THRESHOLD_MANUAL_KEY] = 0.5
 
     min_leaf = safe_int(min_leaf_input, default=20, minimum=1)
     max_thresholds = safe_int(max_thresholds_input, default=40, minimum=1)
@@ -6959,6 +7270,19 @@ def main() -> None:
         if not restore_tree_state_from_checkpoint(checkpoint, state_key, df):
             init_tree_preserving_restore_message(df)
 
+    if threshold_status_slot is not None:
+        threshold_summary = resolved_prediction_threshold_summary(df, target)
+        threshold_value = threshold_summary.get("threshold")
+        threshold_text = f"{float(threshold_value):.4f}" if threshold_value is not None else "-"
+        if threshold_summary.get("mode") == PREDICTION_THRESHOLD_F1 and threshold_summary.get("f1") is not None:
+            threshold_status_slot.caption(
+                f"Active cutoff: {threshold_text} | Train F1={float(threshold_summary['f1']):.4f} "
+                f"| precision={float(threshold_summary['precision']):.4f} "
+                f"| recall={float(threshold_summary['recall']):.4f}"
+            )
+        else:
+            threshold_status_slot.caption(f"Active cutoff: {threshold_text}")
+
     parameters = {
         "min_leaf": min_leaf,
         "max_thresholds": max_thresholds,
@@ -6967,6 +7291,10 @@ def main() -> None:
         "max_category_groups": max_category_groups,
         "parallel_workers": parallel_workers,
         "split_variable_limit": split_variable_limit,
+        "prediction_threshold_mode": st.session_state.get(PREDICTION_THRESHOLD_MODE_KEY, PREDICTION_THRESHOLD_FIXED),
+        "prediction_threshold_manual": clamp_probability(
+            st.session_state.get(PREDICTION_THRESHOLD_MANUAL_KEY, 0.5)
+        ),
     }
     scoring_parameters = candidate_scoring_parameters(parameters)
     saved_auto_parameters = (
