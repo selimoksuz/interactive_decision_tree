@@ -479,6 +479,65 @@ def test_candidate_splits_scores_all_numeric_missing_policies():
     assert {"left", "right", "separate"}.issubset(policies)
 
 
+def test_numeric_binary_candidates_prioritize_information_gain_over_equal_share_thresholds():
+    df = pd.DataFrame(
+        {
+            "x": [float(i) for i in range(1, 101)],
+            "risk_flag": ["low"] * 90 + ["high"] * 10,
+        }
+    )
+
+    candidates = candidate_splits(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        features=["x"],
+        max_thresholds=3,
+        max_categories=3,
+        max_numeric_bins=2,
+        max_category_groups=2,
+        min_leaf=1,
+        parallel_workers=1,
+    )
+    best = max(
+        (candidate for candidate in candidates if candidate.split_type == "numeric_le"),
+        key=lambda c: c.information_gain,
+    )
+
+    assert 89.0 < float(best.value) < 91.0
+
+
+def test_numeric_multiway_candidates_use_target_aware_cutpoints():
+    df = pd.DataFrame(
+        {
+            "x": [float(i) for i in range(1, 121)],
+            "risk_flag": ["high" if 51 <= i <= 70 else "low" for i in range(1, 121)],
+        }
+    )
+
+    candidates = candidate_splits(
+        df=df,
+        target="risk_flag",
+        row_idx=df.index.tolist(),
+        features=["x"],
+        max_thresholds=6,
+        max_categories=3,
+        max_numeric_bins=3,
+        max_category_groups=2,
+        min_leaf=5,
+        parallel_workers=1,
+    )
+    best = max(
+        (candidate for candidate in candidates if candidate.split_type == "numeric_bins"),
+        key=lambda c: c.information_gain,
+    )
+    thresholds = tuple(float(value) for value in best.value)
+
+    assert len(thresholds) == 2
+    assert 49.0 < thresholds[0] < 52.0
+    assert 69.0 < thresholds[1] < 72.0
+
+
 def test_numeric_multiway_max_bins_counts_separate_missing_branch():
     df = pd.DataFrame(
         {

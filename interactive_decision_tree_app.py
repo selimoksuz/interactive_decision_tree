@@ -756,6 +756,107 @@ def numeric_bin_thresholds(s: pd.Series, bin_count: int) -> list[float]:
     return sorted({float(x) for x in thresholds})
 
 
+def binary_entropy_array(event_counts: np.ndarray, total_counts: np.ndarray) -> np.ndarray:
+    counts = np.asarray(total_counts, dtype=float)
+    events = np.asarray(event_counts, dtype=float)
+    out = np.zeros_like(counts, dtype=float)
+    valid = counts > 0
+    if not np.any(valid):
+        return out
+
+    p = np.zeros_like(counts, dtype=float)
+    p[valid] = events[valid] / counts[valid]
+    positive = valid & (p > 0)
+    negative = valid & (p < 1)
+    out[positive] -= p[positive] * np.log2(p[positive])
+    out[negative] -= (1 - p[negative]) * np.log2(1 - p[negative])
+    return out
+
+
+def binary_numeric_boundary_gain_table(
+    sorted_numeric: np.ndarray,
+    cumulative_events: np.ndarray,
+    total_n: int,
+    missing_n: int,
+    missing_events: int,
+    min_leaf: int,
+    missing_policies: list[str],
+    parent_impurity: float,
+) -> pd.DataFrame:
+    if len(sorted_numeric) <= 1:
+        return pd.DataFrame(columns=["threshold", "gain"])
+
+    boundary_positions = np.flatnonzero(sorted_numeric[:-1] < sorted_numeric[1:]) + 1
+    if len(boundary_positions) == 0:
+        return pd.DataFrame(columns=["threshold", "gain"])
+
+    left_n = boundary_positions.astype(float)
+    right_n = float(len(sorted_numeric)) - left_n
+    left_events = cumulative_events[boundary_positions - 1].astype(float)
+    non_missing_events = float(cumulative_events[-1])
+    right_events = non_missing_events - left_events
+    best_weighted_impurity = np.full(len(boundary_positions), np.inf, dtype=float)
+
+    def update_best(counts: list[np.ndarray], events: list[np.ndarray]) -> None:
+        nonlocal best_weighted_impurity
+        valid = np.ones(len(boundary_positions), dtype=bool)
+        weighted = np.zeros(len(boundary_positions), dtype=float)
+        for count, event_count in zip(counts, events):
+            count_arr = np.asarray(count, dtype=float)
+            event_arr = np.asarray(event_count, dtype=float)
+            valid &= count_arr >= float(min_leaf)
+            weighted += (count_arr / float(total_n)) * binary_entropy_array(event_arr, count_arr)
+        best_weighted_impurity = np.minimum(best_weighted_impurity, np.where(valid, weighted, np.inf))
+
+    if "right" in missing_policies:
+        update_best([left_n, right_n + missing_n], [left_events, right_events + missing_events])
+    if "left" in missing_policies:
+        update_best([left_n + missing_n, right_n], [left_events + missing_events, right_events])
+    if "separate" in missing_policies and missing_n > 0:
+        update_best(
+            [left_n, right_n, np.full(len(boundary_positions), float(missing_n))],
+            [left_events, right_events, np.full(len(boundary_positions), float(missing_events))],
+        )
+
+    gains = float(parent_impurity) - best_weighted_impurity
+    thresholds = sorted_numeric[boundary_positions - 1] + (
+        sorted_numeric[boundary_positions] - sorted_numeric[boundary_positions - 1]
+    ) / 2
+    valid = np.isfinite(gains)
+    if not np.any(valid):
+        return pd.DataFrame(columns=["threshold", "gain"])
+
+    return pd.DataFrame({"threshold": thresholds[valid].astype(float), "gain": gains[valid].astype(float)})
+
+
+def binary_numeric_thresholds_by_gain(
+    sorted_numeric: np.ndarray,
+    cumulative_events: np.ndarray,
+    total_n: int,
+    missing_n: int,
+    missing_events: int,
+    min_leaf: int,
+    missing_policies: list[str],
+    parent_impurity: float,
+    max_thresholds: int,
+) -> list[float]:
+    gain_table = binary_numeric_boundary_gain_table(
+        sorted_numeric=sorted_numeric,
+        cumulative_events=cumulative_events,
+        total_n=total_n,
+        missing_n=missing_n,
+        missing_events=missing_events,
+        min_leaf=min_leaf,
+        missing_policies=missing_policies,
+        parent_impurity=parent_impurity,
+    )
+    if gain_table.empty:
+        return []
+
+    ranked = gain_table.sort_values(["gain", "threshold"], ascending=[False, True])
+    return sorted({float(value) for value in ranked["threshold"].head(max(1, int(max_thresholds))).tolist()})
+
+
 def score_branch_split(
     frame: pd.DataFrame,
     target: str,
@@ -840,12 +941,14 @@ def numeric_split_label(
     thresholds: list[float],
     missing_policy: str = "right",
     has_missing: bool = False,
+    manual: bool = False,
 ) -> str:
     thresholds = sorted({float(threshold) for threshold in thresholds})
     if len(thresholds) == 1:
         base = f"{feature} <= {thresholds[0]:.6g}"
     else:
-        base = f"{feature} manual bins: {', '.join(f'{x:.6g}' for x in thresholds)}"
+        label_kind = "manual bins" if manual else "bins"
+        base = f"{feature} {label_kind}: {', '.join(f'{x:.6g}' for x in thresholds)}"
     if not has_missing:
         return base
     if missing_policy == "left":
@@ -1063,6 +1166,99 @@ def score_binary_numeric_multiway_candidate(
         label=numeric_split_label(feature, thresholds, missing_policy, has_missing=has_missing),
         missing_policy=missing_policy,
     )
+
+
+def score_target_aware_binary_numeric_multiway_candidates(
+    feature: str,
+    candidate_thresholds: list[float],
+    sorted_numeric: np.ndarray,
+    cumulative_events: np.ndarray,
+    total_n: int,
+    total_events: int,
+    missing_n: int,
+    missing_events: int,
+    min_leaf: int,
+    missing_policies: list[str],
+    parent_impurity: float,
+    max_numeric_bins: int,
+) -> list[SplitCandidate]:
+    thresholds = sorted({float(threshold) for threshold in candidate_thresholds})
+    if len(thresholds) < 2:
+        return []
+
+    out: list[SplitCandidate] = []
+    max_bins = max(3, int(max_numeric_bins))
+    beam_width = min(32, max(8, max_bins * 4))
+
+    for bin_count in range(3, max_bins + 1):
+        eligible_policies = [
+            policy
+            for policy in missing_policies
+            if numeric_multiway_branch_count(bin_count, policy, missing_n > 0) <= max_numeric_bins
+        ]
+        if not eligible_policies:
+            continue
+
+        beam: list[tuple[float, tuple[float, ...]]] = [(0.0, tuple())]
+        for _ in range(bin_count - 1):
+            expanded: dict[tuple[float, ...], float] = {}
+            for _, state in beam:
+                for threshold in thresholds:
+                    if threshold in state:
+                        continue
+                    next_state = tuple(sorted((*state, threshold)))
+                    if next_state in expanded:
+                        continue
+                    best_gain = -np.inf
+                    for policy in eligible_policies:
+                        candidate = score_binary_numeric_multiway_candidate(
+                            feature=feature,
+                            thresholds=list(next_state),
+                            sorted_numeric=sorted_numeric,
+                            cumulative_events=cumulative_events,
+                            total_n=total_n,
+                            total_events=total_events,
+                            missing_n=missing_n,
+                            missing_events=missing_events,
+                            min_leaf=min_leaf,
+                            missing_policy=policy,
+                            parent_impurity=parent_impurity,
+                        )
+                        if candidate is not None:
+                            best_gain = max(best_gain, candidate.information_gain)
+                    if np.isfinite(best_gain):
+                        expanded[next_state] = float(best_gain)
+
+            if not expanded:
+                beam = []
+                break
+            beam = sorted(
+                [(gain, state) for state, gain in expanded.items()],
+                key=lambda item: (item[0], tuple(-value for value in item[1])),
+                reverse=True,
+            )[:beam_width]
+
+        for _, state in beam:
+            if len(state) != bin_count - 1:
+                continue
+            for policy in eligible_policies:
+                candidate = score_binary_numeric_multiway_candidate(
+                    feature=feature,
+                    thresholds=list(state),
+                    sorted_numeric=sorted_numeric,
+                    cumulative_events=cumulative_events,
+                    total_n=total_n,
+                    total_events=total_events,
+                    missing_n=missing_n,
+                    missing_events=missing_events,
+                    min_leaf=min_leaf,
+                    missing_policy=policy,
+                    parent_impurity=parent_impurity,
+                )
+                if candidate is not None:
+                    out.append(candidate)
+
+    return out
 
 
 def score_split(
@@ -1450,7 +1646,7 @@ def score_numeric_manual_bins(
         return None
     parent_impurity, weighted_impurity, branch_labels, branch_ns, branch_entropies = scored
     split_type = "numeric_le" if len(thresholds) == 1 else "numeric_manual_bins"
-    label = numeric_split_label(feature, thresholds, missing_policy, has_missing=bool(numeric.isna().any()))
+    label = numeric_split_label(feature, thresholds, missing_policy, has_missing=bool(numeric.isna().any()), manual=True)
 
     return SplitCandidate(
         feature=feature,
@@ -1716,7 +1912,6 @@ def candidate_splits_for_feature(
     if pd.api.types.is_numeric_dtype(s):
         policies = numeric_missing_policies(pd.to_numeric(s, errors="coerce"))
         numeric = pd.to_numeric(s, errors="coerce")
-        thresholds = numeric_thresholds(s, max_thresholds)
         if target_kind == "binary" and positive_class is not None:
             numeric_values = numeric.to_numpy(dtype=float)
             event_values = (frame[target] == positive_class).to_numpy(dtype=np.int8)
@@ -1732,7 +1927,17 @@ def candidate_splits_for_feature(
             non_missing_n = int(len(sorted_numeric))
             missing_n = int(total_n - non_missing_n)
             missing_events = int(total_events - int(cumulative_events[-1])) if non_missing_n else total_events
-            unique_non_missing = int(len(np.unique(sorted_numeric))) if non_missing_n else 0
+            thresholds = binary_numeric_thresholds_by_gain(
+                sorted_numeric=sorted_numeric,
+                cumulative_events=cumulative_events,
+                total_n=total_n,
+                missing_n=missing_n,
+                missing_events=missing_events,
+                min_leaf=min_leaf,
+                missing_policies=policies,
+                parent_impurity=parent_impurity,
+                max_thresholds=max_thresholds,
+            )
             candidates.extend(
                 score_binary_numeric_le_candidates(
                     feature=feature,
@@ -1745,32 +1950,24 @@ def candidate_splits_for_feature(
                     parent_impurity=parent_impurity,
                 )
             )
-            for bin_count in range(3, max_numeric_bins + 1):
-                if unique_non_missing < bin_count:
-                    continue
-                quantile_positions = np.linspace(0, 1, bin_count + 1)[1:-1]
-                bin_thresholds = sorted({float(x) for x in np.quantile(sorted_numeric, quantile_positions)})
-                if len(bin_thresholds) != bin_count - 1:
-                    continue
-                for missing_policy in policies:
-                    if numeric_multiway_branch_count(bin_count, missing_policy, missing_n > 0) > max_numeric_bins:
-                        continue
-                    candidate = score_binary_numeric_multiway_candidate(
-                        feature=feature,
-                        thresholds=bin_thresholds,
-                        sorted_numeric=sorted_numeric,
-                        cumulative_events=cumulative_events,
-                        total_n=total_n,
-                        total_events=total_events,
-                        missing_n=missing_n,
-                        missing_events=missing_events,
-                        min_leaf=min_leaf,
-                        missing_policy=missing_policy,
-                        parent_impurity=parent_impurity,
-                    )
-                    if candidate is not None:
-                        candidates.append(candidate)
+            candidates.extend(
+                score_target_aware_binary_numeric_multiway_candidates(
+                    feature=feature,
+                    candidate_thresholds=thresholds,
+                    sorted_numeric=sorted_numeric,
+                    cumulative_events=cumulative_events,
+                    total_n=total_n,
+                    total_events=total_events,
+                    missing_n=missing_n,
+                    missing_events=missing_events,
+                    min_leaf=min_leaf,
+                    missing_policies=policies,
+                    parent_impurity=parent_impurity,
+                    max_numeric_bins=max_numeric_bins,
+                )
+            )
         else:
+            thresholds = numeric_thresholds(s, max_thresholds)
             has_missing = bool(numeric.isna().any())
             for threshold in thresholds:
                 for missing_policy in policies:
