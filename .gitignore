@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.log
 dist/
+build/
 wheelhouse/
 .setup_state.json
 .streamlit/
