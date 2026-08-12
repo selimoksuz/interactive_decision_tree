@@ -154,6 +154,16 @@ def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
         "is_monotonic",
         "monotonic_direction",
         "monotonic_violation_count",
+        "hhi_total",
+        "normalized_hhi",
+        "hhi_concentration",
+        "max_bin_concentration",
+        "binomial_reference_event_rate",
+        "binomial_family_size",
+        "binomial_effective_alpha",
+        "binomial_significant_bins",
+        "binomial_signal_rate",
+        "binomial_signal_share",
         "engine_used",
     ]
     return pd.DataFrame([{"metric": key, "value": metrics.get(key)} for key in keys])
@@ -167,9 +177,18 @@ def woe_column_config() -> dict[str, Any]:
         "event_count": st.column_config.NumberColumn("event", format="%d"),
         "non_event_count": st.column_config.NumberColumn("non_event", format="%d"),
         "event_rate": st.column_config.NumberColumn("event_rate", format="%.6f"),
+        "expected_event_rate": st.column_config.NumberColumn("expected_rate", format="%.6f"),
+        "expected_event_count": st.column_config.NumberColumn("expected_event", format="%.3f"),
+        "event_count_delta": st.column_config.NumberColumn("event_delta", format="%+.3f"),
+        "binomial_p_value": st.column_config.NumberColumn("binom_p", format="%.6f"),
+        "binomial_adjusted_p_value": st.column_config.NumberColumn("binom_adj_p", format="%.6f"),
+        "binomial_significant": st.column_config.CheckboxColumn("binom_signal"),
+        "binomial_ci_lower": st.column_config.NumberColumn("binom_ci_low", format="%.6f"),
+        "binomial_ci_upper": st.column_config.NumberColumn("binom_ci_high", format="%.6f"),
         "all_concentration": st.column_config.NumberColumn("all_pct", format="%.6f"),
         "event_concentration": st.column_config.NumberColumn("event_pct", format="%.6f"),
         "non_event_concentration": st.column_config.NumberColumn("non_event_pct", format="%.6f"),
+        "hhi_contribution": st.column_config.NumberColumn("hhi_contrib", format="%.6f"),
         "calculated_woe": st.column_config.NumberColumn("calculated_woe", format="%.6f"),
         "assigned_woe": st.column_config.NumberColumn("assigned_woe", format="%.6f"),
         "lower": st.column_config.NumberColumn("lower", format="%.12g"),
@@ -194,9 +213,19 @@ def editable_bin_table(table: pd.DataFrame, *, include_merge: bool = False) -> p
         "event_count",
         "non_event_count",
         "event_rate",
+        "expected_event_rate",
+        "expected_event_count",
+        "event_count_delta",
+        "binomial_p_value",
+        "binomial_adjusted_p_value",
+        "binomial_significant",
+        "binomial_result",
+        "binomial_ci_lower",
+        "binomial_ci_upper",
         "all_concentration",
         "event_concentration",
         "non_event_concentration",
+        "hhi_contribution",
         "calculated_woe",
         "assigned_woe",
         "export_woe",
@@ -607,11 +636,20 @@ def variable_summary_row(
         "monotonic": current_train.get("is_monotonic"),
         "monotonic_direction": current_train.get("monotonic_direction"),
         "monotonic_violations": current_train.get("monotonic_violation_count"),
+        "hhi_total": current_train.get("hhi_total"),
+        "normalized_hhi": current_train.get("normalized_hhi"),
+        "hhi_concentration": current_train.get("hhi_concentration"),
+        "max_bin_concentration": current_train.get("max_bin_concentration"),
+        "binomial_significant_bins": current_train.get("binomial_significant_bins"),
+        "binomial_signal_rate": current_train.get("binomial_signal_rate"),
+        "binomial_signal_share": current_train.get("binomial_signal_share"),
     }
     if test_df is not None:
         current_test = evaluate_spec(test_df, target, current_spec, positive_class, "Test")["metrics"]
         row["test_iv"] = current_test.get("export_iv")
         row["test_gini"] = current_test.get("export_gini")
+        row["test_hhi_total"] = current_test.get("hhi_total")
+        row["test_binomial_signal_share"] = current_test.get("binomial_signal_share")
     return row
 
 
@@ -635,6 +673,13 @@ def variable_summary_placeholder(variable: str, state: dict[str, Any]) -> dict[s
         "monotonic": None,
         "monotonic_direction": None,
         "monotonic_violations": None,
+        "hhi_total": None,
+        "normalized_hhi": None,
+        "hhi_concentration": None,
+        "max_bin_concentration": None,
+        "binomial_significant_bins": None,
+        "binomial_signal_rate": None,
+        "binomial_signal_share": None,
         "metrics_status": "not loaded",
     }
 
@@ -893,6 +938,13 @@ def render_catalog(
             "gini_delta": st.column_config.NumberColumn(format="%.6f"),
             "test_iv": st.column_config.NumberColumn(format="%.6f"),
             "test_gini": st.column_config.NumberColumn(format="%.6f"),
+            "hhi_total": st.column_config.NumberColumn(format="%.6f"),
+            "normalized_hhi": st.column_config.NumberColumn(format="%.6f"),
+            "max_bin_concentration": st.column_config.NumberColumn(format="%.6f"),
+            "binomial_signal_rate": st.column_config.NumberColumn(format="%.6f"),
+            "binomial_signal_share": st.column_config.NumberColumn(format="%.6f"),
+            "test_hhi_total": st.column_config.NumberColumn(format="%.6f"),
+            "test_binomial_signal_share": st.column_config.NumberColumn(format="%.6f"),
         },
     )
     return summary
@@ -1238,6 +1290,15 @@ def render_variable_editor(
     metric_cols[2].metric("Bins", str(current_train["metrics"].get("bin_count")))
     metric_cols[3].metric("Manual WOE bins", str(current_train["metrics"].get("manual_woe_bins")))
     metric_cols[4].metric("Monotonic", str(current_train["metrics"].get("monotonic_direction")))
+    test_cols = st.columns(4)
+    hhi_total = current_train["metrics"].get("hhi_total")
+    normalized_hhi = current_train["metrics"].get("normalized_hhi")
+    signal_share = current_train["metrics"].get("binomial_signal_share")
+    signal_bins = current_train["metrics"].get("binomial_significant_bins")
+    test_cols[0].metric("HHI", "n/a" if hhi_total is None else f"{hhi_total:.6f}")
+    test_cols[1].metric("Normalized HHI", "n/a" if normalized_hhi is None else f"{normalized_hhi:.6f}")
+    test_cols[2].metric("Binomial signal share", "n/a" if signal_share is None else f"{signal_share:.2%}")
+    test_cols[3].metric("Signal bins", "n/a" if signal_bins is None else str(signal_bins))
 
     bins_tab, special_tab, compare_tab = st.tabs(
         ["Current bins", "Special / missing", "Original comparison"]
@@ -1260,9 +1321,19 @@ def render_variable_editor(
             "event_count",
             "non_event_count",
             "event_rate",
+            "expected_event_rate",
+            "expected_event_count",
+            "event_count_delta",
+            "binomial_p_value",
+            "binomial_adjusted_p_value",
+            "binomial_significant",
+            "binomial_result",
+            "binomial_ci_lower",
+            "binomial_ci_upper",
             "all_concentration",
             "event_concentration",
             "non_event_concentration",
+            "hhi_contribution",
             "calculated_woe",
             "export_woe",
             "calculated_iv",

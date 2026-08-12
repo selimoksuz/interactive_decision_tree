@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from interactive_decision_tree.session_store import save_dataframe_session
+
+
+APP_PATH = Path(__file__).resolve().parents[1] / "interactive_decision_tree_app.py"
 
 
 def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
@@ -19,7 +23,7 @@ def test_streamlit_woe_workspace_runs_initial_binning(tmp_path, monkeypatch):
     )
     data_id, _ = save_dataframe_session(df, target="target", features=["age", "income"])
 
-    at = AppTest.from_file("interactive_decision_tree_app.py")
+    at = AppTest.from_file(APP_PATH)
     at.query_params["data_id"] = data_id
     at.query_params["work_id"] = f"woe_{uuid4().hex}"
     at.run(timeout=25)

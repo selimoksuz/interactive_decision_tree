@@ -105,6 +105,31 @@ def test_numeric_woe_supports_special_missing_and_manual_woe():
     assert updated_report["metrics"]["manual_woe_bins"] == 1
 
 
+def test_woe_evaluation_adds_binomial_and_hhi_tests():
+    df = woe_df()
+    spec = build_initial_spec(df, "target", "age", 1, WoeBuildConfig(max_bins=3, engine="fallback"))
+
+    report = evaluate_spec(df, "target", spec, 1)
+    table = report["table"]
+    metrics = report["metrics"]
+
+    assert {
+        "expected_event_rate",
+        "expected_event_count",
+        "event_count_delta",
+        "binomial_p_value",
+        "binomial_adjusted_p_value",
+        "binomial_significant",
+        "binomial_ci_lower",
+        "binomial_ci_upper",
+        "hhi_contribution",
+    }.issubset(table.columns)
+    assert metrics["hhi_total"] == pytest.approx(float((table["all_concentration"] ** 2).sum()))
+    assert 0.0 <= metrics["hhi_total"] <= 1.0
+    assert 0.0 <= metrics["binomial_signal_share"] <= 1.0
+    assert metrics["binomial_family_size"] == int((table["count"] > 0).sum())
+
+
 def test_auto_optbinning_raises_when_engine_unavailable(monkeypatch):
     def fail_loader():
         raise RuntimeError("missing optbinning package")
@@ -334,6 +359,11 @@ def test_project_export_contains_integrated_mapping():
     assert decoded["format"] == "interactive_woe_mapping"
     assert decoded["variable_count"] == 2
     assert {variable["name"] for variable in decoded["variables"]} == {"age", "segment"}
+    age_payload = next(variable for variable in decoded["variables"] if variable["name"] == "age")
+    assert "hhi_total" in age_payload["metrics"]
+    assert "binomial_signal_share" in age_payload["metrics"]
+    assert "binomial_p_value" in age_payload["bins"][0]
+    assert "hhi_contribution" in age_payload["bins"][0]
 
 
 def test_project_export_filters_by_export_decision_not_manual_status():

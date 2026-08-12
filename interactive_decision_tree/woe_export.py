@@ -110,11 +110,20 @@ def variable_state_rows(
             "monotonic": current_train.get("is_monotonic"),
             "monotonic_direction": current_train.get("monotonic_direction"),
             "monotonic_violations": current_train.get("monotonic_violation_count"),
+            "hhi_total": current_train.get("hhi_total"),
+            "normalized_hhi": current_train.get("normalized_hhi"),
+            "hhi_concentration": current_train.get("hhi_concentration"),
+            "max_bin_concentration": current_train.get("max_bin_concentration"),
+            "binomial_significant_bins": current_train.get("binomial_significant_bins"),
+            "binomial_signal_rate": current_train.get("binomial_signal_rate"),
+            "binomial_signal_share": current_train.get("binomial_signal_share"),
         }
         if test_df is not None:
             current_test = evaluate_spec(test_df, target, current_spec, positive_class, "Test")["metrics"]
             row["test_iv"] = current_test.get("export_iv")
             row["test_gini"] = current_test.get("export_gini")
+            row["test_hhi_total"] = current_test.get("hhi_total")
+            row["test_binomial_signal_share"] = current_test.get("binomial_signal_share")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -194,9 +203,19 @@ def export_variable_payload(
                 "non_event_count": safe_json(row.get("non_event_count")),
                 "count": safe_json(row.get("count")),
                 "event_rate": safe_json(row.get("event_rate")),
+                "expected_event_rate": safe_json(row.get("expected_event_rate")),
+                "expected_event_count": safe_json(row.get("expected_event_count")),
+                "event_count_delta": safe_json(row.get("event_count_delta")),
+                "binomial_p_value": safe_json(row.get("binomial_p_value")),
+                "binomial_adjusted_p_value": safe_json(row.get("binomial_adjusted_p_value")),
+                "binomial_significant": safe_json(row.get("binomial_significant")),
+                "binomial_result": safe_json(row.get("binomial_result")),
+                "binomial_ci_lower": safe_json(row.get("binomial_ci_lower")),
+                "binomial_ci_upper": safe_json(row.get("binomial_ci_upper")),
                 "all_concentration": safe_json(row.get("all_concentration")),
                 "event_concentration": safe_json(row.get("event_concentration")),
                 "non_event_concentration": safe_json(row.get("non_event_concentration")),
+                "hhi_contribution": safe_json(row.get("hhi_contribution")),
                 "calculated_iv": safe_json(row.get("calculated_iv")),
                 "export_iv": safe_json(row.get("export_iv")),
                 "protected": safe_json(row.get("protected")),
@@ -338,6 +357,16 @@ def _dc_stats(variable: dict[str, Any]) -> list[dict[str, Any]]:
                 "nonevent_count": bin_payload.get("non_event_count"),
                 "total_count": bin_payload.get("count"),
                 "event_rate": bin_payload.get("event_rate"),
+                "expected_event_rate": bin_payload.get("expected_event_rate"),
+                "expected_event_count": bin_payload.get("expected_event_count"),
+                "event_count_delta": bin_payload.get("event_count_delta"),
+                "binomial_p_value": bin_payload.get("binomial_p_value"),
+                "binomial_adjusted_p_value": bin_payload.get("binomial_adjusted_p_value"),
+                "binomial_significant": bin_payload.get("binomial_significant"),
+                "binomial_result": bin_payload.get("binomial_result"),
+                "binomial_ci_lower": bin_payload.get("binomial_ci_lower"),
+                "binomial_ci_upper": bin_payload.get("binomial_ci_upper"),
+                "hhi_contribution": bin_payload.get("hhi_contribution"),
                 "members": bin_payload.get("values", []),
             }
         )
@@ -369,6 +398,16 @@ def _categorical_dc_entry(variable: dict[str, Any]) -> tuple[dict[str, Any], dic
                 "nonevent_count": bin_payload.get("non_event_count"),
                 "total_count": bin_payload.get("count"),
                 "event_rate": bin_payload.get("event_rate"),
+                "expected_event_rate": bin_payload.get("expected_event_rate"),
+                "expected_event_count": bin_payload.get("expected_event_count"),
+                "event_count_delta": bin_payload.get("event_count_delta"),
+                "binomial_p_value": bin_payload.get("binomial_p_value"),
+                "binomial_adjusted_p_value": bin_payload.get("binomial_adjusted_p_value"),
+                "binomial_significant": bin_payload.get("binomial_significant"),
+                "binomial_result": bin_payload.get("binomial_result"),
+                "binomial_ci_lower": bin_payload.get("binomial_ci_lower"),
+                "binomial_ci_upper": bin_payload.get("binomial_ci_upper"),
+                "hhi_contribution": bin_payload.get("hhi_contribution"),
                 "iv_contrib": bin_payload.get("export_iv"),
             }
         )

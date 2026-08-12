@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from interactive_decision_tree.session_store import save_dataframe_session
+
+
+APP_PATH = Path(__file__).resolve().parents[1] / "interactive_decision_tree_app.py"
 
 
 def test_model_shap_and_what_if_workspaces_render_without_tree_side_effects(tmp_path, monkeypatch):
@@ -20,7 +24,7 @@ def test_model_shap_and_what_if_workspaces_render_without_tree_side_effects(tmp_
     data_id, _ = save_dataframe_session(df, target="target", features=["age", "income"])
     work_id = f"test_{uuid4().hex}"
 
-    at = AppTest.from_file("interactive_decision_tree_app.py")
+    at = AppTest.from_file(APP_PATH)
     at.query_params["data_id"] = data_id
     at.query_params["work_id"] = work_id
     at.run(timeout=25)

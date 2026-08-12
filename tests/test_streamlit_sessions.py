@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from interactive_decision_tree.session_store import save_dataframe_session
+
+
+APP_PATH = Path(__file__).resolve().parents[1] / "interactive_decision_tree_app.py"
 
 
 def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
@@ -20,7 +24,7 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     data_id, _ = save_dataframe_session(df, target="target", features=["age", "income"])
     work_id = f"test_{uuid4().hex}"
 
-    at = AppTest.from_file("interactive_decision_tree_app.py")
+    at = AppTest.from_file(APP_PATH)
     at.query_params["data_id"] = data_id
     at.query_params["work_id"] = work_id
     at.run(timeout=25)
@@ -81,7 +85,7 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
     )
     assert split_count > 0
 
-    at2 = AppTest.from_file("interactive_decision_tree_app.py")
+    at2 = AppTest.from_file(APP_PATH)
     at2.query_params["data_id"] = data_id
     at2.query_params["work_id"] = work_id
     at2.run(timeout=25)
@@ -95,7 +99,7 @@ def test_streamlit_loads_session_data_and_restores_tree(tmp_path, monkeypatch):
 def test_streamlit_treats_demo_query_data_id_as_builtin_demo_source(tmp_path, monkeypatch):
     monkeypatch.setenv("INTERACTIVE_TREE_SESSION_DIR", str(tmp_path))
 
-    at = AppTest.from_file("interactive_decision_tree_app.py")
+    at = AppTest.from_file(APP_PATH)
     at.query_params["data_id"] = "demo"
     at.query_params["work_id"] = f"test_{uuid4().hex}"
     at.run(timeout=25)
