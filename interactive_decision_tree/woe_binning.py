@@ -6,16 +6,20 @@ import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import metadata
-from statistics import NormalDist
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.stats import binomtest
 
 
 WOE_SCHEMA_VERSION = 1
 WOE_EPSILON = 1e-8
-WOE_BINOMIAL_ALPHA = 0.05
+WOE_BINOMIAL_CONFIDENCE_LEVEL = 0.95
+WOE_BINOMIAL_ALTERNATIVE = "two-sided"
+WOE_BINOMIAL_METHOD = "exact_binomial"
+WOE_BINOMIAL_ADJUSTMENT = "bonferroni"
+WOE_MAX_BINS = 100
 WOE_HHI_LOW_THRESHOLD = 0.15
 WOE_HHI_MODERATE_THRESHOLD = 0.25
 
@@ -25,6 +29,7 @@ class WoeBuildConfig:
     max_bins: int = 6
     min_bin_size: float = 0.05
     monotonic_trend: str = "auto"
+    binomial_confidence_level: float = WOE_BINOMIAL_CONFIDENCE_LEVEL
     missing_separate: bool = True
     blank_as_missing: bool = True
     special_values: tuple[str, ...] = ()
@@ -575,6 +580,7 @@ def build_initial_spec(
             "max_bins": int(config.max_bins),
             "min_bin_size": float(config.min_bin_size),
             "monotonic_trend": str(config.monotonic_trend),
+            "binomial_confidence_level": float(config.binomial_confidence_level),
             "missing_separate": bool(config.missing_separate),
             "blank_as_missing": bool(config.blank_as_missing),
             "special_values": list(config.special_values),
@@ -639,37 +645,27 @@ def assigned_woe_value(bin_spec: dict[str, Any]) -> float | None:
     return safe_float_or_none(bin_spec.get("assigned_woe"))
 
 
-def normal_two_sided_p_value(z_value: float) -> float:
-    if not math.isfinite(z_value):
-        return 0.0
-    tail = 1.0 - NormalDist().cdf(abs(float(z_value)))
-    return float(max(0.0, min(1.0, 2.0 * tail)))
-
-
-def wilson_rate_interval(events: int, count: int, alpha: float) -> tuple[float | None, float | None]:
-    if count <= 0:
-        return None, None
-    event_rate = float(events / count)
-    bounded_alpha = min(max(float(alpha), 1e-12), 1.0 - 1e-12)
-    z_value = NormalDist().inv_cdf(1.0 - bounded_alpha / 2.0)
-    z_squared = z_value * z_value
-    denominator = 1.0 + z_squared / count
-    centre = (event_rate + z_squared / (2.0 * count)) / denominator
-    margin = (
-        z_value
-        * math.sqrt((event_rate * (1.0 - event_rate) + z_squared / (4.0 * count)) / count)
-        / denominator
-    )
-    return float(max(0.0, centre - margin)), float(min(1.0, centre + margin))
+def spec_binomial_confidence_level(spec: dict[str, Any]) -> float:
+    raw_value = spec.get("config", {}).get("binomial_confidence_level", WOE_BINOMIAL_CONFIDENCE_LEVEL)
+    try:
+        confidence_level = float(raw_value)
+    except (TypeError, ValueError):
+        return WOE_BINOMIAL_CONFIDENCE_LEVEL
+    if not 0.0 < confidence_level < 1.0:
+        return WOE_BINOMIAL_CONFIDENCE_LEVEL
+    return confidence_level
 
 
 def append_binomial_hhi_tests(
     table: pd.DataFrame,
     total_rows: int,
     total_events: int,
-    alpha: float = WOE_BINOMIAL_ALPHA,
+    confidence_level: float = WOE_BINOMIAL_CONFIDENCE_LEVEL,
 ) -> pd.DataFrame:
     out = table.copy()
+    if not 0.0 < float(confidence_level) < 1.0:
+        raise ValueError("binomial_confidence_level must be between 0 and 1")
+    alpha = 1.0 - float(confidence_level)
     family_size = max(1, int((pd.to_numeric(out.get("count"), errors="coerce").fillna(0) > 0).sum()))
     effective_alpha = float(alpha) / family_size
     expected_rate = None if total_rows <= 0 else float(total_events / total_rows)
@@ -695,13 +691,20 @@ def append_binomial_hhi_tests(
             continue
 
         expected_count = float(count * expected_rate)
-        variance = float(count * expected_rate * (1.0 - expected_rate))
-        if variance <= 0.0:
-            p_value = 1.0 if math.isclose(float(event_count), expected_count, abs_tol=1e-12) else 0.0
-        else:
-            p_value = normal_two_sided_p_value((float(event_count) - expected_count) / math.sqrt(variance))
+        test_result = binomtest(
+            int(event_count),
+            int(count),
+            float(expected_rate),
+            alternative=WOE_BINOMIAL_ALTERNATIVE,
+        )
+        p_value = float(test_result.pvalue)
         adjusted_p = float(min(1.0, p_value * family_size))
-        ci_lower, ci_upper = wilson_rate_interval(event_count, count, effective_alpha)
+        interval = test_result.proportion_ci(
+            confidence_level=1.0 - effective_alpha,
+            method="exact",
+        )
+        ci_lower = float(interval.low)
+        ci_upper = float(interval.high)
         expected_counts.append(expected_count)
         count_deltas.append(float(event_count - expected_count))
         p_values.append(p_value)
@@ -717,14 +720,15 @@ def append_binomial_hhi_tests(
     out["binomial_adjusted_p_value"] = adjusted_p_values
     out["binomial_significant"] = significant_values
     out["binomial_result"] = [
-        "Different from total" if value is True else "Not different" if value is False else "No data"
+        "Different" if value is True else "Not different" if value is False else "No data"
         for value in significant_values
     ]
     out["binomial_ci_lower"] = ci_lowers
     out["binomial_ci_upper"] = ci_uppers
     out["binomial_alpha"] = float(alpha)
     out["binomial_effective_alpha"] = effective_alpha
-    out["hhi_contribution"] = pd.to_numeric(out.get("all_concentration"), errors="coerce").fillna(0.0) ** 2
+    bucket_weights = pd.to_numeric(out.get("bucket_weight"), errors="coerce").fillna(0.0)
+    out["hhi_contribution"] = bucket_weights**2
     return out
 
 
@@ -746,6 +750,7 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
             "hhi_concentration": None,
             "hhi_well_distributed": None,
             "max_bin_concentration": None,
+            "max_bucket_weight": None,
             "binomial_reference_event_rate": None,
             "binomial_family_size": 0,
             "binomial_effective_alpha": None,
@@ -754,7 +759,8 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
             "binomial_signal_share": None,
         }
 
-    shares = pd.to_numeric(table.get("all_concentration"), errors="coerce").fillna(0.0)
+    weight_column = "bucket_weight" if "bucket_weight" in table.columns else "all_concentration"
+    shares = pd.to_numeric(table.get(weight_column), errors="coerce").fillna(0.0)
     positive_bins = int((pd.to_numeric(table.get("count"), errors="coerce").fillna(0) > 0).sum())
     hhi_total = float(np.square(shares).sum())
     if positive_bins > 1:
@@ -763,7 +769,7 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         normalized_hhi = float(max(0.0, min(1.0, normalized_hhi)))
     else:
         normalized_hhi = 0.0 if positive_bins == 1 else None
-    concentration = hhi_concentration_label(normalized_hhi)
+    concentration = hhi_concentration_label(hhi_total)
 
     significant = table.get("binomial_significant", pd.Series(False, index=table.index))
     significant = significant.fillna(False).astype(bool)
@@ -771,8 +777,9 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         "hhi_total": hhi_total,
         "normalized_hhi": normalized_hhi,
         "hhi_concentration": concentration,
-        "hhi_well_distributed": None if normalized_hhi is None else bool(normalized_hhi < WOE_HHI_MODERATE_THRESHOLD),
+        "hhi_well_distributed": bool(hhi_total < WOE_HHI_MODERATE_THRESHOLD),
         "max_bin_concentration": None if shares.empty else float(shares.max()),
+        "max_bucket_weight": None if shares.empty else float(shares.max()),
         "binomial_reference_event_rate": (
             None
             if "expected_event_rate" not in table.columns or table["expected_event_rate"].dropna().empty
@@ -831,6 +838,7 @@ def build_bin_table_from_counts(
                 "event_count": event_count,
                 "non_event_count": non_event_count,
                 "event_rate": None if count == 0 else event_count / count,
+                "bucket_weight": None if total_rows == 0 else count / total_rows,
                 "all_concentration": None if total_rows == 0 else count / total_rows,
                 "event_concentration": None if total_events == 0 else event_count / total_events,
                 "non_event_concentration": None if total_non_events == 0 else non_event_count / total_non_events,
@@ -847,6 +855,7 @@ def build_bin_table_from_counts(
         pd.DataFrame(rows),
         total_rows=total_rows,
         total_events=total_events,
+        confidence_level=spec_binomial_confidence_level(spec),
     )
 
 
@@ -1041,6 +1050,7 @@ def evaluate_spec(
     export_auc = binary_auc_from_bin_table(table, "export_woe")
     monotonicity = monotonicity_from_table(table)
     quality = bin_quality_metrics(table)
+    confidence_level = spec_binomial_confidence_level(spec)
     metrics = {
         "dataset": dataset_name,
         "variable": feature,
@@ -1059,6 +1069,11 @@ def evaluate_spec(
         "monotonic_violation_count": int(monotonicity["violation_count"]),
         "manual_woe_bins": int(table["assigned_woe"].notna().sum()),
         "engine_used": str(spec.get("config", {}).get("engine_used", "unknown")),
+        "binomial_confidence_level": confidence_level,
+        "binomial_family_alpha": 1.0 - confidence_level,
+        "binomial_alternative": WOE_BINOMIAL_ALTERNATIVE,
+        "binomial_test_method": WOE_BINOMIAL_METHOD,
+        "binomial_multiple_testing": WOE_BINOMIAL_ADJUSTMENT,
         **quality,
     }
     return {"table": table, "metrics": metrics}

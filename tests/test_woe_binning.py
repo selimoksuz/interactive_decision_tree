@@ -11,6 +11,7 @@ import pytest
 
 import interactive_decision_tree.woe_binning as woe_binning
 from interactive_decision_tree.woe_binning import (
+    WOE_MAX_BINS,
     WoeBuildConfig,
     apply_bin_table_edits,
     apply_numeric_cutpoints,
@@ -31,6 +32,7 @@ from interactive_decision_tree.woe_export import (
 )
 from interactive_decision_tree.woe_ui import (
     apply_current_bin_changes,
+    binomial_test_frame,
     filter_variable_options,
     normalize_variable_selection,
     scoped_woe_project,
@@ -107,7 +109,13 @@ def test_numeric_woe_supports_special_missing_and_manual_woe():
 
 def test_woe_evaluation_adds_binomial_and_hhi_tests():
     df = woe_df()
-    spec = build_initial_spec(df, "target", "age", 1, WoeBuildConfig(max_bins=3, engine="fallback"))
+    spec = build_initial_spec(
+        df,
+        "target",
+        "age",
+        1,
+        WoeBuildConfig(max_bins=3, binomial_confidence_level=0.90, engine="fallback"),
+    )
 
     report = evaluate_spec(df, "target", spec, 1)
     table = report["table"]
@@ -122,12 +130,47 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
         "binomial_significant",
         "binomial_ci_lower",
         "binomial_ci_upper",
+        "bucket_weight",
         "hhi_contribution",
     }.issubset(table.columns)
-    assert metrics["hhi_total"] == pytest.approx(float((table["all_concentration"] ** 2).sum()))
+    assert table["bucket_weight"].sum() == pytest.approx(1.0)
+    assert table["bucket_weight"].equals(table["all_concentration"])
+    assert metrics["hhi_total"] == pytest.approx(float((table["bucket_weight"] ** 2).sum()))
     assert 0.0 <= metrics["hhi_total"] <= 1.0
+    assert metrics["hhi_concentration"] == woe_binning.hhi_concentration_label(metrics["hhi_total"])
     assert 0.0 <= metrics["binomial_signal_share"] <= 1.0
     assert metrics["binomial_family_size"] == int((table["count"] > 0).sum())
+    assert metrics["binomial_confidence_level"] == pytest.approx(0.90)
+    assert metrics["binomial_family_alpha"] == pytest.approx(0.10)
+    assert metrics["binomial_alternative"] == "two-sided"
+    assert metrics["binomial_test_method"] == "exact_binomial"
+    assert metrics["binomial_multiple_testing"] == "bonferroni"
+
+    visible_tests = binomial_test_frame(table)
+    assert list(visible_tests.columns) == [
+        "label",
+        "bucket_weight",
+        "event_rate",
+        "binomial_adjusted_p_value",
+        "binomial_result",
+        "binomial_ci_lower",
+        "binomial_ci_upper",
+    ]
+
+
+def test_woe_max_bins_supports_more_than_twenty_normal_bins():
+    df = pd.DataFrame({"feature": np.arange(500), "target": np.tile([0, 1], 250)})
+
+    spec = build_initial_spec(
+        df,
+        "target",
+        "feature",
+        1,
+        WoeBuildConfig(max_bins=25, min_bin_size=0.01, engine="fallback"),
+    )
+
+    assert WOE_MAX_BINS == 100
+    assert sum(bin_spec["kind"] == "normal" for bin_spec in spec["bins"]) == 25
 
 
 def test_auto_optbinning_raises_when_engine_unavailable(monkeypatch):
@@ -362,6 +405,9 @@ def test_project_export_contains_integrated_mapping():
     age_payload = next(variable for variable in decoded["variables"] if variable["name"] == "age")
     assert "hhi_total" in age_payload["metrics"]
     assert "binomial_signal_share" in age_payload["metrics"]
+    assert age_payload["metrics"]["binomial_confidence_level"] == pytest.approx(0.95)
+    assert age_payload["metrics"]["binomial_alternative"] == "two-sided"
+    assert "bucket_weight" in age_payload["bins"][0]
     assert "binomial_p_value" in age_payload["bins"][0]
     assert "hhi_contribution" in age_payload["bins"][0]
 
