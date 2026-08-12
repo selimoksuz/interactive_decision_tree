@@ -162,7 +162,19 @@ def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
         "binomial_signal_share",
         "engine_used",
     ]
-    return pd.DataFrame([{"metric": key, "value": metrics.get(key)} for key in keys])
+    rows = []
+    for key in keys:
+        value = metrics.get(key)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            display_value = "n/a"
+        elif isinstance(value, bool):
+            display_value = "Yes" if value else "No"
+        elif isinstance(value, float):
+            display_value = f"{value:.6f}"
+        else:
+            display_value = str(value)
+        rows.append({"metric": key, "value": display_value})
+    return pd.DataFrame(rows, dtype="string")
 
 
 def woe_column_config(

@@ -34,6 +34,7 @@ from interactive_decision_tree.woe_ui import (
     apply_current_bin_changes,
     binomial_test_frame,
     filter_variable_options,
+    metrics_frame,
     normalize_variable_selection,
     scoped_woe_project,
     update_variable_selection_for_filtered,
@@ -58,6 +59,16 @@ def test_woe_variable_filter_supports_contains_multiple_terms_and_wildcards():
     assert filter_variable_options(variables, "age,score") == ["age", "risk_score"]
     assert filter_variable_options(variables, "inc%") == ["income"]
     assert filter_variable_options(variables, "*ment") == ["segment"]
+
+
+def test_woe_metrics_frame_uses_arrow_safe_display_strings():
+    frame = metrics_frame({"export_iv": 0.1234567, "is_monotonic": True, "engine_used": "optbinning"})
+
+    values = dict(frame.to_dict("split")["data"])
+    assert str(frame["value"].dtype) == "string"
+    assert values["export_iv"] == "0.123457"
+    assert values["is_monotonic"] == "Yes"
+    assert values["engine_used"] == "optbinning"
 
 
 def test_woe_variable_selection_actions_preserve_order():
