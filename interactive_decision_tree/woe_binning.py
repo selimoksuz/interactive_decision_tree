@@ -10,14 +10,16 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.stats import binomtest
+from scipy.stats import binom, binomtest
 
 
 WOE_SCHEMA_VERSION = 1
 WOE_EPSILON = 1e-8
 WOE_BINOMIAL_CONFIDENCE_LEVEL = 0.95
 WOE_BINOMIAL_ALTERNATIVE = "two-sided"
-WOE_BINOMIAL_METHOD = "exact_binomial"
+WOE_BINOMIAL_ONE_TAIL_ALTERNATIVE = "greater"
+WOE_BINOMIAL_METHOD = "central_exact_binomial"
+WOE_BINOMIAL_ONE_TAIL_METHOD = "exact_binomial_upper_tail"
 WOE_BINOMIAL_ADJUSTMENT = "bonferroni"
 WOE_MAX_BINS = 100
 WOE_HHI_LOW_THRESHOLD = 0.15
@@ -656,6 +658,16 @@ def spec_binomial_confidence_level(spec: dict[str, Any]) -> float:
     return confidence_level
 
 
+def central_exact_two_tail_p_value(events: int, trials: int, expected_rate: float) -> float:
+    left_tail = float(binom.cdf(int(events), int(trials), float(expected_rate)))
+    right_tail = float(binom.sf(int(events) - 1, int(trials), float(expected_rate)))
+    return float(min(1.0, 2.0 * min(left_tail, right_tail)))
+
+
+def exact_upper_tail_p_value(events: int, trials: int, expected_rate: float) -> float:
+    return float(binom.sf(int(events) - 1, int(trials), float(expected_rate)))
+
+
 def append_binomial_hhi_tests(
     table: pd.DataFrame,
     total_rows: int,
@@ -671,9 +683,12 @@ def append_binomial_hhi_tests(
     expected_rate = None if total_rows <= 0 else float(total_events / total_rows)
     expected_counts: list[float | None] = []
     count_deltas: list[float | None] = []
-    p_values: list[float | None] = []
-    adjusted_p_values: list[float | None] = []
-    significant_values: list[bool | None] = []
+    two_tail_p_values: list[float | None] = []
+    two_tail_adjusted_p_values: list[float | None] = []
+    two_tail_pass_values: list[bool | None] = []
+    one_tail_p_values: list[float | None] = []
+    one_tail_adjusted_p_values: list[float | None] = []
+    one_tail_pass_values: list[bool | None] = []
     ci_lowers: list[float | None] = []
     ci_uppers: list[float | None] = []
 
@@ -683,23 +698,22 @@ def append_binomial_hhi_tests(
         if count <= 0 or expected_rate is None:
             expected_counts.append(None)
             count_deltas.append(None)
-            p_values.append(None)
-            adjusted_p_values.append(None)
-            significant_values.append(None)
+            two_tail_p_values.append(None)
+            two_tail_adjusted_p_values.append(None)
+            two_tail_pass_values.append(None)
+            one_tail_p_values.append(None)
+            one_tail_adjusted_p_values.append(None)
+            one_tail_pass_values.append(None)
             ci_lowers.append(None)
             ci_uppers.append(None)
             continue
 
         expected_count = float(count * expected_rate)
-        test_result = binomtest(
-            int(event_count),
-            int(count),
-            float(expected_rate),
-            alternative=WOE_BINOMIAL_ALTERNATIVE,
-        )
-        p_value = float(test_result.pvalue)
-        adjusted_p = float(min(1.0, p_value * family_size))
-        interval = test_result.proportion_ci(
+        two_tail_p_value = central_exact_two_tail_p_value(event_count, count, expected_rate)
+        one_tail_p_value = exact_upper_tail_p_value(event_count, count, expected_rate)
+        two_tail_adjusted_p = float(min(1.0, two_tail_p_value * family_size))
+        one_tail_adjusted_p = float(min(1.0, one_tail_p_value * family_size))
+        interval = binomtest(int(event_count), int(count)).proportion_ci(
             confidence_level=1.0 - effective_alpha,
             method="exact",
         )
@@ -707,21 +721,35 @@ def append_binomial_hhi_tests(
         ci_upper = float(interval.high)
         expected_counts.append(expected_count)
         count_deltas.append(float(event_count - expected_count))
-        p_values.append(p_value)
-        adjusted_p_values.append(adjusted_p)
-        significant_values.append(bool(adjusted_p < float(alpha)))
+        two_tail_p_values.append(two_tail_p_value)
+        two_tail_adjusted_p_values.append(two_tail_adjusted_p)
+        two_tail_pass_values.append(bool(two_tail_p_value >= effective_alpha))
+        one_tail_p_values.append(one_tail_p_value)
+        one_tail_adjusted_p_values.append(one_tail_adjusted_p)
+        one_tail_pass_values.append(bool(one_tail_p_value >= effective_alpha))
         ci_lowers.append(ci_lower)
         ci_uppers.append(ci_upper)
 
+    out["variable_avg_event_rate"] = expected_rate
     out["expected_event_rate"] = expected_rate
     out["expected_event_count"] = expected_counts
     out["event_count_delta"] = count_deltas
-    out["binomial_p_value"] = p_values
-    out["binomial_adjusted_p_value"] = adjusted_p_values
-    out["binomial_significant"] = significant_values
+    out["binomial_p_value"] = two_tail_p_values
+    out["binomial_adjusted_p_value"] = two_tail_adjusted_p_values
+    out["binomial_pass"] = two_tail_pass_values
+    out["binomial_significant"] = [None if value is None else not value for value in two_tail_pass_values]
     out["binomial_result"] = [
-        "Different" if value is True else "Not different" if value is False else "No data"
-        for value in significant_values
+        "Pass" if value is True else "Reject" if value is False else "No data"
+        for value in two_tail_pass_values
+    ]
+    out["binomial_two_tail_pass"] = two_tail_pass_values
+    out["binomial_two_tail_result"] = out["binomial_result"]
+    out["binomial_one_tail_p_value"] = one_tail_p_values
+    out["binomial_one_tail_adjusted_p_value"] = one_tail_adjusted_p_values
+    out["binomial_one_tail_pass"] = one_tail_pass_values
+    out["binomial_one_tail_result"] = [
+        "Pass" if value is True else "Reject" if value is False else "No data"
+        for value in one_tail_pass_values
     ]
     out["binomial_ci_lower"] = ci_lowers
     out["binomial_ci_upper"] = ci_uppers
@@ -729,6 +757,7 @@ def append_binomial_hhi_tests(
     out["binomial_effective_alpha"] = effective_alpha
     bucket_weights = pd.to_numeric(out.get("bucket_weight"), errors="coerce").fillna(0.0)
     out["hhi_contribution"] = bucket_weights**2
+    out["bucket_hhi"] = out["hhi_contribution"]
     return out
 
 
@@ -751,12 +780,21 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
             "hhi_well_distributed": None,
             "max_bin_concentration": None,
             "max_bucket_weight": None,
+            "average_bucket_hhi": None,
+            "variable_avg_value": None,
+            "variable_avg_event_rate": None,
             "binomial_reference_event_rate": None,
             "binomial_family_size": 0,
             "binomial_effective_alpha": None,
             "binomial_significant_bins": 0,
             "binomial_signal_rate": None,
             "binomial_signal_share": None,
+            "binomial_pass_bins": 0,
+            "binomial_reject_bins": 0,
+            "binomial_pass_weight": None,
+            "binomial_one_tail_pass_bins": 0,
+            "binomial_one_tail_reject_bins": 0,
+            "binomial_one_tail_pass_weight": None,
         }
 
     weight_column = "bucket_weight" if "bucket_weight" in table.columns else "all_concentration"
@@ -771,8 +809,31 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         normalized_hhi = 0.0 if positive_bins == 1 else None
     concentration = hhi_concentration_label(hhi_total)
 
-    significant = table.get("binomial_significant", pd.Series(False, index=table.index))
-    significant = significant.fillna(False).astype(bool)
+    two_tail_pass = table.get("binomial_pass", pd.Series(False, index=table.index)).fillna(False).astype(bool)
+    one_tail_pass = (
+        table.get("binomial_one_tail_pass", pd.Series(False, index=table.index)).fillna(False).astype(bool)
+    )
+    populated = pd.to_numeric(table.get("count"), errors="coerce").fillna(0) > 0
+    significant = populated & ~two_tail_pass
+    one_tail_reject = populated & ~one_tail_pass
+    variable_avg_event_rate = (
+        None
+        if "variable_avg_event_rate" not in table.columns or table["variable_avg_event_rate"].dropna().empty
+        else float(table["variable_avg_event_rate"].dropna().iloc[0])
+    )
+    variable_values = pd.to_numeric(table.get("variable_avg_value"), errors="coerce")
+    variable_counts = pd.to_numeric(table.get("count"), errors="coerce").fillna(0.0)
+    variable_value_rows = variable_values.notna() & (variable_counts > 0)
+    variable_avg_value = (
+        None
+        if not bool(variable_value_rows.any())
+        else float(
+            np.average(
+                variable_values.loc[variable_value_rows],
+                weights=variable_counts.loc[variable_value_rows],
+            )
+        )
+    )
     return {
         "hhi_total": hhi_total,
         "normalized_hhi": normalized_hhi,
@@ -780,6 +841,9 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         "hhi_well_distributed": bool(hhi_total < WOE_HHI_MODERATE_THRESHOLD),
         "max_bin_concentration": None if shares.empty else float(shares.max()),
         "max_bucket_weight": None if shares.empty else float(shares.max()),
+        "average_bucket_hhi": None if positive_bins == 0 else float(hhi_total / positive_bins),
+        "variable_avg_value": variable_avg_value,
+        "variable_avg_event_rate": variable_avg_event_rate,
         "binomial_reference_event_rate": (
             None
             if "expected_event_rate" not in table.columns or table["expected_event_rate"].dropna().empty
@@ -794,12 +858,18 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         "binomial_significant_bins": int(significant.sum()),
         "binomial_signal_rate": None if positive_bins == 0 else float(significant.sum() / positive_bins),
         "binomial_signal_share": float(shares.loc[significant].sum()),
+        "binomial_pass_bins": int((populated & two_tail_pass).sum()),
+        "binomial_reject_bins": int(significant.sum()),
+        "binomial_pass_weight": float(shares.loc[populated & two_tail_pass].sum()),
+        "binomial_one_tail_pass_bins": int((populated & one_tail_pass).sum()),
+        "binomial_one_tail_reject_bins": int(one_tail_reject.sum()),
+        "binomial_one_tail_pass_weight": float(shares.loc[populated & one_tail_pass].sum()),
     }
 
 
 def build_bin_table_from_counts(
     spec: dict[str, Any],
-    counts_by_bin: dict[str, dict[str, int]],
+    counts_by_bin: dict[str, dict[str, Any]],
     total_rows: int,
     total_events: int,
     total_non_events: int,
@@ -816,6 +886,13 @@ def build_bin_table_from_counts(
         event_count = int(counts.get("event_count", 0))
         non_event_count = int(counts.get("non_event_count", 0))
         count = event_count + non_event_count
+        raw_variable_avg = counts.get("variable_avg_value")
+        try:
+            variable_avg_value = float(raw_variable_avg)
+        except (TypeError, ValueError):
+            variable_avg_value = None
+        if variable_avg_value is not None and not math.isfinite(variable_avg_value):
+            variable_avg_value = None
         event_dist = (event_count + WOE_EPSILON) / (total_events + WOE_EPSILON * max(1, len(order)))
         non_event_dist = (non_event_count + WOE_EPSILON) / (
             total_non_events + WOE_EPSILON * max(1, len(order))
@@ -838,6 +915,7 @@ def build_bin_table_from_counts(
                 "event_count": event_count,
                 "non_event_count": non_event_count,
                 "event_rate": None if count == 0 else event_count / count,
+                "variable_avg_value": variable_avg_value,
                 "bucket_weight": None if total_rows == 0 else count / total_rows,
                 "all_concentration": None if total_rows == 0 else count / total_rows,
                 "event_concentration": None if total_events == 0 else event_count / total_events,
@@ -945,16 +1023,26 @@ def build_bin_table(
     total_rows = int(y_valid.sum())
     total_non_events = total_rows - total_events
     if total_rows:
-        grouped = (
-            pd.DataFrame({"bin_id": assigned.loc[y_valid].astype("object"), "event": event.loc[y_valid].astype(int)})
-            .groupby("bin_id", dropna=False)["event"]
-            .agg(["count", "sum"])
+        grouped_input = pd.DataFrame(
+            {
+                "bin_id": assigned.loc[y_valid].astype("object"),
+                "event": event.loc[y_valid].astype(int),
+            }
         )
+        named_aggregations: dict[str, tuple[str, str]] = {
+            "count": ("event", "size"),
+            "event_count": ("event", "sum"),
+        }
+        if spec.get("feature_kind") == "numeric":
+            grouped_input["feature_value"] = pd.to_numeric(df.loc[y_valid, feature], errors="coerce")
+            named_aggregations["variable_avg_value"] = ("feature_value", "mean")
+        grouped = grouped_input.groupby("bin_id", dropna=False).agg(**named_aggregations)
         counts_by_bin = {
             str(bin_id): {
                 "count": int(row["count"]),
-                "event_count": int(row["sum"]),
-                "non_event_count": int(row["count"] - row["sum"]),
+                "event_count": int(row["event_count"]),
+                "non_event_count": int(row["count"] - row["event_count"]),
+                "variable_avg_value": row.get("variable_avg_value"),
             }
             for bin_id, row in grouped.iterrows()
         }
@@ -1073,6 +1161,8 @@ def evaluate_spec(
         "binomial_family_alpha": 1.0 - confidence_level,
         "binomial_alternative": WOE_BINOMIAL_ALTERNATIVE,
         "binomial_test_method": WOE_BINOMIAL_METHOD,
+        "binomial_one_tail_alternative": WOE_BINOMIAL_ONE_TAIL_ALTERNATIVE,
+        "binomial_one_tail_test_method": WOE_BINOMIAL_ONE_TAIL_METHOD,
         "binomial_multiple_testing": WOE_BINOMIAL_ADJUSTMENT,
         **quality,
     }

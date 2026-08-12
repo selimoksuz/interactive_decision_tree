@@ -8,6 +8,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 
 import interactive_decision_tree.woe_binning as woe_binning
 from interactive_decision_tree.woe_binning import (
@@ -32,7 +33,7 @@ from interactive_decision_tree.woe_export import (
 )
 from interactive_decision_tree.woe_ui import (
     apply_current_bin_changes,
-    binomial_test_frame,
+    current_bin_editor_columns,
     filter_variable_options,
     metrics_frame,
     normalize_variable_selection,
@@ -139,14 +140,26 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
         "binomial_p_value",
         "binomial_adjusted_p_value",
         "binomial_significant",
+        "binomial_pass",
+        "binomial_result",
+        "binomial_one_tail_p_value",
+        "binomial_one_tail_adjusted_p_value",
+        "binomial_one_tail_pass",
+        "binomial_one_tail_result",
         "binomial_ci_lower",
         "binomial_ci_upper",
         "bucket_weight",
+        "variable_avg_value",
+        "variable_avg_event_rate",
         "hhi_contribution",
+        "bucket_hhi",
     }.issubset(table.columns)
     assert table["bucket_weight"].sum() == pytest.approx(1.0)
     assert table["bucket_weight"].equals(table["all_concentration"])
     assert metrics["hhi_total"] == pytest.approx(float((table["bucket_weight"] ** 2).sum()))
+    assert metrics["average_bucket_hhi"] == pytest.approx(
+        metrics["hhi_total"] / metrics["binomial_family_size"]
+    )
     assert 0.0 <= metrics["hhi_total"] <= 1.0
     assert metrics["hhi_concentration"] == woe_binning.hhi_concentration_label(metrics["hhi_total"])
     assert 0.0 <= metrics["binomial_signal_share"] <= 1.0
@@ -154,19 +167,49 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
     assert metrics["binomial_confidence_level"] == pytest.approx(0.90)
     assert metrics["binomial_family_alpha"] == pytest.approx(0.10)
     assert metrics["binomial_alternative"] == "two-sided"
-    assert metrics["binomial_test_method"] == "exact_binomial"
+    assert metrics["binomial_test_method"] == "central_exact_binomial"
+    assert metrics["binomial_one_tail_alternative"] == "greater"
+    assert metrics["binomial_one_tail_test_method"] == "exact_binomial_upper_tail"
     assert metrics["binomial_multiple_testing"] == "bonferroni"
+    assert metrics["variable_avg_event_rate"] == pytest.approx(df["target"].mean())
+    assert metrics["variable_avg_value"] == pytest.approx(df["age"].mean())
+    normal_rows = table[table["kind"] == "normal"]
+    assert normal_rows["variable_avg_value"].notna().all()
+    assert set(table["binomial_result"]) <= {"Pass", "Reject", "No data"}
+    assert set(table["binomial_one_tail_result"]) <= {"Pass", "Reject", "No data"}
+    assert table["bucket_hhi"].equals(table["hhi_contribution"])
 
-    visible_tests = binomial_test_frame(table)
-    assert list(visible_tests.columns) == [
-        "label",
+    first = table.iloc[0]
+    expected_two_tail = min(
+        1.0,
+        2.0
+        * min(
+            stats.binom.cdf(first["event_count"], first["count"], metrics["variable_avg_event_rate"]),
+            stats.binom.sf(first["event_count"] - 1, first["count"], metrics["variable_avg_event_rate"]),
+        ),
+    )
+    expected_one_tail = stats.binom.sf(
+        first["event_count"] - 1,
+        first["count"],
+        metrics["variable_avg_event_rate"],
+    )
+    assert first["binomial_p_value"] == pytest.approx(expected_two_tail)
+    assert first["binomial_one_tail_p_value"] == pytest.approx(expected_one_tail)
+
+    visible_columns = current_bin_editor_columns("numeric")
+    assert visible_columns[:4] == ["merge", "label", "lower", "upper"]
+    assert {
+        "count",
+        "event_count",
+        "non_event_count",
         "bucket_weight",
         "event_rate",
-        "binomial_adjusted_p_value",
+        "variable_avg_value",
         "binomial_result",
-        "binomial_ci_lower",
-        "binomial_ci_upper",
-    ]
+        "binomial_one_tail_result",
+        "bucket_hhi",
+    } <= set(visible_columns)
+    assert {"binomial_p_value", "binomial_ci_lower", "binomial_ci_upper"}.isdisjoint(visible_columns)
 
 
 def test_woe_max_bins_supports_more_than_twenty_normal_bins():
@@ -418,7 +461,13 @@ def test_project_export_contains_integrated_mapping():
     assert "binomial_signal_share" in age_payload["metrics"]
     assert age_payload["metrics"]["binomial_confidence_level"] == pytest.approx(0.95)
     assert age_payload["metrics"]["binomial_alternative"] == "two-sided"
+    assert age_payload["metrics"]["binomial_one_tail_alternative"] == "greater"
     assert "bucket_weight" in age_payload["bins"][0]
+    assert "variable_avg_event_rate" in age_payload["bins"][0]
+    assert "variable_avg_value" in age_payload["bins"][0]
+    assert "binomial_pass" in age_payload["bins"][0]
+    assert "binomial_one_tail_result" in age_payload["bins"][0]
+    assert "bucket_hhi" in age_payload["bins"][0]
     assert "binomial_p_value" in age_payload["bins"][0]
     assert "hhi_contribution" in age_payload["bins"][0]
 

@@ -156,10 +156,14 @@ def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
         "monotonic_direction",
         "monotonic_violation_count",
         "hhi_total",
+        "average_bucket_hhi",
         "hhi_concentration",
         "max_bucket_weight",
-        "binomial_significant_bins",
-        "binomial_signal_share",
+        "variable_avg_value",
+        "binomial_pass_bins",
+        "binomial_reject_bins",
+        "binomial_one_tail_pass_bins",
+        "binomial_one_tail_reject_bins",
         "engine_used",
     ]
     rows = []
@@ -177,24 +181,22 @@ def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows, dtype="string")
 
 
-def woe_column_config(
-    confidence_level: float = WOE_BINOMIAL_CONFIDENCE_LEVEL,
-) -> dict[str, Any]:
-    confidence_label = f"{float(confidence_level):.0%} simultaneous CI"
+def woe_column_config() -> dict[str, Any]:
     return {
         "merge": st.column_config.CheckboxColumn("Merge"),
         "bin_order": st.column_config.NumberColumn("Order", format="%d"),
+        "label": st.column_config.TextColumn("Band Range"),
         "count": st.column_config.NumberColumn("Count", format="%d"),
-        "event_count": st.column_config.NumberColumn("Event Count", format="%d"),
-        "non_event_count": st.column_config.NumberColumn("Non-event Count", format="%d"),
+        "event_count": st.column_config.NumberColumn("Bad Count", format="%d"),
+        "non_event_count": st.column_config.NumberColumn("Good Count", format="%d"),
         "bucket_weight": st.column_config.NumberColumn("Bucket Weight", format="%.6f"),
-        "event_rate": st.column_config.NumberColumn("Event Rate", format="%.6f"),
+        "event_rate": st.column_config.NumberColumn("Bad Rate", format="%.6f"),
+        "variable_avg_value": st.column_config.NumberColumn("Variable Avg Value", format="%.6f"),
+        "binomial_result": st.column_config.TextColumn("Two-tail Binomial"),
+        "binomial_one_tail_result": st.column_config.TextColumn("One-tail Binomial"),
+        "bucket_hhi": st.column_config.NumberColumn("Bucket HHI", format="%.6f"),
         "event_concentration": st.column_config.NumberColumn("Event Share", format="%.6f"),
         "non_event_concentration": st.column_config.NumberColumn("Non-event Share", format="%.6f"),
-        "binomial_adjusted_p_value": st.column_config.NumberColumn("Adjusted p-value", format="%.6f"),
-        "binomial_result": st.column_config.TextColumn("Binomial Result"),
-        "binomial_ci_lower": st.column_config.NumberColumn(f"{confidence_label} Lower", format="%.6f"),
-        "binomial_ci_upper": st.column_config.NumberColumn(f"{confidence_label} Upper", format="%.6f"),
         "calculated_woe": st.column_config.NumberColumn("Calculated WOE", format="%.6f"),
         "assigned_woe": st.column_config.NumberColumn("Assigned WOE", format="%.6f"),
         "lower": st.column_config.NumberColumn("Lower", format="%.12g"),
@@ -220,6 +222,11 @@ def editable_bin_table(table: pd.DataFrame, *, include_merge: bool = False) -> p
         "non_event_count",
         "bucket_weight",
         "event_rate",
+        "variable_avg_value",
+        "variable_avg_event_rate",
+        "binomial_result",
+        "binomial_one_tail_result",
+        "bucket_hhi",
         "event_concentration",
         "non_event_concentration",
         "calculated_woe",
@@ -236,17 +243,30 @@ def editable_bin_table(table: pd.DataFrame, *, include_merge: bool = False) -> p
     return out
 
 
-def binomial_test_frame(table: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "label",
-        "bucket_weight",
-        "event_rate",
-        "binomial_adjusted_p_value",
-        "binomial_result",
-        "binomial_ci_lower",
-        "binomial_ci_upper",
-    ]
-    return table[[column for column in columns if column in table.columns]].copy()
+def current_bin_editor_columns(feature_kind: str) -> list[str]:
+    columns = ["merge", "label"]
+    if feature_kind == "numeric":
+        columns.extend(["lower", "upper"])
+    else:
+        columns.append("values")
+    columns.extend(
+        [
+            "count",
+            "event_count",
+            "non_event_count",
+            "bucket_weight",
+            "event_rate",
+            "variable_avg_value",
+            "binomial_result",
+            "binomial_one_tail_result",
+            "bucket_hhi",
+            "calculated_woe",
+            "assigned_woe",
+            "export_iv",
+            "note",
+        ]
+    )
+    return columns
 
 
 def selected_normal_merge_bin_ids(edited_table: pd.DataFrame) -> list[str]:
@@ -598,9 +618,12 @@ def build_config_from_sidebar(
         "Binomial confidence level",
         options=[0.90, 0.95, 0.99],
         index=1,
-        format_func=lambda value: f"{value:.0%} family-wise (two-sided)",
+        format_func=lambda value: f"{value:.0%} family-wise",
         key="woe_binomial_confidence_level",
-        help="Exact two-sided binomial test with Bonferroni adjustment across non-empty bins.",
+        help=(
+            "Applied to both the central exact two-tail test and the exact upper one-tail test, "
+            "with Bonferroni adjustment across non-empty bins."
+        ),
     )
     engine = "optbinning"
     status = optbinning_status()
@@ -666,10 +689,16 @@ def variable_summary_row(
         "monotonic_direction": current_train.get("monotonic_direction"),
         "monotonic_violations": current_train.get("monotonic_violation_count"),
         "hhi_total": current_train.get("hhi_total"),
+        "average_bucket_hhi": current_train.get("average_bucket_hhi"),
         "normalized_hhi": current_train.get("normalized_hhi"),
         "hhi_concentration": current_train.get("hhi_concentration"),
         "max_bin_concentration": current_train.get("max_bin_concentration"),
         "max_bucket_weight": current_train.get("max_bucket_weight"),
+        "variable_avg_value": current_train.get("variable_avg_value"),
+        "binomial_pass_bins": current_train.get("binomial_pass_bins"),
+        "binomial_reject_bins": current_train.get("binomial_reject_bins"),
+        "binomial_one_tail_pass_bins": current_train.get("binomial_one_tail_pass_bins"),
+        "binomial_one_tail_reject_bins": current_train.get("binomial_one_tail_reject_bins"),
         "binomial_significant_bins": current_train.get("binomial_significant_bins"),
         "binomial_signal_rate": current_train.get("binomial_signal_rate"),
         "binomial_signal_share": current_train.get("binomial_signal_share"),
@@ -704,10 +733,16 @@ def variable_summary_placeholder(variable: str, state: dict[str, Any]) -> dict[s
         "monotonic_direction": None,
         "monotonic_violations": None,
         "hhi_total": None,
+        "average_bucket_hhi": None,
         "normalized_hhi": None,
         "hhi_concentration": None,
         "max_bin_concentration": None,
         "max_bucket_weight": None,
+        "variable_avg_value": None,
+        "binomial_pass_bins": None,
+        "binomial_reject_bins": None,
+        "binomial_one_tail_pass_bins": None,
+        "binomial_one_tail_reject_bins": None,
         "binomial_significant_bins": None,
         "binomial_signal_rate": None,
         "binomial_signal_share": None,
@@ -970,9 +1005,12 @@ def render_catalog(
         "bins",
         "monotonic_direction",
         "hhi_total",
+        "average_bucket_hhi",
         "hhi_concentration",
         "max_bucket_weight",
-        "binomial_significant_bins",
+        "variable_avg_value",
+        "binomial_reject_bins",
+        "binomial_one_tail_reject_bins",
         "test_iv",
         "test_gini",
         "metrics_status",
@@ -992,7 +1030,14 @@ def render_catalog(
             "test_iv": st.column_config.NumberColumn(format="%.6f"),
             "test_gini": st.column_config.NumberColumn(format="%.6f"),
             "hhi_total": st.column_config.NumberColumn(format="%.6f"),
+            "average_bucket_hhi": st.column_config.NumberColumn("Average Bucket HHI", format="%.6f"),
             "max_bucket_weight": st.column_config.NumberColumn("Max Bucket Weight", format="%.6f"),
+            "variable_avg_value": st.column_config.NumberColumn(
+                "Variable Avg Value",
+                format="%.6f",
+            ),
+            "binomial_reject_bins": st.column_config.NumberColumn("Two-tail Rejects", format="%d"),
+            "binomial_one_tail_reject_bins": st.column_config.NumberColumn("One-tail Rejects", format="%d"),
         },
     )
     return summary
@@ -1343,22 +1388,25 @@ def render_variable_editor(
     metric_cols[4].metric("Monotonic", str(current_train["metrics"].get("monotonic_direction")))
     test_cols = st.columns(4)
     hhi_total = current_train["metrics"].get("hhi_total")
+    average_bucket_hhi = current_train["metrics"].get("average_bucket_hhi")
     hhi_label = current_train["metrics"].get("hhi_concentration")
     max_bucket_weight = current_train["metrics"].get("max_bucket_weight")
-    signal_share = current_train["metrics"].get("binomial_signal_share")
-    signal_bins = current_train["metrics"].get("binomial_significant_bins")
+    variable_avg_value = current_train["metrics"].get("variable_avg_value")
     hhi_value = "n/a" if hhi_total is None else f"{hhi_total:.6f}"
     if hhi_label and hhi_value != "n/a":
         hhi_value = f"{hhi_value} ({hhi_label})"
-    test_cols[0].metric("HHI (bucket weights)", hhi_value)
+    test_cols[0].metric("Variable HHI", hhi_value)
     test_cols[1].metric(
+        "Average Bucket HHI",
+        "n/a" if average_bucket_hhi is None else f"{average_bucket_hhi:.6f}",
+    )
+    test_cols[2].metric(
+        "Variable Avg Value",
+        "n/a" if variable_avg_value is None else f"{variable_avg_value:.6g}",
+    )
+    test_cols[3].metric(
         "Max Bucket Weight",
         "n/a" if max_bucket_weight is None else f"{max_bucket_weight:.2%}",
-    )
-    test_cols[2].metric("Different buckets", "n/a" if signal_bins is None else str(signal_bins))
-    test_cols[3].metric(
-        "Different bucket weight",
-        "n/a" if signal_share is None else f"{signal_share:.2%}",
     )
 
     confidence_level = float(
@@ -1368,9 +1416,10 @@ def render_variable_editor(
     family_size = current_train["metrics"].get("binomial_family_size")
     reference_text = "n/a" if reference_rate is None else f"{float(reference_rate):.4%}"
     st.caption(
-        f"Binomial: exact two-sided (two-tail), H0 bucket event rate = total event rate ({reference_text}); "
-        f"{confidence_level:.0%} family-wise confidence with Bonferroni across {family_size or 0} non-empty "
-        "bucket(s). Bucket Weight = bucket count / scored rows."
+        f"Binomial null event rate = overall bad rate ({reference_text}). Two-tail uses central exact; "
+        "one-tail uses the upper tail (H1: bucket event rate is higher). "
+        f"Both use {confidence_level:.0%} family-wise confidence with Bonferroni across "
+        f"{family_size or 0} non-empty bucket(s)."
     )
 
     bins_tab, special_tab, compare_tab = st.tabs(
@@ -1395,8 +1444,11 @@ def render_variable_editor(
             "non_event_count",
             "bucket_weight",
             "event_rate",
-            "event_concentration",
-            "non_event_concentration",
+            "variable_avg_value",
+            "variable_avg_event_rate",
+            "binomial_result",
+            "binomial_one_tail_result",
+            "bucket_hhi",
             "calculated_woe",
             "export_woe",
             "calculated_iv",
@@ -1405,28 +1457,7 @@ def render_variable_editor(
         ]
         if state["current_spec"].get("feature_kind") != "numeric":
             disabled_columns.extend(["lower", "upper"])
-        editor_columns = ["merge", "kind", "label"]
-        if state["current_spec"].get("feature_kind") == "numeric":
-            editor_columns.extend(["lower", "upper"])
-        else:
-            editor_columns.append("values")
-        editor_columns.extend(
-            [
-                "count",
-                "event_count",
-                "non_event_count",
-                "bucket_weight",
-                "event_rate",
-                "event_concentration",
-                "non_event_concentration",
-                "calculated_woe",
-                "assigned_woe",
-                "export_woe",
-                "calculated_iv",
-                "export_iv",
-                "note",
-            ]
-        )
+        editor_columns = current_bin_editor_columns(str(state["current_spec"].get("feature_kind")))
         edited = st.data_editor(
             editable_bin_table(current_train["table"], include_merge=True),
             hide_index=True,
@@ -1434,7 +1465,7 @@ def render_variable_editor(
             key=editor_key,
             disabled=disabled_columns,
             column_order=editor_columns,
-            column_config=woe_column_config(confidence_level),
+            column_config=woe_column_config(),
         )
         selected_merge_bins = selected_normal_merge_bin_ids(edited)
         merge_help = (
@@ -1456,14 +1487,6 @@ def render_variable_editor(
                 else:
                     st.info("No current bin changes to apply.")
 
-        with st.expander("Binomial / HHI diagnostics", expanded=False):
-            st.dataframe(
-                binomial_test_frame(current_train["table"]),
-                hide_index=True,
-                width="stretch",
-                column_config=woe_column_config(confidence_level),
-            )
-
     with special_tab:
         render_special_missing_editor(state, df, target, positive_class)
 
@@ -1482,15 +1505,12 @@ def render_variable_editor(
             test_cols[1].markdown("**Current test metrics**")
             test_cols[1].dataframe(metrics_frame(reports["current_test"]["metrics"]), hide_index=True, width="stretch")
         st.markdown("**Original bins**")
-        original_confidence = float(
-            original_train["metrics"].get("binomial_confidence_level", WOE_BINOMIAL_CONFIDENCE_LEVEL)
-        )
         st.dataframe(
             editable_bin_table(original_train["table"]),
             hide_index=True,
             width="stretch",
             column_order=[column for column in editor_columns if column != "merge"],
-            column_config=woe_column_config(original_confidence),
+            column_config=woe_column_config(),
         )
 
 
