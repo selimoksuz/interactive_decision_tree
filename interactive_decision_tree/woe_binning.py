@@ -670,17 +670,26 @@ def exact_upper_tail_p_value(events: int, trials: int, expected_rate: float) -> 
 
 def append_binomial_hhi_tests(
     table: pd.DataFrame,
-    total_rows: int,
-    total_events: int,
+    variable_is_probability: bool,
     confidence_level: float = WOE_BINOMIAL_CONFIDENCE_LEVEL,
 ) -> pd.DataFrame:
     out = table.copy()
     if not 0.0 < float(confidence_level) < 1.0:
         raise ValueError("binomial_confidence_level must be between 0 and 1")
     alpha = 1.0 - float(confidence_level)
-    family_size = max(1, int((pd.to_numeric(out.get("count"), errors="coerce").fillna(0) > 0).sum()))
-    effective_alpha = float(alpha) / family_size
-    expected_rate = None if total_rows <= 0 else float(total_events / total_rows)
+    counts = pd.to_numeric(out.get("count"), errors="coerce").fillna(0).astype(int)
+    events = pd.to_numeric(out.get("event_count"), errors="coerce").fillna(0).astype(int)
+    variable_averages = pd.to_numeric(out.get("variable_avg_value"), errors="coerce")
+    normal_bins = out.get("kind", pd.Series("", index=out.index)).astype(str).eq("normal")
+    applicable = (
+        bool(variable_is_probability)
+        & normal_bins
+        & counts.gt(0)
+        & variable_averages.notna()
+        & variable_averages.between(0.0, 1.0, inclusive="both")
+    )
+    family_size = int(applicable.sum())
+    effective_alpha = None if family_size == 0 else float(alpha) / family_size
     expected_counts: list[float | None] = []
     count_deltas: list[float | None] = []
     two_tail_p_values: list[float | None] = []
@@ -692,10 +701,13 @@ def append_binomial_hhi_tests(
     ci_lowers: list[float | None] = []
     ci_uppers: list[float | None] = []
 
-    counts = pd.to_numeric(out.get("count"), errors="coerce").fillna(0).astype(int)
-    events = pd.to_numeric(out.get("event_count"), errors="coerce").fillna(0).astype(int)
-    for count, event_count in zip(counts.tolist(), events.tolist()):
-        if count <= 0 or expected_rate is None:
+    for count, event_count, raw_expected_rate, is_applicable in zip(
+        counts.tolist(),
+        events.tolist(),
+        variable_averages.tolist(),
+        applicable.tolist(),
+    ):
+        if not is_applicable or effective_alpha is None:
             expected_counts.append(None)
             count_deltas.append(None)
             two_tail_p_values.append(None)
@@ -708,6 +720,7 @@ def append_binomial_hhi_tests(
             ci_uppers.append(None)
             continue
 
+        expected_rate = float(raw_expected_rate)
         expected_count = float(count * expected_rate)
         two_tail_p_value = central_exact_two_tail_p_value(event_count, count, expected_rate)
         one_tail_p_value = exact_upper_tail_p_value(event_count, count, expected_rate)
@@ -730,8 +743,9 @@ def append_binomial_hhi_tests(
         ci_lowers.append(ci_lower)
         ci_uppers.append(ci_upper)
 
-    out["variable_avg_event_rate"] = expected_rate
-    out["expected_event_rate"] = expected_rate
+    out["binomial_applicable"] = applicable.astype(bool)
+    out["binomial_reference"] = ["variable_avg_value" if value else None for value in applicable]
+    out["expected_event_rate"] = variable_averages.where(applicable)
     out["expected_event_count"] = expected_counts
     out["event_count_delta"] = count_deltas
     out["binomial_p_value"] = two_tail_p_values
@@ -739,7 +753,7 @@ def append_binomial_hhi_tests(
     out["binomial_pass"] = two_tail_pass_values
     out["binomial_significant"] = [None if value is None else not value for value in two_tail_pass_values]
     out["binomial_result"] = [
-        "Pass" if value is True else "Reject" if value is False else "No data"
+        "Pass" if value is True else "Reject" if value is False else "N/A"
         for value in two_tail_pass_values
     ]
     out["binomial_two_tail_pass"] = two_tail_pass_values
@@ -748,7 +762,7 @@ def append_binomial_hhi_tests(
     out["binomial_one_tail_adjusted_p_value"] = one_tail_adjusted_p_values
     out["binomial_one_tail_pass"] = one_tail_pass_values
     out["binomial_one_tail_result"] = [
-        "Pass" if value is True else "Reject" if value is False else "No data"
+        "Pass" if value is True else "Reject" if value is False else "N/A"
         for value in one_tail_pass_values
     ]
     out["binomial_ci_lower"] = ci_lowers
@@ -782,19 +796,15 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
             "max_bucket_weight": None,
             "average_bucket_hhi": None,
             "variable_avg_value": None,
-            "variable_avg_event_rate": None,
-            "binomial_reference_event_rate": None,
             "binomial_family_size": 0,
             "binomial_effective_alpha": None,
-            "binomial_significant_bins": 0,
-            "binomial_signal_rate": None,
-            "binomial_signal_share": None,
             "binomial_pass_bins": 0,
             "binomial_reject_bins": 0,
             "binomial_pass_weight": None,
             "binomial_one_tail_pass_bins": 0,
             "binomial_one_tail_reject_bins": 0,
             "binomial_one_tail_pass_weight": None,
+            "binomial_not_applicable_bins": 0,
         }
 
     weight_column = "bucket_weight" if "bucket_weight" in table.columns else "all_concentration"
@@ -809,21 +819,18 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         normalized_hhi = 0.0 if positive_bins == 1 else None
     concentration = hhi_concentration_label(hhi_total)
 
+    applicable = table.get("binomial_applicable", pd.Series(False, index=table.index)).fillna(False).astype(bool)
     two_tail_pass = table.get("binomial_pass", pd.Series(False, index=table.index)).fillna(False).astype(bool)
     one_tail_pass = (
         table.get("binomial_one_tail_pass", pd.Series(False, index=table.index)).fillna(False).astype(bool)
     )
     populated = pd.to_numeric(table.get("count"), errors="coerce").fillna(0) > 0
-    significant = populated & ~two_tail_pass
-    one_tail_reject = populated & ~one_tail_pass
-    variable_avg_event_rate = (
-        None
-        if "variable_avg_event_rate" not in table.columns or table["variable_avg_event_rate"].dropna().empty
-        else float(table["variable_avg_event_rate"].dropna().iloc[0])
-    )
+    two_tail_reject = applicable & ~two_tail_pass
+    one_tail_reject = applicable & ~one_tail_pass
     variable_values = pd.to_numeric(table.get("variable_avg_value"), errors="coerce")
     variable_counts = pd.to_numeric(table.get("count"), errors="coerce").fillna(0.0)
-    variable_value_rows = variable_values.notna() & (variable_counts > 0)
+    normal_rows = table.get("kind", pd.Series("", index=table.index)).astype(str).eq("normal")
+    variable_value_rows = normal_rows & variable_values.notna() & (variable_counts > 0)
     variable_avg_value = (
         None
         if not bool(variable_value_rows.any())
@@ -843,27 +850,20 @@ def bin_quality_metrics(table: pd.DataFrame) -> dict[str, Any]:
         "max_bucket_weight": None if shares.empty else float(shares.max()),
         "average_bucket_hhi": None if positive_bins == 0 else float(hhi_total / positive_bins),
         "variable_avg_value": variable_avg_value,
-        "variable_avg_event_rate": variable_avg_event_rate,
-        "binomial_reference_event_rate": (
-            None
-            if "expected_event_rate" not in table.columns or table["expected_event_rate"].dropna().empty
-            else float(table["expected_event_rate"].dropna().iloc[0])
-        ),
-        "binomial_family_size": positive_bins,
+        "binomial_reference": "bucket_variable_avg_value",
+        "binomial_family_size": int(applicable.sum()),
         "binomial_effective_alpha": (
             None
             if "binomial_effective_alpha" not in table.columns or table["binomial_effective_alpha"].dropna().empty
             else float(table["binomial_effective_alpha"].dropna().iloc[0])
         ),
-        "binomial_significant_bins": int(significant.sum()),
-        "binomial_signal_rate": None if positive_bins == 0 else float(significant.sum() / positive_bins),
-        "binomial_signal_share": float(shares.loc[significant].sum()),
-        "binomial_pass_bins": int((populated & two_tail_pass).sum()),
-        "binomial_reject_bins": int(significant.sum()),
-        "binomial_pass_weight": float(shares.loc[populated & two_tail_pass].sum()),
-        "binomial_one_tail_pass_bins": int((populated & one_tail_pass).sum()),
+        "binomial_pass_bins": int((applicable & two_tail_pass).sum()),
+        "binomial_reject_bins": int(two_tail_reject.sum()),
+        "binomial_pass_weight": float(shares.loc[applicable & two_tail_pass].sum()),
+        "binomial_one_tail_pass_bins": int((applicable & one_tail_pass).sum()),
         "binomial_one_tail_reject_bins": int(one_tail_reject.sum()),
-        "binomial_one_tail_pass_weight": float(shares.loc[populated & one_tail_pass].sum()),
+        "binomial_one_tail_pass_weight": float(shares.loc[applicable & one_tail_pass].sum()),
+        "binomial_not_applicable_bins": int((populated & ~applicable).sum()),
     }
 
 
@@ -875,6 +875,7 @@ def build_bin_table_from_counts(
     total_non_events: int,
     order: list[str],
     dataset_name: str = "Train",
+    variable_is_probability: bool = False,
 ) -> pd.DataFrame:
     feature = str(spec["feature"])
     spec_by_id = {str(bin_spec.get("bin_id")): bin_spec for bin_spec in spec.get("bins", [])}
@@ -931,8 +932,7 @@ def build_bin_table_from_counts(
         )
     return append_binomial_hhi_tests(
         pd.DataFrame(rows),
-        total_rows=total_rows,
-        total_events=total_events,
+        variable_is_probability=variable_is_probability,
         confidence_level=spec_binomial_confidence_level(spec),
     )
 
@@ -1001,6 +1001,7 @@ def precomputed_categorical_bin_table(
         total_non_events,
         order,
         dataset_name=dataset_name,
+        variable_is_probability=False,
     )
 
 
@@ -1022,6 +1023,7 @@ def build_bin_table(
     total_events = int(event.sum())
     total_rows = int(y_valid.sum())
     total_non_events = total_rows - total_events
+    variable_is_probability = False
     if total_rows:
         grouped_input = pd.DataFrame(
             {
@@ -1036,6 +1038,19 @@ def build_bin_table(
         if spec.get("feature_kind") == "numeric":
             grouped_input["feature_value"] = pd.to_numeric(df.loc[y_valid, feature], errors="coerce")
             named_aggregations["variable_avg_value"] = ("feature_value", "mean")
+            normal_bin_ids = {
+                str(bin_spec.get("bin_id"))
+                for bin_spec in spec.get("bins", [])
+                if bin_spec.get("kind") == "normal"
+            }
+            normal_values = grouped_input.loc[
+                grouped_input["bin_id"].astype(str).isin(normal_bin_ids),
+                "feature_value",
+            ]
+            variable_is_probability = bool(
+                normal_values.notna().any()
+                and normal_values.dropna().between(0.0, 1.0, inclusive="both").all()
+            )
         grouped = grouped_input.groupby("bin_id", dropna=False).agg(**named_aggregations)
         counts_by_bin = {
             str(bin_id): {
@@ -1056,6 +1071,7 @@ def build_bin_table(
         total_non_events,
         bin_order(spec, assigned),
         dataset_name=dataset_name,
+        variable_is_probability=variable_is_probability,
     )
 
 

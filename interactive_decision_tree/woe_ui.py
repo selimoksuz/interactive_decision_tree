@@ -164,6 +164,7 @@ def metrics_frame(metrics: dict[str, Any]) -> pd.DataFrame:
         "binomial_reject_bins",
         "binomial_one_tail_pass_bins",
         "binomial_one_tail_reject_bins",
+        "binomial_not_applicable_bins",
         "engine_used",
     ]
     rows = []
@@ -192,8 +193,8 @@ def woe_column_config() -> dict[str, Any]:
         "bucket_weight": st.column_config.NumberColumn("Bucket Weight", format="%.6f"),
         "event_rate": st.column_config.NumberColumn("Bad Rate", format="%.6f"),
         "variable_avg_value": st.column_config.NumberColumn("Variable Avg Value", format="%.6f"),
-        "binomial_result": st.column_config.TextColumn("Two-tail Binomial"),
-        "binomial_one_tail_result": st.column_config.TextColumn("One-tail Binomial"),
+        "binomial_result": st.column_config.TextColumn("Two-tail (Bad != Avg)"),
+        "binomial_one_tail_result": st.column_config.TextColumn("One-tail (Bad > Avg)"),
         "bucket_hhi": st.column_config.NumberColumn("Bucket HHI", format="%.6f"),
         "event_concentration": st.column_config.NumberColumn("Event Share", format="%.6f"),
         "non_event_concentration": st.column_config.NumberColumn("Non-event Share", format="%.6f"),
@@ -223,7 +224,6 @@ def editable_bin_table(table: pd.DataFrame, *, include_merge: bool = False) -> p
         "bucket_weight",
         "event_rate",
         "variable_avg_value",
-        "variable_avg_event_rate",
         "binomial_result",
         "binomial_one_tail_result",
         "bucket_hhi",
@@ -699,16 +699,13 @@ def variable_summary_row(
         "binomial_reject_bins": current_train.get("binomial_reject_bins"),
         "binomial_one_tail_pass_bins": current_train.get("binomial_one_tail_pass_bins"),
         "binomial_one_tail_reject_bins": current_train.get("binomial_one_tail_reject_bins"),
-        "binomial_significant_bins": current_train.get("binomial_significant_bins"),
-        "binomial_signal_rate": current_train.get("binomial_signal_rate"),
-        "binomial_signal_share": current_train.get("binomial_signal_share"),
+        "binomial_not_applicable_bins": current_train.get("binomial_not_applicable_bins"),
     }
     if test_df is not None:
         current_test = evaluate_spec(test_df, target, current_spec, positive_class, "Test")["metrics"]
         row["test_iv"] = current_test.get("export_iv")
         row["test_gini"] = current_test.get("export_gini")
         row["test_hhi_total"] = current_test.get("hhi_total")
-        row["test_binomial_signal_share"] = current_test.get("binomial_signal_share")
     return row
 
 
@@ -743,9 +740,7 @@ def variable_summary_placeholder(variable: str, state: dict[str, Any]) -> dict[s
         "binomial_reject_bins": None,
         "binomial_one_tail_pass_bins": None,
         "binomial_one_tail_reject_bins": None,
-        "binomial_significant_bins": None,
-        "binomial_signal_rate": None,
-        "binomial_signal_share": None,
+        "binomial_not_applicable_bins": None,
         "metrics_status": "not loaded",
     }
 
@@ -1011,6 +1006,7 @@ def render_catalog(
         "variable_avg_value",
         "binomial_reject_bins",
         "binomial_one_tail_reject_bins",
+        "binomial_not_applicable_bins",
         "test_iv",
         "test_gini",
         "metrics_status",
@@ -1038,6 +1034,7 @@ def render_catalog(
             ),
             "binomial_reject_bins": st.column_config.NumberColumn("Two-tail Rejects", format="%d"),
             "binomial_one_tail_reject_bins": st.column_config.NumberColumn("One-tail Rejects", format="%d"),
+            "binomial_not_applicable_bins": st.column_config.NumberColumn("Binomial N/A", format="%d"),
         },
     )
     return summary
@@ -1412,14 +1409,14 @@ def render_variable_editor(
     confidence_level = float(
         current_train["metrics"].get("binomial_confidence_level", WOE_BINOMIAL_CONFIDENCE_LEVEL)
     )
-    reference_rate = current_train["metrics"].get("binomial_reference_event_rate")
     family_size = current_train["metrics"].get("binomial_family_size")
-    reference_text = "n/a" if reference_rate is None else f"{float(reference_rate):.4%}"
+    not_applicable = current_train["metrics"].get("binomial_not_applicable_bins") or 0
     st.caption(
-        f"Binomial null event rate = overall bad rate ({reference_text}). Two-tail uses central exact; "
-        "one-tail uses the upper tail (H1: bucket event rate is higher). "
+        "Binomial H0 per bucket: Bad Rate = Variable Avg Value. "
+        "Two-tail tests inequality; one-tail uses H1: Bad Rate > Variable Avg Value. "
         f"Both use {confidence_level:.0%} family-wise confidence with Bonferroni across "
-        f"{family_size or 0} non-empty bucket(s)."
+        f"{family_size or 0} applicable bucket(s). {not_applicable} non-probability, missing, or special bucket(s) "
+        "are N/A."
     )
 
     bins_tab, special_tab, compare_tab = st.tabs(
@@ -1445,7 +1442,6 @@ def render_variable_editor(
             "bucket_weight",
             "event_rate",
             "variable_avg_value",
-            "variable_avg_event_rate",
             "binomial_result",
             "binomial_one_tail_result",
             "bucket_hhi",

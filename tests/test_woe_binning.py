@@ -53,6 +53,12 @@ def woe_df() -> pd.DataFrame:
     )
 
 
+def probability_woe_df() -> pd.DataFrame:
+    probability = np.linspace(0.001, 0.999, 1_000)
+    target = np.random.default_rng(20260813).binomial(1, probability)
+    return pd.DataFrame({"probability": probability, "target": target})
+
+
 def test_woe_variable_filter_supports_contains_multiple_terms_and_wildcards():
     variables = ["age", "income", "avg_balance_3m", "risk_score", "segment"]
 
@@ -120,13 +126,13 @@ def test_numeric_woe_supports_special_missing_and_manual_woe():
 
 
 def test_woe_evaluation_adds_binomial_and_hhi_tests():
-    df = woe_df()
+    df = probability_woe_df()
     spec = build_initial_spec(
         df,
         "target",
-        "age",
+        "probability",
         1,
-        WoeBuildConfig(max_bins=3, binomial_confidence_level=0.90, engine="fallback"),
+        WoeBuildConfig(max_bins=4, binomial_confidence_level=0.90, engine="fallback"),
     )
 
     report = evaluate_spec(df, "target", spec, 1)
@@ -150,7 +156,8 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
         "binomial_ci_upper",
         "bucket_weight",
         "variable_avg_value",
-        "variable_avg_event_rate",
+        "binomial_applicable",
+        "binomial_reference",
         "hhi_contribution",
         "bucket_hhi",
     }.issubset(table.columns)
@@ -162,8 +169,8 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
     )
     assert 0.0 <= metrics["hhi_total"] <= 1.0
     assert metrics["hhi_concentration"] == woe_binning.hhi_concentration_label(metrics["hhi_total"])
-    assert 0.0 <= metrics["binomial_signal_share"] <= 1.0
-    assert metrics["binomial_family_size"] == int((table["count"] > 0).sum())
+    assert metrics["binomial_family_size"] == int(table["binomial_applicable"].sum())
+    assert metrics["binomial_not_applicable_bins"] == 0
     assert metrics["binomial_confidence_level"] == pytest.approx(0.90)
     assert metrics["binomial_family_alpha"] == pytest.approx(0.10)
     assert metrics["binomial_alternative"] == "two-sided"
@@ -171,12 +178,14 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
     assert metrics["binomial_one_tail_alternative"] == "greater"
     assert metrics["binomial_one_tail_test_method"] == "exact_binomial_upper_tail"
     assert metrics["binomial_multiple_testing"] == "bonferroni"
-    assert metrics["variable_avg_event_rate"] == pytest.approx(df["target"].mean())
-    assert metrics["variable_avg_value"] == pytest.approx(df["age"].mean())
+    assert metrics["binomial_reference"] == "bucket_variable_avg_value"
+    assert metrics["variable_avg_value"] == pytest.approx(df["probability"].mean())
     normal_rows = table[table["kind"] == "normal"]
     assert normal_rows["variable_avg_value"].notna().all()
-    assert set(table["binomial_result"]) <= {"Pass", "Reject", "No data"}
-    assert set(table["binomial_one_tail_result"]) <= {"Pass", "Reject", "No data"}
+    assert normal_rows["binomial_applicable"].all()
+    assert normal_rows["expected_event_rate"].equals(normal_rows["variable_avg_value"])
+    assert set(table["binomial_result"]) <= {"Pass", "Reject"}
+    assert set(table["binomial_one_tail_result"]) <= {"Pass", "Reject"}
     assert table["bucket_hhi"].equals(table["hhi_contribution"])
 
     first = table.iloc[0]
@@ -184,14 +193,14 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
         1.0,
         2.0
         * min(
-            stats.binom.cdf(first["event_count"], first["count"], metrics["variable_avg_event_rate"]),
-            stats.binom.sf(first["event_count"] - 1, first["count"], metrics["variable_avg_event_rate"]),
+            stats.binom.cdf(first["event_count"], first["count"], first["variable_avg_value"]),
+            stats.binom.sf(first["event_count"] - 1, first["count"], first["variable_avg_value"]),
         ),
     )
     expected_one_tail = stats.binom.sf(
         first["event_count"] - 1,
         first["count"],
-        metrics["variable_avg_event_rate"],
+        first["variable_avg_value"],
     )
     assert first["binomial_p_value"] == pytest.approx(expected_two_tail)
     assert first["binomial_one_tail_p_value"] == pytest.approx(expected_one_tail)
@@ -210,6 +219,51 @@ def test_woe_evaluation_adds_binomial_and_hhi_tests():
         "bucket_hhi",
     } <= set(visible_columns)
     assert {"binomial_p_value", "binomial_ci_lower", "binomial_ci_upper"}.isdisjoint(visible_columns)
+
+
+def test_woe_binomial_is_not_applicable_to_non_probability_variables():
+    df = woe_df()
+    for feature in ("age", "segment"):
+        spec = build_initial_spec(df, "target", feature, 1, WoeBuildConfig(max_bins=3, engine="fallback"))
+        report = evaluate_spec(df, "target", spec, 1)
+        table = report["table"]
+        metrics = report["metrics"]
+
+        assert not table["binomial_applicable"].any()
+        assert table["expected_event_rate"].isna().all()
+        assert set(table["binomial_result"]) == {"N/A"}
+        assert set(table["binomial_one_tail_result"]) == {"N/A"}
+        assert metrics["binomial_family_size"] == 0
+        assert metrics["binomial_pass_bins"] == 0
+        assert metrics["binomial_reject_bins"] == 0
+        assert metrics["binomial_not_applicable_bins"] == int((table["count"] > 0).sum())
+
+
+def test_woe_binomial_excludes_missing_and_special_probability_buckets():
+    df = probability_woe_df()
+    df.loc[len(df)] = [None, 1]
+    df.loc[len(df)] = [-999.0, 0]
+    spec = build_initial_spec(
+        df,
+        "target",
+        "probability",
+        1,
+        WoeBuildConfig(max_bins=4, special_values=("-999",), engine="fallback"),
+    )
+
+    report = evaluate_spec(df, "target", spec, 1)
+    table = report["table"]
+    normal = table["kind"] == "normal"
+    excluded = table["kind"].isin(["missing", "special"])
+
+    assert table.loc[normal, "binomial_applicable"].all()
+    assert not table.loc[excluded, "binomial_applicable"].any()
+    assert set(table.loc[excluded, "binomial_result"]) == {"N/A"}
+    assert report["metrics"]["binomial_family_size"] == int(normal.sum())
+    assert report["metrics"]["binomial_not_applicable_bins"] == int(excluded.sum())
+    assert report["metrics"]["variable_avg_value"] == pytest.approx(
+        df.loc[df["probability"].between(0.0, 1.0), "probability"].mean()
+    )
 
 
 def test_woe_max_bins_supports_more_than_twenty_normal_bins():
@@ -458,13 +512,16 @@ def test_project_export_contains_integrated_mapping():
     assert {variable["name"] for variable in decoded["variables"]} == {"age", "segment"}
     age_payload = next(variable for variable in decoded["variables"] if variable["name"] == "age")
     assert "hhi_total" in age_payload["metrics"]
-    assert "binomial_signal_share" in age_payload["metrics"]
+    assert age_payload["metrics"]["binomial_reference"] == "bucket_variable_avg_value"
+    assert age_payload["metrics"]["binomial_not_applicable_bins"] > 0
     assert age_payload["metrics"]["binomial_confidence_level"] == pytest.approx(0.95)
     assert age_payload["metrics"]["binomial_alternative"] == "two-sided"
     assert age_payload["metrics"]["binomial_one_tail_alternative"] == "greater"
     assert "bucket_weight" in age_payload["bins"][0]
-    assert "variable_avg_event_rate" in age_payload["bins"][0]
     assert "variable_avg_value" in age_payload["bins"][0]
+    assert "variable_avg_event_rate" not in age_payload["bins"][0]
+    assert age_payload["bins"][0]["binomial_applicable"] is False
+    assert age_payload["bins"][0]["binomial_result"] == "N/A"
     assert "binomial_pass" in age_payload["bins"][0]
     assert "binomial_one_tail_result" in age_payload["bins"][0]
     assert "bucket_hhi" in age_payload["bins"][0]

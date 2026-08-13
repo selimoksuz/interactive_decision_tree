@@ -117,7 +117,7 @@ def variable_state_rows(
             "hhi_concentration": current_train.get("hhi_concentration"),
             "max_bin_concentration": current_train.get("max_bin_concentration"),
             "max_bucket_weight": current_train.get("max_bucket_weight"),
-            "variable_avg_event_rate": current_train.get("variable_avg_event_rate"),
+            "binomial_reference": current_train.get("binomial_reference"),
             "binomial_confidence_level": current_train.get("binomial_confidence_level"),
             "binomial_alternative": current_train.get("binomial_alternative"),
             "binomial_test_method": current_train.get("binomial_test_method"),
@@ -128,16 +128,13 @@ def variable_state_rows(
             "binomial_reject_bins": current_train.get("binomial_reject_bins"),
             "binomial_one_tail_pass_bins": current_train.get("binomial_one_tail_pass_bins"),
             "binomial_one_tail_reject_bins": current_train.get("binomial_one_tail_reject_bins"),
-            "binomial_significant_bins": current_train.get("binomial_significant_bins"),
-            "binomial_signal_rate": current_train.get("binomial_signal_rate"),
-            "binomial_signal_share": current_train.get("binomial_signal_share"),
+            "binomial_not_applicable_bins": current_train.get("binomial_not_applicable_bins"),
         }
         if test_df is not None:
             current_test = evaluate_spec(test_df, target, current_spec, positive_class, "Test")["metrics"]
             row["test_iv"] = current_test.get("export_iv")
             row["test_gini"] = current_test.get("export_gini")
             row["test_hhi_total"] = current_test.get("hhi_total")
-            row["test_binomial_signal_share"] = current_test.get("binomial_signal_share")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -218,7 +215,8 @@ def export_variable_payload(
                 "count": safe_json(row.get("count")),
                 "event_rate": safe_json(row.get("event_rate")),
                 "variable_avg_value": safe_json(row.get("variable_avg_value")),
-                "variable_avg_event_rate": safe_json(row.get("variable_avg_event_rate")),
+                "binomial_applicable": safe_json(row.get("binomial_applicable")),
+                "binomial_reference": safe_json(row.get("binomial_reference")),
                 "expected_event_rate": safe_json(row.get("expected_event_rate")),
                 "expected_event_count": safe_json(row.get("expected_event_count")),
                 "event_count_delta": safe_json(row.get("event_count_delta")),
@@ -385,7 +383,8 @@ def _dc_stats(variable: dict[str, Any]) -> list[dict[str, Any]]:
                 "total_count": bin_payload.get("count"),
                 "event_rate": bin_payload.get("event_rate"),
                 "variable_avg_value": bin_payload.get("variable_avg_value"),
-                "variable_avg_event_rate": bin_payload.get("variable_avg_event_rate"),
+                "binomial_applicable": bin_payload.get("binomial_applicable"),
+                "binomial_reference": bin_payload.get("binomial_reference"),
                 "expected_event_rate": bin_payload.get("expected_event_rate"),
                 "expected_event_count": bin_payload.get("expected_event_count"),
                 "event_count_delta": bin_payload.get("event_count_delta"),
@@ -437,7 +436,8 @@ def _categorical_dc_entry(variable: dict[str, Any]) -> tuple[dict[str, Any], dic
                 "total_count": bin_payload.get("count"),
                 "event_rate": bin_payload.get("event_rate"),
                 "variable_avg_value": bin_payload.get("variable_avg_value"),
-                "variable_avg_event_rate": bin_payload.get("variable_avg_event_rate"),
+                "binomial_applicable": bin_payload.get("binomial_applicable"),
+                "binomial_reference": bin_payload.get("binomial_reference"),
                 "expected_event_rate": bin_payload.get("expected_event_rate"),
                 "expected_event_count": bin_payload.get("expected_event_count"),
                 "event_count_delta": bin_payload.get("event_count_delta"),
